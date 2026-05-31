@@ -4,10 +4,10 @@ use crate::supervisor::{RunOptions, run};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hiloop_core::identity::{ForkContext, ForkNodeId, ForkPath, RunId};
-use std::process::ExitCode;
+use std::{path::PathBuf, process::ExitCode};
 
-pub(crate) fn run_from_args() -> Result<ExitCode> {
-    Cli::parse().execute()
+pub(crate) async fn run_from_args() -> Result<ExitCode> {
+    Box::pin(Cli::parse().execute()).await
 }
 
 #[derive(Debug, Parser)]
@@ -18,11 +18,11 @@ struct Cli {
 }
 
 impl Cli {
-    fn execute(self) -> Result<ExitCode> {
+    async fn execute(self) -> Result<ExitCode> {
         match self.command {
             Command::Run(args) => {
                 let options = args.into_run_options();
-                run(&options)
+                Box::pin(run(&options)).await
             }
         }
     }
@@ -52,6 +52,10 @@ struct RunArgs {
     #[arg(long, env = "HILOOP_FORK_PATH")]
     fork_path: Option<ForkPath>,
 
+    /// Create a newline-delimited JSON event file. Fails if the path exists.
+    #[arg(long = "events-jsonl", env = "HILOOP_EVENTS_JSONL")]
+    events_jsonl: Option<PathBuf>,
+
     /// Command to wrap. Everything after `--` is passed to the child.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -65,6 +69,6 @@ impl RunArgs {
             self.fork_path.unwrap_or_default(),
         );
 
-        RunOptions::new(context, self.command)
+        RunOptions::new(context, self.command, self.events_jsonl)
     }
 }

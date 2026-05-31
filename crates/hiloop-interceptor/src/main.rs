@@ -3,6 +3,7 @@ mod supervisor;
 
 use std::process::ExitCode;
 
-fn main() -> anyhow::Result<ExitCode> {
-    cli::run_from_args()
+#[tokio::main]
+async fn main() -> anyhow::Result<ExitCode> {
+    Box::pin(cli::run_from_args()).await
 }

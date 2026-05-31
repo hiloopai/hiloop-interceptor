@@ -17,11 +17,19 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
 futures-core.workspace = true
+futures-util.workspace = true
 hiloop-core.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [features]
 test-support = []

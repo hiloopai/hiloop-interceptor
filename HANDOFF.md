@@ -59,8 +59,15 @@ Nail the **contracts + the spine + mocks**, so P1 can be built/tested against th
    because it represents heterogeneous pre-normalization ingress. The normalized `Event` boundary
    remains narrow. Revisit `RawSignal::source`, `RawSignal::kind`, and raw attributes once source
    categories stabilize.
-4. **CI / tooling** — fmt + clippy + test wired (`.github/workflows/ci.yml`); add a
-   **record-don't-gate** bench job (criterion + iai-callgrind → Bencher Self-Hosted) (**R18**).
+4. **Runtime pipeline** — **decision:** use Tokio with bounded queues for `Source -> Normalizer
+   -> Exporter`. The default path is lossless/blocking: stdout/stderr are tee'd to the parent,
+   normalized to `process.stdout` / `process.stderr` log events, and flushed through the selected
+   exporter before returning the child exit code. JSONL is the local/dev/test exporter; OTEL,
+   ClickHouse, or other production exporters should be swappable behind the same `Exporter` trait.
+5. **CI / tooling** — fmt + clippy + docs + test wired (`.github/workflows/ci.yml`);
+   Dependabot tracks Cargo and GitHub Actions updates. Add a generated-file drift check once code
+   generation exists, and add a **record-don't-gate** bench job (criterion + iai-callgrind →
+   Bencher Self-Hosted) once meaningful workloads exist (**R18**).
 
 ## Phase 1 scope (what the binary becomes)
 
@@ -91,7 +98,8 @@ hiloop-interceptor/
     hiloop-interceptor/           # CLI supervisor · wrapper-local seams
 ```
 `cargo run -p hiloop-interceptor -- run -- echo hi` works (mints a local fork context, injects
-`HILOOP_*`/`OTEL_RESOURCE_ATTRIBUTES`, execs).
+`HILOOP_*`/`OTEL_RESOURCE_ATTRIBUTES`, execs). Add `--events-jsonl ./events.jsonl` to capture
+stdout/stderr as normalized log events while still teeing child output to the parent.
 
 ## Decisions that constrain implementation (don't re-litigate without cause)
 

@@ -1,21 +1,46 @@
 //! Process supervision for wrapped harness commands.
 
 use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use hiloop_core::identity::ForkContext;
+use hiloop_interceptor::{
+    exporters::JsonlExporter,
+    pipeline::{PipelineOptions, run_stream},
+    seams::{Exporter, RawSignal, SourceError},
+    stdio::StdioLogNormalizer,
+};
 use std::{
     ffi::OsString,
-    process::{Command, ExitCode, ExitStatus},
+    path::PathBuf,
+    process::{ExitCode, ExitStatus, Stdio},
+    sync::Arc,
 };
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    process::Command,
+    sync::mpsc,
+};
+
+const MAX_STDIO_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RunOptions {
     context: ForkContext,
     command: Vec<String>,
+    events_jsonl: Option<PathBuf>,
 }
 
 impl RunOptions {
-    pub(crate) fn new(context: ForkContext, command: Vec<String>) -> Self {
-        Self { context, command }
+    pub(crate) fn new(
+        context: ForkContext,
+        command: Vec<String>,
+        events_jsonl: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            context,
+            command,
+            events_jsonl,
+        }
     }
 }
 
@@ -60,9 +85,19 @@ impl ChildEnv {
     }
 }
 
-pub(crate) fn run(options: &RunOptions) -> Result<ExitCode> {
+pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
     if options.command.is_empty() {
         bail!("no command given; usage: hiloop-interceptor run -- <cmd> [args...]");
+    }
+
+    if let Some(path) = &options.events_jsonl {
+        let exporter = JsonlExporter::create(path).await.with_context(|| {
+            format!(
+                "failed to create JSONL event exporter at `{}`",
+                path.display()
+            )
+        })?;
+        return Box::pin(run_captured(options, &exporter)).await;
     }
 
     let mut child = Command::new(&options.command[0]);
@@ -71,8 +106,164 @@ pub(crate) fn run(options: &RunOptions) -> Result<ExitCode> {
 
     let status = child
         .status()
+        .await
         .with_context(|| format!("failed to run child command `{}`", options.command[0]))?;
     Ok(exit_code_from_status(status))
+}
+
+async fn run_captured<E>(options: &RunOptions, exporter: &E) -> Result<ExitCode>
+where
+    E: Exporter,
+{
+    let mut child = Command::new(&options.command[0]);
+    child
+        .args(&options.command[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    ChildEnv::for_context(&options.context).apply_to(&mut child);
+
+    let mut child = child
+        .spawn()
+        .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("child stdout was not available for capture")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("child stderr was not available for capture")?;
+
+    let options_pipeline = PipelineOptions::default();
+    let (signal_tx, signal_rx) = mpsc::channel(options_pipeline.raw_queue_capacity());
+    let clock = Arc::new(hiloop_core::identity::HlcClock::new());
+
+    let stdout_capture = capture_stream(
+        stdout,
+        tokio::io::stdout(),
+        "stdout",
+        signal_tx.clone(),
+        Arc::clone(&clock),
+    );
+    let stderr_capture = capture_stream(
+        stderr,
+        tokio::io::stderr(),
+        "stderr",
+        signal_tx.clone(),
+        Arc::clone(&clock),
+    );
+    drop(signal_tx);
+
+    let normalizer = StdioLogNormalizer;
+    let stream = tokio_stream::wrappers::ReceiverStream::new(signal_rx);
+    let pipeline = run_stream(
+        &options.context,
+        stream,
+        &normalizer,
+        exporter,
+        options_pipeline,
+    );
+
+    let (status_result, stdout_result, stderr_result, pipeline_result) = tokio::join!(
+        async {
+            child.wait().await.with_context(|| {
+                format!("failed to wait for child command `{}`", options.command[0])
+            })
+        },
+        stdout_capture,
+        stderr_capture,
+        async { pipeline.await.context("stdio event pipeline failed") },
+    );
+
+    let status = status_result?;
+    pipeline_result?;
+    stdout_result.context("failed to capture child stdout")?;
+    stderr_result.context("failed to capture child stderr")?;
+
+    Ok(exit_code_from_status(status))
+}
+
+async fn capture_stream<R, W>(
+    mut reader: R,
+    mut writer: W,
+    stream_name: &'static str,
+    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: Arc<hiloop_core::identity::HlcClock>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut pending = Vec::new();
+    let mut buffer = [0; 8192];
+    let mut signal_tx = Some(signal_tx);
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("failed to read child {stream_name}"))?;
+        if read == 0 {
+            break;
+        }
+
+        let chunk = &buffer[..read];
+        writer
+            .write_all(chunk)
+            .await
+            .with_context(|| format!("failed to tee child {stream_name}"))?;
+        writer
+            .flush()
+            .await
+            .with_context(|| format!("failed to flush tee for child {stream_name}"))?;
+
+        pending.extend_from_slice(chunk);
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+            trim_line_ending(&mut line);
+            send_stdio_signal(&mut signal_tx, stream_name, &clock, line).await;
+        }
+        while pending.len() > MAX_STDIO_LINE_BYTES {
+            let chunk = pending.drain(..MAX_STDIO_LINE_BYTES).collect::<Vec<_>>();
+            send_stdio_signal(&mut signal_tx, stream_name, &clock, chunk).await;
+        }
+    }
+
+    if !pending.is_empty() {
+        send_stdio_signal(&mut signal_tx, stream_name, &clock, pending).await;
+    }
+
+    if signal_tx.is_none() {
+        bail!("stdio event pipeline stopped before {stream_name} capture finished");
+    }
+
+    Ok(())
+}
+
+async fn send_stdio_signal(
+    signal_tx: &mut Option<mpsc::Sender<Result<RawSignal, SourceError>>>,
+    stream_name: &'static str,
+    clock: &hiloop_core::identity::HlcClock,
+    line: Vec<u8>,
+) {
+    let Some(tx) = signal_tx else {
+        return;
+    };
+
+    let raw = RawSignal::new("stdio", stream_name, clock.tick(), Bytes::from(line));
+    if tx.send(Ok(raw)).await.is_err() {
+        *signal_tx = None;
+    }
+}
+
+fn trim_line_ending(line: &mut Vec<u8>) {
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
 }
 
 fn exit_code_from_status(status: ExitStatus) -> ExitCode {
@@ -85,8 +276,26 @@ fn exit_code_from_status(status: ExitStatus) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use hiloop_core::identity::{ForkNodeId, ForkPath, RunId};
     use std::str::FromStr;
+    use tokio::io::AsyncWriteExt;
+
+    #[derive(Debug)]
+    struct FailingExporter;
+
+    #[async_trait]
+    impl Exporter for FailingExporter {
+        async fn export(
+            &self,
+            _events: &[hiloop_core::event::Event],
+        ) -> std::result::Result<(), hiloop_interceptor::seams::ExportError> {
+            Err(hiloop_interceptor::seams::ExportError::other(
+                "failing",
+                "intentional test failure",
+            ))
+        }
+    }
 
     #[test]
     fn child_env_stamps_the_fork_context() {
@@ -124,6 +333,118 @@ mod tests {
             Some(
                 "run.id=01J00000000000000000000000,fork.node_id=01J00000000000000000000001,fork.path=/0/3"
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_stream_chunks_long_lines() {
+        let line = vec![b'a'; MAX_STDIO_LINE_BYTES + 1];
+        let (mut input, output) = tokio::io::duplex(MAX_STDIO_LINE_BYTES + 1);
+        input.write_all(&line).await.expect("write test input");
+        drop(input);
+
+        let (signal_tx, mut signal_rx) = mpsc::channel(4);
+        capture_stream(
+            output,
+            tokio::io::sink(),
+            "stdout",
+            signal_tx,
+            Arc::new(hiloop_core::identity::HlcClock::new()),
+        )
+        .await
+        .expect("capture stream");
+
+        let first = signal_rx
+            .recv()
+            .await
+            .expect("first signal")
+            .expect("first raw signal");
+        let second = signal_rx
+            .recv()
+            .await
+            .expect("second signal")
+            .expect("second raw signal");
+
+        assert_eq!(first.body.len(), MAX_STDIO_LINE_BYTES);
+        assert_eq!(second.body.len(), 1);
+        assert!(signal_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_stream_does_not_emit_empty_signal_for_boundary_newline() {
+        let mut line = vec![b'a'; MAX_STDIO_LINE_BYTES];
+        line.push(b'\n');
+        let (mut input, output) = tokio::io::duplex(MAX_STDIO_LINE_BYTES + 1);
+        input.write_all(&line).await.expect("write test input");
+        drop(input);
+
+        let (signal_tx, mut signal_rx) = mpsc::channel(4);
+        capture_stream(
+            output,
+            tokio::io::sink(),
+            "stdout",
+            signal_tx,
+            Arc::new(hiloop_core::identity::HlcClock::new()),
+        )
+        .await
+        .expect("capture stream");
+
+        let signal = signal_rx.recv().await.expect("signal").expect("raw signal");
+
+        assert_eq!(signal.body.len(), MAX_STDIO_LINE_BYTES);
+        assert!(signal_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_stream_drains_after_event_pipeline_closes() {
+        let (mut input, output) = tokio::io::duplex(64);
+        input.write_all(b"hello\n").await.expect("write test input");
+        drop(input);
+
+        let (signal_tx, signal_rx) = mpsc::channel(1);
+        drop(signal_rx);
+
+        let error = capture_stream(
+            output,
+            tokio::io::sink(),
+            "stdout",
+            signal_tx,
+            Arc::new(hiloop_core::identity::HlcClock::new()),
+        )
+        .await
+        .expect_err("closed pipeline should be reported after drain");
+
+        assert!(
+            error
+                .to_string()
+                .contains("stdio event pipeline stopped before stdout capture finished")
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_export_failure_does_not_kill_child() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("child-finished");
+        let marker_arg = marker.to_string_lossy().into_owned();
+        let options = RunOptions::new(
+            ForkContext::new_local_root(),
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf 'hello\\n'; sleep 0.1; touch \"$0\"".to_owned(),
+                marker_arg,
+            ],
+            None,
+        );
+
+        let error = Box::pin(run_captured(&options, &FailingExporter))
+            .await
+            .expect_err("export should fail");
+
+        assert!(error.to_string().contains("stdio event pipeline failed"));
+        assert!(
+            marker.exists(),
+            "child should finish despite export failure"
         );
     }
 }

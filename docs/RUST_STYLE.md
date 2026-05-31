@@ -11,9 +11,13 @@ surface area for now. Prefer consistency with nearby code over cleverness.
 - Prefer explicit, descriptive names over abbreviations.
 - Prefer narrow visibility: `pub(crate)` before `pub`, and private before either.
 - Prefer `#[expect(...)]` over `#[allow(...)]` when a lint suppression is deliberate.
+  Keep suppressions local and include the reason when it is not obvious.
 - Use `Option<T>` for true absence. Do not encode missing values as empty strings, zero, empty
   collections, or arbitrary JSON. Boundary sentinel encodings are allowed only when documented by
   the contract, such as root `ForkPath` serializing as `""`.
+- Public configuration should not expose invalid states. Prefer private fields plus constructors
+  and getters when validation is needed; public fields are best reserved for passive wire/data
+  structs.
 - Avoid `panic!`, `unreachable!`, `unwrap`, and `expect` in production code. Encode invariants in
   types or return errors. Tests may use `expect` when it clarifies setup.
 - Avoid `unsafe`. When it becomes necessary, require a `SAFETY:` comment that explains the
@@ -35,8 +39,17 @@ Use rustdoc for:
 - CLI args and config fields, because tools can generate reference docs from them;
 - examples that are worth compiling as doctests.
 
+Use canonical rustdoc sections where they add real information:
+
+- `# Errors` for public fallible APIs;
+- `# Panics` for intentional panics;
+- `# Safety` for unsafe APIs;
+- examples that use `?` instead of `unwrap` unless the unwrap is the point of the example.
+
 Do not use rustdoc to narrate every obvious field. Rustdoc should answer "what contract does this
 API expose?" or "why would I use this?", not "this field stores the value named by the field."
+Do not add a comment just because an item exists. Private helpers usually need no comment unless
+they encode a non-obvious invariant, ordering constraint, or interoperability rule.
 
 Use normal comments sparingly. Good comments usually explain one of:
 
@@ -76,6 +89,7 @@ taxonomy is stable.
 
 - Libraries return typed errors with `thiserror` when callers may match on the failure.
 - Binaries can use `anyhow` at the outer CLI boundary.
+- Preserve source error chains when wrapping lower-level failures across library boundaries.
 - Keep error messages actionable and user-facing at the CLI layer.
 - Use `Result<T, E>` for recoverable failures. Reserve process exit for the binary edge.
 
@@ -86,6 +100,9 @@ Every behavior change needs a test. Choose the narrowest test that proves the co
 - unit tests for pure logic and small invariants;
 - property tests for identity/path/ordering invariants;
 - seam conformance tests once a trait has multiple implementations;
+- shared contract helpers for exporters/normalizers so new implementations inherit the same
+  behavioral checks;
+- async pipeline tests for shutdown, backpressure, error propagation, and flush ordering;
 - integration tests for process behavior, filesystem behavior, and real dependencies;
 - snapshot tests only when textual output is the API.
 
@@ -96,13 +113,26 @@ When adding tests, first look for an existing nearby test module/file.
 
 Reference docs should come from code when the code is the source of truth:
 
-- Rust API docs: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps`.
+- Rust API docs:
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`.
 - CLI help: generated from `clap` doc comments and attributes.
 - Future config/API reference: generate from typed schema/protobuf/config structs rather than
   manually duplicating options in Markdown.
 
 When a change updates CLI args, config schema, protobuf contracts, or public rustdoc examples,
 the generated docs must be regenerated in the same change once the generator exists.
+
+## Review Workflow
+
+Use focused review passes at implementation checkpoints:
+
+- one pass for behavioral correctness, error propagation, shutdown, and data-loss risks;
+- one pass for Rust style, comments/rustdoc, narrow types, and API shape;
+- one pass for CI/tooling/test coverage when the change affects repo workflow.
+
+Review comments should cite the style rule or contract they are enforcing. Do not add comments or
+abstractions just to satisfy review; change the code only when it improves the contract,
+correctness, or maintainability.
 
 ## Python-To-Rust Notes
 

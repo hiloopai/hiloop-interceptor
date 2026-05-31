@@ -11,7 +11,7 @@ use hiloop_core::{
     event::Event,
     identity::{ForkContext, Hlc},
 };
-use std::{collections::BTreeMap, pin::Pin};
+use std::{collections::BTreeMap, error::Error as StdError, pin::Pin};
 use thiserror::Error;
 
 /// Boxed stream of raw signals produced by a [`Source`].
@@ -103,7 +103,6 @@ pub trait Exporter: Send + Sync {
     }
 }
 
-/// Source failure.
 #[derive(Debug, Error)]
 pub enum SourceError {
     #[error("source `{source_name}` stopped: {reason}")]
@@ -117,7 +116,6 @@ pub enum SourceError {
     },
 }
 
-/// Normalization failure.
 #[derive(Debug, Error)]
 pub enum NormalizeError {
     #[error("failed to decode `{kind}` signal from `{source_name}`: {message}")]
@@ -134,13 +132,39 @@ pub enum NormalizeError {
     },
 }
 
-/// Export failure.
 #[derive(Debug, Error)]
 pub enum ExportError {
     #[error("exporter `{exporter}` is applying back-pressure: {message}")]
     Backpressure { exporter: String, message: String },
     #[error("exporter `{exporter}` failed: {message}")]
-    Other { exporter: String, message: String },
+    Other {
+        exporter: String,
+        message: String,
+        #[source]
+        source: Option<Box<dyn StdError + Send + Sync>>,
+    },
+}
+
+impl ExportError {
+    pub fn other(exporter: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Other {
+            exporter: exporter.into(),
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    pub fn with_source(
+        exporter: impl Into<String>,
+        message: impl Into<String>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        Self::Other {
+            exporter: exporter.into(),
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
 }
 
 /// Test helpers and mock implementations for seam conformance suites.
@@ -158,7 +182,6 @@ pub mod testing {
     }
 
     impl MemoryExporter {
-        /// Snapshot of exported events.
         pub fn events(&self) -> Vec<Event> {
             self.events
                 .lock()
