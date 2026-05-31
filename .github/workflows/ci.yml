@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        run: rustup toolchain install --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: check
+        run: cargo check --workspace --all-targets --all-features
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+      - name: test
+        run: cargo test --all-features --workspace
+  # TODO: add a `bench` job that records (does NOT gate) criterion + iai-callgrind
+  # results to Bencher Self-Hosted — "record-don't-gate" until SLOs are real (R18).
+  # TODO: add release packaging (cargo-dist) once we pick install channels.
