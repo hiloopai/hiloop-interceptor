@@ -24,8 +24,22 @@ cargo run -p hiloop-interceptor -- run -- echo hello
 ```
 
 Today this resolves a fork-tree context, injects the spine into the child environment
-(`HILOOP_*`, `OTEL_RESOURCE_ATTRIBUTES`), and passes the command through — the interception
-sources are not implemented yet.
+(`HILOOP_*`, `OTEL_RESOURCE_ATTRIBUTES`), and passes the command through.
+
+To capture stdout/stderr into normalized JSONL events while still teeing child output:
+
+```sh
+cargo run -p hiloop-interceptor -- run --events-jsonl ./events.jsonl -- sh -c 'printf "hello\n"'
+```
+
+Add `--raw-jsonl ./raw.jsonl` with `--events-jsonl` to preserve captured raw observations and stamp
+`raw.observation_id` on the normalized events that came from them.
+
+The current integration test wraps a real command and asserts child output is teed while
+fork-stamped stdio events are flushed to JSONL. That proves the supervisor, env stamping, local
+normalization, and exporter seam wiring. It does not yet prove OTLP ingest, HTTPS proxy capture,
+ClickHouse export, or harness-aware semantic normalization; those are still planned behind the
+existing seams.
 
 ## Workspace
 
@@ -41,6 +55,24 @@ Rust is pinned to stable `1.96.0`; the crate edition and rustfmt style edition a
 
 Rust code style and testing conventions are documented in
 [`docs/RUST_STYLE.md`](./docs/RUST_STYLE.md).
+Performance benchmarking plans are tracked in [`docs/BENCHMARKING.md`](./docs/BENCHMARKING.md).
+
+## Verification and security
+
+Local verification mirrors CI:
+
+```sh
+cargo fmt --all --check
+cargo check --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+cargo test --workspace --all-targets --all-features --locked
+cargo deny check
+```
+
+`cargo deny check` is optional until `cargo-deny` is installed locally, but should be run for
+dependency, license, or lockfile changes. GitHub Dependency Review runs on PRs, and GitHub CodeQL
+default setup should be enabled in repository security settings.
 
 ## Install (eventually)
 

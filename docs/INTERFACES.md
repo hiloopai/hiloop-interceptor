@@ -62,12 +62,57 @@ reports applicability with `supports`, and converts one raw observation into zer
 `Event` values through `NormalizationOutcome`.
 
 The pipeline, not individual normalizers, stamps common provenance such as normalizer name/version,
-output schema version, raw source/kind, and raw retention policy.
+output schema version, raw source/kind, raw retention policy, wrapper identity, and generic process
+metadata when available. `process.argv` is currently JSON-encoded into a string attribute because
+`hiloop-core::event::AttributeValue` is intentionally scalar-only; revisit this if arrays become a
+first-class attribute value.
+
+`NormalizerRouter` returns every supported normalizer for each raw signal. This keeps generic source
+normalization from being bypassed when later semantic enrichers are registered. The helper that
+selects one "best" normalizer keeps the strongest support level and uses registration order for
+ties.
+
+Raw retention is explicit. The default is `discard_after_normalize`; if a normalizer requests
+`preserve`, the pipeline requires a configured `RawStore`, stores the raw observation once, and
+stamps `raw.observation_id` onto emitted events. `JsonlRawStore` is the current local bronze-store
+implementation; production object storage and replay indexing are still future work. Diagnostics
+are counted in `PipelineReport`, but they are not yet routed to exporters or side channels.
+
+The current router can run every supported normalizer for a raw signal, which lets a generic source
+normalizer and an early semantic normalizer coexist. Before shipping harness-specific enrichment as
+a stable extension point, split that into two explicit stages:
+
+```rust
+pub trait SourceNormalizer {
+    fn descriptor(&self) -> NormalizerDescriptor;
+    fn supports(&self, raw: &RawSignal) -> NormalizerSupport;
+    async fn normalize(
+        &self,
+        context: &NormalizationContext,
+        raw: RawSignal,
+    ) -> Result<NormalizationOutcome, NormalizeError>;
+}
+
+pub trait SemanticEnricher {
+    fn descriptor(&self) -> NormalizerDescriptor;
+    fn supports(&self, raw: &RawSignal, events: &[Event]) -> NormalizerSupport;
+    async fn enrich(
+        &self,
+        context: &NormalizationContext,
+        raw: &RawSignal,
+        events: Vec<Event>,
+    ) -> Result<NormalizationOutcome, NormalizeError>;
+}
+```
+
+Migration steps: rename the existing `Normalizer` trait to `SourceNormalizer`, keep a type alias or
+blanket adapter for current implementations, add a separate `SemanticEnricher` registry to the
+pipeline after raw retention, then change `NormalizerRouter::select_all` back to source-normalizer
+selection only.
 
 Expected growth:
 
-- a router that chooses among generic source normalizers and optional harness-specific semantic
-  enrichers;
+- optional harness-specific semantic enrichers layered after generic source normalizers;
 - replay tooling for raw observations;
 - richer diagnostics surfaced to exporters or side channels;
 - typed normalizer output schema versions;

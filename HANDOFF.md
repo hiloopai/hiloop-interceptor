@@ -110,6 +110,11 @@ hiloop-interceptor/
 `HILOOP_*`/`OTEL_RESOURCE_ATTRIBUTES`, execs). Add `--events-jsonl ./events.jsonl` to capture
 stdout/stderr as normalized log events while still teeing child output to the parent.
 
+The current e2e proof wraps a real shell command and verifies JSONL output, so it covers the
+supervisor path, fork-spine stamping, stdio capture, generic normalization, and exporter flush. It
+does not yet cover OTLP ingest, proxy/network capture, ClickHouse delivery, replay/raw-retention
+mechanics, or harness-specific semantic extraction.
+
 ## Decisions that constrain implementation (don't re-litigate without cause)
 
 - **Rust** (footprint × every sandbox + eBPF) — **W1/D10-adjacent**.

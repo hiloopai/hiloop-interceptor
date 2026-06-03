@@ -12,3 +12,4 @@
 - [ ] `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`
 - [ ] `cargo test --workspace --all-targets --all-features --locked`
+- [ ] `cargo deny check` if dependencies, licenses, or `Cargo.lock` changed

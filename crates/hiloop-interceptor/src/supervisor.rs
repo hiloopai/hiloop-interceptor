@@ -5,8 +5,12 @@ use bytes::Bytes;
 use hiloop_core::identity::ForkContext;
 use hiloop_interceptor::{
     exporters::JsonlExporter,
-    pipeline::{PipelineOptions, run_stream},
-    seams::{Exporter, RawSignal, SourceError},
+    pipeline::{PipelineOptions, run_stream_with_router_and_raw_store},
+    raw::JsonlRawStore,
+    seams::{
+        Exporter, NormalizationContext, NormalizerRouter, ProcessContext, RawRetentionPolicy,
+        RawSignal, RawStore, SourceError,
+    },
     stdio::StdioLogNormalizer,
 };
 use std::{
@@ -22,12 +26,16 @@ use tokio::{
 };
 
 const MAX_STDIO_LINE_BYTES: usize = 64 * 1024;
+const OTEL_RUN_ID: &str = "hiloop.run.id";
+const OTEL_FORK_NODE_ID: &str = "hiloop.fork.node_id";
+const OTEL_FORK_PATH: &str = "hiloop.fork.path";
 
 #[derive(Debug, Clone)]
 pub(crate) struct RunOptions {
     context: ForkContext,
     command: Vec<String>,
     events_jsonl: Option<PathBuf>,
+    raw_jsonl: Option<PathBuf>,
 }
 
 impl RunOptions {
@@ -35,11 +43,13 @@ impl RunOptions {
         context: ForkContext,
         command: Vec<String>,
         events_jsonl: Option<PathBuf>,
+        raw_jsonl: Option<PathBuf>,
     ) -> Self {
         Self {
             context,
             command,
             events_jsonl,
+            raw_jsonl,
         }
     }
 }
@@ -52,7 +62,7 @@ struct ChildEnv {
 impl ChildEnv {
     fn for_context(context: &ForkContext) -> Self {
         let resource_attributes = format!(
-            "run.id={},fork.node_id={},fork.path={}",
+            "{OTEL_RUN_ID}={},{OTEL_FORK_NODE_ID}={},{OTEL_FORK_PATH}={}",
             context.run_id, context.fork_node_id, context.fork_path
         );
 
@@ -90,6 +100,10 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
         bail!("no command given; usage: hiloop-interceptor run -- <cmd> [args...]");
     }
 
+    if options.raw_jsonl.is_some() && options.events_jsonl.is_none() {
+        bail!("--raw-jsonl requires --events-jsonl so raw capture and normalization run together");
+    }
+
     if let Some(path) = &options.events_jsonl {
         let exporter = JsonlExporter::create(path).await.with_context(|| {
             format!(
@@ -97,7 +111,16 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
                 path.display()
             )
         })?;
-        return Box::pin(run_captured(options, &exporter)).await;
+        if let Some(raw_path) = &options.raw_jsonl {
+            let raw_store = JsonlRawStore::create(raw_path).await.with_context(|| {
+                format!(
+                    "failed to create JSONL raw observation store at `{}`",
+                    raw_path.display()
+                )
+            })?;
+            return Box::pin(run_captured(options, &exporter, Some(&raw_store))).await;
+        }
+        return Box::pin(run_captured(options, &exporter, None)).await;
     }
 
     let mut child = Command::new(&options.command[0]);
@@ -111,7 +134,11 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
     Ok(exit_code_from_status(status))
 }
 
-async fn run_captured<E>(options: &RunOptions, exporter: &E) -> Result<ExitCode>
+async fn run_captured<E>(
+    options: &RunOptions,
+    exporter: &E,
+    raw_store: Option<&dyn RawStore>,
+) -> Result<ExitCode>
 where
     E: Exporter,
 {
@@ -126,6 +153,7 @@ where
     let mut child = child
         .spawn()
         .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
+    let process = child_process_context(options, child.id());
     let stdout = child
         .stdout
         .take()
@@ -135,7 +163,11 @@ where
         .take()
         .context("child stderr was not available for capture")?;
 
-    let options_pipeline = PipelineOptions::default();
+    let mut options_pipeline = PipelineOptions::default();
+    if raw_store.is_some() {
+        options_pipeline =
+            options_pipeline.with_raw_retention_override(RawRetentionPolicy::Preserve);
+    }
     let (signal_tx, signal_rx) = mpsc::channel(options_pipeline.raw_queue_capacity());
     let clock = Arc::new(hiloop_core::identity::HlcClock::new());
 
@@ -156,12 +188,16 @@ where
     drop(signal_tx);
 
     let normalizer = StdioLogNormalizer;
+    let router = NormalizerRouter::single(&normalizer);
+    let normalization_context =
+        NormalizationContext::new(options.context.clone()).with_process(process);
     let stream = tokio_stream::wrappers::ReceiverStream::new(signal_rx);
-    let pipeline = run_stream(
-        &options.context,
+    let pipeline = run_stream_with_router_and_raw_store(
+        &normalization_context,
         stream,
-        &normalizer,
+        &router,
         exporter,
+        raw_store,
         options_pipeline,
     );
 
@@ -182,6 +218,15 @@ where
     stderr_result.context("failed to capture child stderr")?;
 
     Ok(exit_code_from_status(status))
+}
+
+fn child_process_context(options: &RunOptions, pid: Option<u32>) -> ProcessContext {
+    ProcessContext {
+        pid,
+        command: options.command.first().map(PathBuf::from),
+        argv: options.command.clone(),
+        cwd: std::env::current_dir().ok(),
+    }
 }
 
 async fn capture_stream<R, W>(
@@ -331,7 +376,7 @@ mod tests {
         assert_eq!(
             vars.get("OTEL_RESOURCE_ATTRIBUTES").map(String::as_str),
             Some(
-                "run.id=01J00000000000000000000000,fork.node_id=01J00000000000000000000001,fork.path=/0/3"
+                "hiloop.run.id=01J00000000000000000000000,hiloop.fork.node_id=01J00000000000000000000001,hiloop.fork.path=/0/3"
             )
         );
     }
@@ -435,9 +480,10 @@ mod tests {
                 marker_arg,
             ],
             None,
+            None,
         );
 
-        let error = Box::pin(run_captured(&options, &FailingExporter))
+        let error = Box::pin(run_captured(&options, &FailingExporter, None))
             .await
             .expect_err("export should fail");
 

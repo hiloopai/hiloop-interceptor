@@ -19,9 +19,16 @@ pub mod provenance_keys {
     pub const NORMALIZER_NAME: &str = "normalizer.name";
     pub const NORMALIZER_VERSION: &str = "normalizer.version";
     pub const NORMALIZER_OUTPUT_SCHEMA_VERSION: &str = "normalizer.output_schema_version";
+    pub const PROCESS_ARGV: &str = "process.argv";
+    pub const PROCESS_COMMAND: &str = "process.command";
+    pub const PROCESS_CWD: &str = "process.cwd";
+    pub const PROCESS_PID: &str = "process.pid";
+    pub const RAW_OBSERVATION_ID: &str = "raw.observation_id";
     pub const RAW_SOURCE: &str = "raw.source";
     pub const RAW_KIND: &str = "raw.kind";
     pub const RAW_RETENTION: &str = "raw.retention";
+    pub const WRAPPER_NAME: &str = "wrapper.name";
+    pub const WRAPPER_VERSION: &str = "wrapper.version";
 }
 
 /// Boxed stream of raw signals produced by a [`Source`].
@@ -136,12 +143,117 @@ impl NormalizerSupport {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct SelectedNormalizer<'a> {
+    normalizer: &'a dyn Normalizer,
+    support: NormalizerSupport,
+}
+
+impl<'a> SelectedNormalizer<'a> {
+    pub fn normalizer(self) -> &'a dyn Normalizer {
+        self.normalizer
+    }
+
+    pub fn descriptor(self) -> NormalizerDescriptor {
+        self.normalizer.descriptor()
+    }
+
+    pub fn support(self) -> NormalizerSupport {
+        self.support
+    }
+}
+
+/// Selects supported normalizers; strongest-match queries keep registration order for ties.
+pub struct NormalizerRouter<'a> {
+    normalizers: Vec<&'a dyn Normalizer>,
+}
+
+impl<'a> NormalizerRouter<'a> {
+    pub fn new(
+        normalizers: impl IntoIterator<Item = &'a dyn Normalizer>,
+    ) -> Result<Self, NormalizerRouterError> {
+        let normalizers = normalizers.into_iter().collect::<Vec<_>>();
+        if normalizers.is_empty() {
+            return Err(NormalizerRouterError::Empty);
+        }
+        Ok(Self { normalizers })
+    }
+
+    pub fn single(normalizer: &'a dyn Normalizer) -> Self {
+        Self {
+            normalizers: vec![normalizer],
+        }
+    }
+
+    pub fn select(&self, raw: &RawSignal) -> Option<SelectedNormalizer<'a>> {
+        let mut best = None;
+
+        for selection in self.select_all(raw) {
+            let support = selection.support();
+            if best.is_none_or(|best_selection: SelectedNormalizer<'_>| {
+                support > best_selection.support
+            }) {
+                best = Some(selection);
+            }
+        }
+
+        best
+    }
+
+    pub fn select_all(&self, raw: &RawSignal) -> Vec<SelectedNormalizer<'a>> {
+        let mut selections = Vec::new();
+
+        for normalizer in &self.normalizers {
+            let support = normalizer.supports(raw);
+            if !support.is_supported() {
+                continue;
+            }
+
+            selections.push(SelectedNormalizer {
+                normalizer: *normalizer,
+                support,
+            });
+        }
+
+        selections
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum NormalizerRouterError {
+    #[error("normalizer router requires at least one normalizer")]
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawObservationRef {
+    id: String,
+}
+
+impl RawObservationRef {
+    pub fn new(id: impl Into<String>) -> Result<Self, RawStoreError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(RawStoreError::BlankId);
+        }
+        Ok(Self { id })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 /// Process metadata available without assuming a particular harness.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcessContext {
+    /// Operating-system process identifier, when available.
     pub pid: Option<u32>,
-    pub executable: Option<PathBuf>,
+    /// Command name/path as requested by the supervisor.
+    pub command: Option<PathBuf>,
+    /// Full argument vector passed to the child process.
     pub argv: Vec<String>,
+    /// Working directory inherited by the child process.
     pub cwd: Option<PathBuf>,
 }
 
@@ -192,8 +304,8 @@ impl NormalizationContext {
 /// Policy requested for the raw observation after semantic extraction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RawRetentionPolicy {
-    #[default]
     Preserve,
+    #[default]
     DiscardAfterNormalize,
 }
 
@@ -233,7 +345,7 @@ impl NormalizationOutcome {
         Self {
             events,
             diagnostics: Vec::new(),
-            raw_retention: RawRetentionPolicy::Preserve,
+            raw_retention: RawRetentionPolicy::DiscardAfterNormalize,
         }
     }
 
@@ -296,6 +408,19 @@ pub trait Exporter: Send + Sync {
     }
 }
 
+#[async_trait]
+pub trait RawStore: Send + Sync {
+    async fn store(
+        &self,
+        context: &NormalizationContext,
+        raw: &RawSignal,
+    ) -> Result<RawObservationRef, RawStoreError>;
+
+    async fn flush(&self) -> Result<(), RawStoreError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SourceError {
     #[error("source `{source_name}` stopped: {reason}")]
@@ -349,6 +474,41 @@ pub enum ExportError {
     },
 }
 
+#[derive(Debug, Error)]
+pub enum RawStoreError {
+    #[error("raw observation id must not be blank")]
+    BlankId,
+    #[error("raw store `{store}` failed: {message}")]
+    Other {
+        store: String,
+        message: String,
+        #[source]
+        source: Option<Box<dyn StdError + Send + Sync>>,
+    },
+}
+
+impl RawStoreError {
+    pub fn other(store: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Other {
+            store: store.into(),
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    pub fn with_source(
+        store: impl Into<String>,
+        message: impl Into<String>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        Self::Other {
+            store: store.into(),
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
 impl ExportError {
     pub fn other(exporter: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Other {
@@ -375,7 +535,8 @@ impl ExportError {
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
     use super::{
-        ExportError, Exporter, NormalizationContext, NormalizationOutcome, Normalizer, RawSignal,
+        ExportError, Exporter, NormalizationContext, NormalizationOutcome, Normalizer,
+        RawObservationRef, RawSignal, RawStore, RawStoreError,
     };
     use async_trait::async_trait;
     use hiloop_core::event::Event;
@@ -427,5 +588,105 @@ pub mod testing {
                 .extend_from_slice(events);
             Ok(())
         }
+    }
+
+    #[derive(Debug, Default)]
+    pub struct MemoryRawStore {
+        raws: Mutex<Vec<(RawObservationRef, RawSignal)>>,
+    }
+
+    impl MemoryRawStore {
+        pub fn raws(&self) -> Vec<(RawObservationRef, RawSignal)> {
+            self.raws
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl RawStore for MemoryRawStore {
+        async fn store(
+            &self,
+            _context: &NormalizationContext,
+            raw: &RawSignal,
+        ) -> Result<RawObservationRef, RawStoreError> {
+            let mut raws = self
+                .raws
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let raw_ref = RawObservationRef::new(format!("raw-{}", raws.len() + 1))?;
+            raws.push((raw_ref.clone(), raw.clone()));
+            Ok(raw_ref)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct StubNormalizer {
+        descriptor: NormalizerDescriptor,
+        support: NormalizerSupport,
+    }
+
+    #[async_trait]
+    impl Normalizer for StubNormalizer {
+        fn descriptor(&self) -> NormalizerDescriptor {
+            self.descriptor
+        }
+
+        fn supports(&self, _raw: &RawSignal) -> NormalizerSupport {
+            self.support
+        }
+
+        async fn normalize(
+            &self,
+            _context: &NormalizationContext,
+            _raw: RawSignal,
+        ) -> Result<NormalizationOutcome, NormalizeError> {
+            Ok(NormalizationOutcome::default())
+        }
+    }
+
+    #[test]
+    fn normalizer_router_selects_strongest_supported_match() {
+        let fallback = StubNormalizer {
+            descriptor: NormalizerDescriptor::new("fallback", "1", "event.v1"),
+            support: NormalizerSupport::Fallback,
+        };
+        let unsupported = StubNormalizer {
+            descriptor: NormalizerDescriptor::new("unsupported", "1", "event.v1"),
+            support: NormalizerSupport::Unsupported,
+        };
+        let exact = StubNormalizer {
+            descriptor: NormalizerDescriptor::new("exact", "1", "event.v1"),
+            support: NormalizerSupport::Exact,
+        };
+        let normalizers: [&dyn Normalizer; 3] = [&fallback, &unsupported, &exact];
+        let router = NormalizerRouter::new(normalizers).expect("router");
+        let raw = RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::new(),
+        );
+
+        let selected = router.select(&raw).expect("selected normalizer");
+
+        assert_eq!(selected.descriptor().name(), "exact");
+        assert_eq!(selected.support(), NormalizerSupport::Exact);
+    }
+
+    #[test]
+    fn normalizer_router_rejects_empty_registry() {
+        let normalizers: [&dyn Normalizer; 0] = [];
+
+        assert!(NormalizerRouter::new(normalizers).is_err());
     }
 }

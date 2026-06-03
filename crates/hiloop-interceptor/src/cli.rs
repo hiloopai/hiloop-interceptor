@@ -56,6 +56,10 @@ struct RunArgs {
     #[arg(long = "events-jsonl", env = "HILOOP_EVENTS_JSONL")]
     events_jsonl: Option<PathBuf>,
 
+    /// Create a newline-delimited raw observation file. Requires `--events-jsonl`.
+    #[arg(long = "raw-jsonl", env = "HILOOP_RAW_JSONL")]
+    raw_jsonl: Option<PathBuf>,
+
     /// Command to wrap. Everything after `--` is passed to the child.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -69,6 +73,6 @@ impl RunArgs {
             self.fork_path.unwrap_or_default(),
         );
 
-        RunOptions::new(context, self.command, self.events_jsonl)
+        RunOptions::new(context, self.command, self.events_jsonl, self.raw_jsonl)
     }
 }
