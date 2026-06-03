@@ -11,8 +11,18 @@ use hiloop_core::{
     event::Event,
     identity::{ForkContext, Hlc},
 };
-use std::{collections::BTreeMap, error::Error as StdError, pin::Pin};
+use std::{collections::BTreeMap, error::Error as StdError, path::PathBuf, pin::Pin};
 use thiserror::Error;
+
+/// Normalized attribute keys reserved for interceptor provenance.
+pub mod provenance_keys {
+    pub const NORMALIZER_NAME: &str = "normalizer.name";
+    pub const NORMALIZER_VERSION: &str = "normalizer.version";
+    pub const NORMALIZER_OUTPUT_SCHEMA_VERSION: &str = "normalizer.output_schema_version";
+    pub const RAW_SOURCE: &str = "raw.source";
+    pub const RAW_KIND: &str = "raw.kind";
+    pub const RAW_RETENTION: &str = "raw.retention";
+}
 
 /// Boxed stream of raw signals produced by a [`Source`].
 pub type RawSignalStream = Pin<Box<dyn Stream<Item = Result<RawSignal, SourceError>> + Send>>;
@@ -78,16 +88,199 @@ pub trait Source: Send + Sync {
     fn signals(&self) -> RawSignalStream;
 }
 
+/// Stable identity and output schema of a normalizer implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NormalizerDescriptor {
+    name: &'static str,
+    version: &'static str,
+    output_schema_version: &'static str,
+}
+
+impl NormalizerDescriptor {
+    pub const fn new(
+        name: &'static str,
+        version: &'static str,
+        output_schema_version: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            version,
+            output_schema_version,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    pub const fn version(self) -> &'static str {
+        self.version
+    }
+
+    pub const fn output_schema_version(self) -> &'static str {
+        self.output_schema_version
+    }
+}
+
+/// Strength of a normalizer match for a raw signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NormalizerSupport {
+    Unsupported,
+    Fallback,
+    Exact,
+}
+
+impl NormalizerSupport {
+    pub const fn is_supported(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+}
+
+/// Process metadata available without assuming a particular harness.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessContext {
+    pub pid: Option<u32>,
+    pub executable: Option<PathBuf>,
+    pub argv: Vec<String>,
+    pub cwd: Option<PathBuf>,
+}
+
+/// Interceptor metadata stamped onto normalized output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrapperContext {
+    pub name: &'static str,
+    pub version: &'static str,
+}
+
+impl WrapperContext {
+    pub const fn current() -> Self {
+        Self {
+            name: env!("CARGO_PKG_NAME"),
+            version: env!("CARGO_PKG_VERSION"),
+        }
+    }
+}
+
+/// Context shared by every normalizer invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizationContext {
+    fork: ForkContext,
+    pub process: Option<ProcessContext>,
+    pub wrapper: WrapperContext,
+}
+
+impl NormalizationContext {
+    pub fn new(fork: ForkContext) -> Self {
+        Self {
+            fork,
+            process: None,
+            wrapper: WrapperContext::current(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_process(mut self, process: ProcessContext) -> Self {
+        self.process = Some(process);
+        self
+    }
+
+    pub fn fork_context(&self) -> &ForkContext {
+        &self.fork
+    }
+}
+
+/// Policy requested for the raw observation after semantic extraction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RawRetentionPolicy {
+    #[default]
+    Preserve,
+    DiscardAfterNormalize,
+}
+
+impl RawRetentionPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::DiscardAfterNormalize => "discard_after_normalize",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizationDiagnostic {
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+}
+
+/// Events and side information produced from one raw observation.
+#[derive(Debug, Clone, Default)]
+pub struct NormalizationOutcome {
+    events: Vec<Event>,
+    diagnostics: Vec<NormalizationDiagnostic>,
+    raw_retention: RawRetentionPolicy,
+}
+
+impl NormalizationOutcome {
+    pub fn from_events(events: Vec<Event>) -> Self {
+        Self {
+            events,
+            diagnostics: Vec::new(),
+            raw_retention: RawRetentionPolicy::Preserve,
+        }
+    }
+
+    #[must_use]
+    pub fn with_raw_retention(mut self, raw_retention: RawRetentionPolicy) -> Self {
+        self.raw_retention = raw_retention;
+        self
+    }
+
+    #[must_use]
+    pub fn with_diagnostic(mut self, diagnostic: NormalizationDiagnostic) -> Self {
+        self.diagnostics.push(diagnostic);
+        self
+    }
+
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    pub fn diagnostics(&self) -> &[NormalizationDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn raw_retention_policy(&self) -> RawRetentionPolicy {
+        self.raw_retention
+    }
+
+    pub fn into_events(self) -> Vec<Event> {
+        self.events
+    }
+}
+
 /// Turns raw signals into fork-stamped events.
 #[async_trait]
 pub trait Normalizer: Send + Sync {
-    /// Normalize one raw signal. Returning multiple events covers batch payloads
-    /// like OTLP exports.
+    /// Stable identity used for provenance, replay, and schema evolution.
+    fn descriptor(&self) -> NormalizerDescriptor;
+
+    /// Report whether this normalizer should handle a raw signal.
+    fn supports(&self, raw: &RawSignal) -> NormalizerSupport;
+
+    /// Normalize one raw signal. Returning multiple events covers batch payloads like OTLP exports.
     async fn normalize(
         &self,
-        context: &ForkContext,
+        context: &NormalizationContext,
         raw: RawSignal,
-    ) -> Result<Vec<Event>, NormalizeError>;
+    ) -> Result<NormalizationOutcome, NormalizeError>;
 }
 
 /// Ships normalized events to a downstream bus or store.
@@ -118,6 +311,12 @@ pub enum SourceError {
 
 #[derive(Debug, Error)]
 pub enum NormalizeError {
+    #[error("normalizer `{normalizer}` does not support `{kind}` signal from `{source_name}`")]
+    Unsupported {
+        normalizer: &'static str,
+        source_name: String,
+        kind: String,
+    },
     #[error("failed to decode `{kind}` signal from `{source_name}`: {message}")]
     Decode {
         source_name: String,
@@ -128,6 +327,11 @@ pub enum NormalizeError {
     PayloadOffload {
         source_name: String,
         kind: String,
+        message: String,
+    },
+    #[error("normalizer `{normalizer}` produced invalid output: {message}")]
+    InvalidOutput {
+        normalizer: &'static str,
         message: String,
     },
 }
@@ -170,10 +374,34 @@ impl ExportError {
 /// Test helpers and mock implementations for seam conformance suites.
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
-    use super::{ExportError, Exporter};
+    use super::{
+        ExportError, Exporter, NormalizationContext, NormalizationOutcome, Normalizer, RawSignal,
+    };
     use async_trait::async_trait;
     use hiloop_core::event::Event;
+    use hiloop_core::identity::ForkContext;
     use std::sync::Mutex;
+
+    pub async fn assert_normalizer_accepts_supported_raw<N>(
+        normalizer: &N,
+        raw: RawSignal,
+    ) -> Result<NormalizationOutcome, super::NormalizeError>
+    where
+        N: Normalizer,
+    {
+        let descriptor = normalizer.descriptor();
+        assert!(!descriptor.name().trim().is_empty());
+        assert!(!descriptor.version().trim().is_empty());
+        assert!(!descriptor.output_schema_version().trim().is_empty());
+        assert!(normalizer.supports(&raw).is_supported());
+
+        normalizer
+            .normalize(
+                &NormalizationContext::new(ForkContext::new_local_root()),
+                raw,
+            )
+            .await
+    }
 
     /// In-memory exporter used by contract tests.
     #[derive(Debug, Default)]

@@ -14,7 +14,7 @@ surface area for now. Prefer consistency with nearby code over cleverness.
   Keep suppressions local and include the reason when it is not obvious.
 - Use `Option<T>` for true absence. Do not encode missing values as empty strings, zero, empty
   collections, or arbitrary JSON. Boundary sentinel encodings are allowed only when documented by
-  the contract, such as root `ForkPath` serializing as `""`.
+  the contract, such as a wire format that reserves a specific root identifier.
 - Public configuration should not expose invalid states. Prefer private fields plus constructors
   and getters when validation is needed; public fields are best reserved for passive wire/data
   structs.
@@ -59,31 +59,67 @@ Use normal comments sparingly. Good comments usually explain one of:
 - a security or data-loss caveat;
 - why a simpler-looking approach is wrong.
 
-Prefer rustdoc links like [`ForkPath`] or [`Event`] when referencing local API items.
+Prefer rustdoc links when referencing local API items.
 
 ## Public Contracts
 
-`hiloop-core` is the shared contract crate. Keep it dependency-light and stable:
+Shared contract crates should stay dependency-light and stable. They are best suited for:
 
-- fork identity types;
-- telemetry event data types;
-- parsing/validation helpers for those data types.
+- persisted or wire-format data types;
+- identity and schema types used by multiple crates or repositories;
+- parsing and validation helpers for those contracts;
+- public extension APIs with shared conformance tests.
 
-Do not put implementation seams in `hiloop-core` unless at least one of these is true:
+Do not put implementation seams in a shared contract crate unless at least one of these is true:
 
-- both OSS and private repos compile against the trait;
+- multiple independently owned components compile against the trait;
 - the type defines persisted or wire compatibility;
 - it is a public extension API;
-- its conformance suite must be shared across public and private implementations.
+- its conformance suite must be shared across implementations.
 
-Wrapper-only traits live in `hiloop-interceptor`. Private-only traits live in the private monorepo
-near the component that owns them.
+Implementation-local traits should live near the component that owns them. Private-only traits
+should stay private until they become a real cross-component contract.
 
-Raw ingress types may be looser than normalized contracts. For example,
-`hiloop_interceptor::seams::RawSignal` keeps source/kind/attribute data as strings because it
-represents heterogeneous pre-normalization input. This is an explicit exception to the narrow-type
-rule, not a precedent for normalized schemas. Revisit those fields once the source and kind
-taxonomy is stable.
+Boundary ingress types may be looser than normalized contracts when they represent heterogeneous
+pre-normalization input. Treat that as an explicit exception to the narrow-type rule, not as a
+precedent for normalized schemas. Revisit loose fields once the taxonomy is stable.
+
+## Interface Boundaries
+
+Interfaces should make the correct path the easy path. A trait should usually exist only when it
+represents an external boundary, a plugin point, or a contract that needs shared conformance tests.
+Avoid trait layers that only wrap one concrete implementation without clarifying ownership, failure
+modes, or future extension.
+
+Implementation-specific interface notes belong in a separate design document that can evolve with
+the codebase. Keep this style guide focused on review principles that should remain stable.
+
+### Review Checklist
+
+Use this checklist when adding or changing a trait, persisted type, or cross-crate boundary:
+
+- Is this a real boundary with multiple plausible implementations, or a shared wire/persisted
+  contract? If not, prefer concrete functions/types.
+- Does the interface live at the right layer: shared contract crate, extension-point crate, or the
+  private component that owns the behavior?
+- Is the contract minimal? Each method should have one clear responsibility and one owner.
+- Are invalid states unrepresentable where practical? Prefer enums, newtypes, validated
+  constructors, `Option<T>` for absence, and `Result<T, E>` for recoverable failure.
+- Are string keys, schema names, and sentinel values centralized as constants, enums, or newtypes?
+  Avoid magic strings at call sites.
+- Does persisted or replayable output include stable identity and versioning for the implementation
+  that produced it?
+- Is support/routing behavior explicit? Implementations should report whether they can handle an
+  input instead of guessing inside the main operation.
+- Does shared metadata get enforced centrally by the orchestration layer when possible, rather than
+  relying on each implementation to remember it?
+- Are raw data retention, diagnostics, and lossy conversions explicit in the type signatures or
+  documented as deferred decisions?
+- Are shutdown, flush, cancellation, back-pressure, and partial failure semantics testable?
+- Does every new implementation pass shared conformance tests, plus focused tests for its own
+  source/protocol behavior?
+- Are public fields limited to passive wire/data structs? Use private fields plus constructors and
+  getters when validation or invariants matter.
 
 ## Error Handling
 
@@ -100,9 +136,9 @@ Every behavior change needs a test. Choose the narrowest test that proves the co
 - unit tests for pure logic and small invariants;
 - property tests for identity/path/ordering invariants;
 - seam conformance tests once a trait has multiple implementations;
-- shared contract helpers for exporters/normalizers so new implementations inherit the same
+- shared contract helpers for boundary implementations so new implementations inherit the same
   behavioral checks;
-- async pipeline tests for shutdown, backpressure, error propagation, and flush ordering;
+- async workflow tests for shutdown, backpressure, error propagation, and flush ordering;
 - integration tests for process behavior, filesystem behavior, and real dependencies;
 - snapshot tests only when textual output is the API.
 

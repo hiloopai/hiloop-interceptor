@@ -1,10 +1,14 @@
 //! Tokio pipeline for source, normalization, and export stages.
 
 use crate::seams::{
-    ExportError, Exporter, NormalizeError, Normalizer, RawSignal, Source, SourceError,
+    ExportError, Exporter, NormalizationContext, NormalizeError, Normalizer, NormalizerDescriptor,
+    RawRetentionPolicy, RawSignal, Source, SourceError, provenance_keys,
 };
 use futures_util::StreamExt;
-use hiloop_core::identity::ForkContext;
+use hiloop_core::{
+    event::{AttributeKey, Event},
+    identity::ForkContext,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -116,6 +120,29 @@ where
 /// Accepts any raw-signal stream, including producer-backed Tokio channels.
 pub async fn run_stream<S, N, E>(
     context: &ForkContext,
+    stream: S,
+    normalizer: &N,
+    exporter: &E,
+    options: PipelineOptions,
+) -> Result<PipelineReport, PipelineError>
+where
+    S: futures_core::Stream<Item = Result<RawSignal, SourceError>> + Unpin,
+    N: Normalizer,
+    E: Exporter,
+{
+    let normalization_context = NormalizationContext::new(context.clone());
+    run_stream_with_context(
+        &normalization_context,
+        stream,
+        normalizer,
+        exporter,
+        options,
+    )
+    .await
+}
+
+pub async fn run_stream_with_context<S, N, E>(
+    context: &NormalizationContext,
     mut stream: S,
     normalizer: &N,
     exporter: &E,
@@ -129,6 +156,7 @@ where
     let (raw_tx, mut raw_rx) = mpsc::channel(options.raw_queue_capacity());
     let (event_tx, mut event_rx) = mpsc::channel(options.event_queue_capacity());
     let context = context.clone();
+    let descriptor = normalizer.descriptor();
 
     let source_stage = async move {
         let mut raw_signals = 0;
@@ -148,7 +176,22 @@ where
     let normalize_stage = async move {
         let mut events = 0;
         while let Some(raw) = raw_rx.recv().await {
-            for event in normalizer.normalize(&context, raw).await? {
+            if !normalizer.supports(&raw).is_supported() {
+                return Err(PipelineError::Normalize(NormalizeError::Unsupported {
+                    normalizer: descriptor.name(),
+                    source_name: raw.source,
+                    kind: raw.kind,
+                }));
+            }
+
+            let source = raw.source.clone();
+            let kind = raw.kind.clone();
+            let outcome = normalizer.normalize(&context, raw).await?;
+            let retention = outcome.raw_retention_policy();
+
+            for event in outcome.into_events() {
+                let event =
+                    stamp_normalization_metadata(event, descriptor, retention, &source, &kind)?;
                 event_tx
                     .send(event)
                     .await
@@ -193,6 +236,52 @@ where
         events,
         export_batches,
     })
+}
+
+fn stamp_normalization_metadata(
+    event: Event,
+    descriptor: NormalizerDescriptor,
+    retention: RawRetentionPolicy,
+    source: &str,
+    kind: &str,
+) -> Result<Event, PipelineError> {
+    Ok(event
+        .with_attribute(
+            normalizer_key(provenance_keys::NORMALIZER_NAME, descriptor)?,
+            descriptor.name(),
+        )
+        .with_attribute(
+            normalizer_key(provenance_keys::NORMALIZER_VERSION, descriptor)?,
+            descriptor.version(),
+        )
+        .with_attribute(
+            normalizer_key(
+                provenance_keys::NORMALIZER_OUTPUT_SCHEMA_VERSION,
+                descriptor,
+            )?,
+            descriptor.output_schema_version(),
+        )
+        .with_attribute(
+            normalizer_key(provenance_keys::RAW_SOURCE, descriptor)?,
+            source,
+        )
+        .with_attribute(normalizer_key(provenance_keys::RAW_KIND, descriptor)?, kind)
+        .with_attribute(
+            normalizer_key(provenance_keys::RAW_RETENTION, descriptor)?,
+            retention.as_str(),
+        ))
+}
+
+fn normalizer_key(
+    value: &'static str,
+    descriptor: NormalizerDescriptor,
+) -> Result<AttributeKey, PipelineError> {
+    AttributeKey::new(value)
+        .map_err(|error| NormalizeError::InvalidOutput {
+            normalizer: descriptor.name(),
+            message: error.to_string(),
+        })
+        .map_err(PipelineError::Normalize)
 }
 
 #[cfg(test)]
@@ -283,7 +372,27 @@ mod tests {
                 export_batches: 1,
             }
         );
-        assert_eq!(exporter.events().len(), 1);
+        let events = exporter.events();
+        assert_eq!(events.len(), 1);
+        let value = serde_json::to_value(&events[0]).expect("serialize event");
+        assert_eq!(
+            value["attributes"][provenance_keys::NORMALIZER_NAME],
+            "stdio-log"
+        );
+        assert_eq!(
+            value["attributes"][provenance_keys::NORMALIZER_VERSION],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            value["attributes"][provenance_keys::NORMALIZER_OUTPUT_SCHEMA_VERSION],
+            "hiloop.event.v1"
+        );
+        assert_eq!(value["attributes"][provenance_keys::RAW_SOURCE], "stdio");
+        assert_eq!(value["attributes"][provenance_keys::RAW_KIND], "stdout");
+        assert_eq!(
+            value["attributes"][provenance_keys::RAW_RETENTION],
+            "preserve"
+        );
         assert!(exporter.flushed());
     }
 

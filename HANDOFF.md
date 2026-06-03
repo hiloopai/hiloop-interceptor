@@ -58,7 +58,16 @@ Nail the **contracts + the spine + mocks**, so P1 can be built/tested against th
    public/private implementations. **Decision:** `RawSignal` is intentionally stringly typed
    because it represents heterogeneous pre-normalization ingress. The normalized `Event` boundary
    remains narrow. Revisit `RawSignal::source`, `RawSignal::kind`, and raw attributes once source
-   categories stabilize.
+   categories stabilize. **Decision:** normalization is layered and generic-first. Source
+   normalizers should capture reliable provenance (source kind, stream, process identity, argv/cwd,
+   wrapper version, sandbox/host context when known) without assuming a named harness. Optional
+   harness semantic normalizers can later extract structured `llm.*` / `agent.*` events for
+   popular or customer-specific harnesses, but raw/bronze observations plus
+   `normalizer_name` / `normalizer_version` metadata must remain available for replay and parser
+   evolution. **Implementation order:** design the normalization interface and conformance suite
+   first, then build the default/generic implementation against it. The interface must encode
+   normalizer identity/versioning, support matching, provenance inputs, canonical event outputs,
+   diagnostics, and raw/bronze retention policy.
 4. **Runtime pipeline** — **decision:** use Tokio with bounded queues for `Source -> Normalizer
    -> Exporter`. The default path is lossless/blocking: stdout/stderr are tee'd to the parent,
    normalized to `process.stdout` / `process.stderr` log events, and flushed through the selected
