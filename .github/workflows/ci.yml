@@ -31,8 +31,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: docs
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-      - name: test
+      - name: tests including mock harness e2e
         run: cargo test --workspace --all-targets --all-features --locked
+      - name: doctests
+        run: cargo test --workspace --doc --all-features --locked
   msrv:
     runs-on: ubuntu-latest
     steps:

@@ -110,10 +110,12 @@ hiloop-interceptor/
 `HILOOP_*`/`OTEL_RESOURCE_ATTRIBUTES`, execs). Add `--events-jsonl ./events.jsonl` to capture
 stdout/stderr as normalized log events while still teeing child output to the parent.
 
-The current e2e proof wraps a real shell command and verifies JSONL output, so it covers the
-supervisor path, fork-spine stamping, stdio capture, generic normalization, and exporter flush. It
-does not yet cover OTLP ingest, proxy/network capture, ClickHouse delivery, replay/raw-retention
-mechanics, or harness-specific semantic extraction.
+The mock-harness e2e suite wraps deterministic shell scenarios and covers pass-through/context
+injection, child exit propagation, fork-spine stamping, byte-for-byte stdio teeing, binary and
+empty-line handling, lossless per-stream ordering under load, raw-observation linking, generic
+normalization, and exporter flush. It does not yet cover OTLP ingest, proxy/network capture,
+ClickHouse delivery, production replay, signal/process-tree supervision, or harness-specific
+semantic extraction. See `docs/TESTING.md` for the desired behavior contract and test ladder.
 
 ## Decisions that constrain implementation (don't re-litigate without cause)
 

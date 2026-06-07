@@ -1,7 +1,8 @@
 # Benchmarking Plan
 
 Use benchmarks to understand interceptor overhead over time. Start by recording results, not gating
-PRs, until workloads and runners are stable.
+PRs, until workloads and runners are stable. Correctness under load remains a hard gate; the
+directional performance budgets and promotion rules live in [`TESTING.md`](TESTING.md).
 
 ## Tooling
 
@@ -31,7 +32,11 @@ PRs, until workloads and runners are stable.
    - Track: events/s, JSONL bytes/s, serialized bytes/event, and flush time.
 
 4. `stdio_e2e_binary`
-   - Run `hiloop-interceptor run --events-jsonl ... -- <line generator>`.
+   - Run `hiloop-interceptor run --events-jsonl ... -- <native line generator>` using the same
+     workload shapes as the mock-harness E2E suite. The POSIX shell fixture is for correctness,
+     not throughput measurement.
+   - Measure direct child execution separately, then report interceptor added time and slowdown
+     ratio.
    - Compare against the same child command without capture.
    - Track: child slowdown ratio, captured lines/s, stdout/stderr bytes/s, and JSONL bytes/s.
 
@@ -47,6 +52,9 @@ PRs, until workloads and runners are stable.
   metrics once Valgrind setup is stable.
 - Every recorded run should include commit SHA, rustc version, OS/kernel, CPU model, runner type,
   profile, benchmark command, and benchmark tool versions.
+- Wall-clock results from shared GitHub runners are diagnostic artifacts, not comparable baselines.
+- Keep benchmark input generation out of the timed region.
+- Measure pass-through, event JSONL, and event+raw JSONL separately so retention cost is visible.
 
 ## Standard Metrics
 

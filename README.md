@@ -55,11 +55,13 @@ Rust is pinned to stable `1.96.0`; the crate edition and rustfmt style edition a
 
 Rust code style and testing conventions are documented in
 [`docs/RUST_STYLE.md`](./docs/RUST_STYLE.md).
+The behavior contract, E2E ladder, and initial performance budgets are documented in
+[`docs/TESTING.md`](./docs/TESTING.md).
 Performance benchmarking plans are tracked in [`docs/BENCHMARKING.md`](./docs/BENCHMARKING.md).
 
 ## Verification and security
 
-Local verification mirrors CI:
+Local verification covers CI plus the local dependency policy:
 
 ```sh
 cargo fmt --all --check
@@ -67,7 +69,14 @@ cargo check --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --doc --all-features --locked
 cargo deny check
+```
+
+Run the compiled-binary mock-harness E2E suite directly with:
+
+```sh
+cargo test -p hiloop-interceptor --test interceptor_e2e --all-features --locked
 ```
 
 `cargo deny check` is optional until `cargo-deny` is installed locally, but should be run for

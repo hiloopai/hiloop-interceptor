@@ -1,0 +1,128 @@
+# Testing Strategy
+
+The interceptor sits between a harness and the outside world. Its first obligation is to preserve
+the harness's behavior; its second is to capture useful, correctly attributed telemetry without
+silent loss. Tests should make both obligations explicit.
+
+Implemented correctness contracts gate CI. Wall-clock performance is recorded and reviewed until
+representative workloads and stable runners give us enough evidence to set hard regression
+thresholds.
+
+## Behavior Contract
+
+| ID | Required behavior | Primary proof |
+|---|---|---|
+| B1 | The wrapped command receives the requested argv and fork context. | Mock-harness E2E |
+| B2 | Without capture enabled, stdout/stderr and the child exit code pass through unchanged. | Mock-harness E2E |
+| B3 | With capture enabled, stdout/stderr are teed byte-for-byte while normalized events are emitted. | Mock-harness E2E |
+| B4 | Every normalized event carries the requested run/node/path plus normalizer, wrapper, raw-source, and process provenance. | Pipeline tests + E2E |
+| B5 | Each source stream preserves observation order. No total order between independent sources such as stdout and stderr is promised. | Load E2E |
+| B6 | LF and CRLF delimit records; a final partial line is emitted; empty lines are events; lines over 64 KiB are emitted in bounded chunks. | Supervisor unit tests + E2E |
+| B7 | Non-UTF-8 bodies are preserved losslessly as base64 rather than replaced or decoded lossily. | Normalizer unit test + E2E |
+| B8 | The default capture path is lossless and bounded: downstream pressure may block the child, but it must not silently drop or duplicate observations. | Pipeline tests + load E2E; backpressure stress pending |
+| B9 | Raw preservation stores one raw observation per captured signal and links every derived event to it. Default retention does not create raw records. | Pipeline tests + E2E |
+| B10 | On normal or nonzero child exit, capture drains and exporters/raw stores flush before the wrapper returns the child exit code. | Pipeline tests + E2E |
+| B11 | Invalid output configuration and output-file conflicts fail before the child starts. | Mock-harness E2E |
+| B12 | A telemetry pipeline failure does not abruptly kill a still-running child; the wrapper drains the child and then reports telemetry failure. | Supervisor unit test |
+
+These are desired contracts, not incidental implementation details. Changing one requires an
+explicit design decision and updated tests.
+
+## Known Contract Gaps
+
+The following behavior is needed before the interceptor is a production supervisor:
+
+- **Live export latency:** a partial batch is currently exported only when it fills or the child
+  exits. Add a configurable maximum batch delay and prove emit-to-export p95 stays under one second.
+- **Signals and process trees:** define and test signal forwarding, descendant cleanup, orphan
+  reaping when running as PID 1, and wrapper behavior when the parent disappears.
+- **Telemetry failure policy:** the current policy protects child liveness and reports failure
+  afterward. Define configurable fail-open/fail-closed policy before production exporters land.
+- **Existing environment:** define merge/override behavior for pre-existing
+  `OTEL_RESOURCE_ATTRIBUTES`, proxy variables, and CA bundle variables.
+- **Slow and failed sinks:** prove bounded memory, lossless blocking, cancellation, flush ordering,
+  and recovery with a deliberately slow/failing exporter and raw store.
+- **Capture surfaces:** add the same contract coverage for OTLP, proxy, and future eBPF sources.
+
+## Test Layers
+
+### Pull Requests
+
+PR CI runs:
+
+1. Unit and property tests for narrow logic and schema invariants.
+2. Seam conformance tests against every implementation and its in-memory mock.
+3. Mock-harness E2E tests against the compiled interceptor binary.
+4. Formatting, compile, clippy, rustdoc, and dependency-review checks.
+
+The deterministic mock harness lives at
+`crates/hiloop-interceptor/tests/fixtures/mock_harness.sh`. It has explicit modes for context
+inspection, mixed streams, binary output, nonzero exits, high-volume output, and child-start
+markers. It uses POSIX `sh`, matching the interceptor's current Unix/PID-1 product scope.
+
+Run the fast E2E suite directly:
+
+```sh
+cargo test -p hiloop-interceptor --test interceptor_e2e --all-features --locked
+```
+
+### Nightly
+
+Nightly tests should add workloads that are too slow or timing-sensitive for every PR:
+
+- 100,000+ events through small queues with a slow exporter;
+- cancellation and exporter/raw-store failure at each pipeline stage;
+- memory high-water measurement during sustained capture;
+- repeated start/stop and nonzero-exit loops to detect leaked processes or file descriptors;
+- Criterion wall-clock benchmark recording.
+
+### Pre-Release
+
+Pre-release testing should use real integrations:
+
+- representative harnesses, including at least one customer-shaped custom harness;
+- real OTLP SDKs and the embedded receiver;
+- HTTPS proxy capture across supported runtimes;
+- production exporter/backend;
+- PID-1 execution in the target sandbox image;
+- a multi-hour soak with telemetry and dependency failures.
+
+## E2E Review Rules
+
+- Assert observable behavior at the binary boundary, not private implementation details.
+- Use fixed fork identity in E2E tests so provenance assertions are deterministic.
+- Assert exact bytes at the tee boundary and parsed values at JSONL boundaries.
+- Assert per-stream order only; scheduling makes stdout/stderr total order nondeterministic.
+- Keep PR scenarios deterministic and small. Throughput measurements belong in benchmarks, not
+  wall-clock assertions on shared CI runners.
+- Give every external-process scenario a timeout so a deadlock fails instead of hanging CI.
+- A load test may gate on zero loss, duplication, or deadlock. It must not gate on elapsed time
+  until it runs on a stable performance runner.
+
+## Performance Contract
+
+Correctness under load must become a hard gate as the corresponding implementations and
+deterministic stress harnesses land:
+
+- no dropped or duplicated observations in the default blocking mode;
+- memory remains bounded by configured queues, batches, maximum in-flight bodies, and exporter
+  buffers rather than total run duration;
+- shutdown drains accepted observations and flushes durable sinks;
+- pressure is observable through metrics and does not become an unexplained hang.
+
+The initial directional budgets are:
+
+| Surface | Metric | Directional budget |
+|---|---|---|
+| Wrapper | release binary / idle RSS | `< 20 MB` / `< 30 MB` |
+| Pass-through | added process startup p95 | `< 25 ms` |
+| Stdio capture | short-line throughput | `>= 100k events/s/node` |
+| Stdio capture | 1 KiB aggregate throughput | `>= 50 MiB/s/node` |
+| Live export | capture-to-export p95 | `< 1 s` |
+| Proxy, once implemented | added request latency p99 | `< 5 ms` |
+| Soak | memory/file-descriptor/process growth | flat after warm-up |
+
+These budgets are hypotheses. Record the hardware, OS, toolchain, workload, and queue/batch
+configuration with every result. Promote a budget to a CI gate only after repeated measurements on
+a stable runner and validation against real harness workloads. See
+[`BENCHMARKING.md`](BENCHMARKING.md) for the benchmark implementation plan.
