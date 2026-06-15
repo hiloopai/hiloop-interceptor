@@ -50,6 +50,7 @@ const PROXY_SOURCE: &str = "proxy";
 const REQUEST_KIND: &str = "http.request";
 const RESPONSE_KIND: &str = "http.response";
 const EXCHANGE_ID_ATTR: &str = "http.exchange_id";
+const TRUNCATED_ATTR: &str = "http.capture.truncated";
 const CA_CACHE_SIZE: u64 = 1_000;
 const DESCRIPTOR: NormalizerDescriptor =
     NormalizerDescriptor::new("proxy-http", env!("CARGO_PKG_VERSION"), "hiloop.event.v1");
@@ -205,20 +206,13 @@ impl CaptureHandler {
         }
     }
 
-    /// Capture a request, emit its raw signal, and rebuild it for forwarding. The
-    /// exchange id is minted here and remembered so `on_response` can stamp the
-    /// matching response. Split out of the trait impl so it is testable without an
+    /// The request body is buffered eagerly, not teed like the response: a teed
+    /// signal only fires once the body drains downstream, which a failed upstream
+    /// never does. Inherent (not the trait method) to stay testable without an
     /// `HttpContext`.
-    ///
-    /// Unlike the response path, the request body is buffered eagerly rather than
-    /// teed: a request signal must be emitted even when the upstream connection
-    /// fails before consuming the body (a teed signal only fires once the body is
-    /// drained downstream, which a failed upstream never does). Request bodies are
-    /// the small side of an exchange (LLM prompts are JSON, not SSE), so this does
-    /// not reintroduce the streaming-passthrough problem the response tee solves.
     async fn on_request(&mut self, request: Request<Body>) -> Request<Body> {
         // CONNECT only establishes the TLS tunnel; the real request arrives after
-        // interception, so skip it to avoid noise authority-form signals.
+        // interception, so skip it to avoid noisy authority-form signals.
         if request.method() == Method::CONNECT {
             return request;
         }
@@ -227,7 +221,7 @@ impl CaptureHandler {
         self.exchange_id = Some(exchange_id.clone());
 
         let (parts, body) = request.into_parts();
-        let bytes = collect_body(body).await;
+        let (bytes, truncated) = collect_body(body).await;
 
         let mut attributes = vec![
             (EXCHANGE_ID_ATTR, exchange_id),
@@ -241,15 +235,15 @@ impl CaptureHandler {
             attributes.push(("http.request.content_type", content_type));
         }
 
-        emit_signal(
-            &self.signal_tx,
+        let raw = build_raw(
             &self.clock,
             REQUEST_KIND,
             "http.request.body_size",
             attributes,
             bytes.clone(),
-        )
-        .await;
+            truncated,
+        );
+        let _ = self.signal_tx.send(Ok(raw)).await;
 
         Request::from_parts(parts, Body::from(bytes))
     }
@@ -289,12 +283,11 @@ impl CaptureHandler {
             clock,
             kind,
             size_attr,
+            emitted: false,
         };
 
-        // `async-stream` generators are unavailable, so drive the upstream body by
-        // hand with `unfold`: each step forwards one frame downstream and copies
-        // its data into the capture buffer. The first step that sees end-of-stream
-        // (or an upstream error) emits the captured signal, then the stream ends.
+        // Streaming tee: forward each frame as it arrives; never collect() the whole
+        // body. Mid-stream client disconnect is handled by TeeState's Drop.
         let teed = futures_util::stream::unfold(state, |mut state| async move {
             let upstream = state.upstream.as_mut()?;
             match upstream.next().await {
@@ -306,12 +299,12 @@ impl CaptureHandler {
                 }
                 Some(Err(error)) => {
                     state.upstream = None;
-                    state.emit().await;
+                    state.emit(true).await;
                     Some((Err(error), state))
                 }
                 None => {
                     state.upstream = None;
-                    state.emit().await;
+                    state.emit(false).await;
                     None
                 }
             }
@@ -321,8 +314,8 @@ impl CaptureHandler {
     }
 }
 
-/// Drives a single body's tee: forwards frames while accumulating `captured`,
-/// then emits one `RawSignal` when the upstream ends.
+/// State for one streaming body tee. `Drop` emits a partial (truncated) signal if
+/// the client disconnects before the body ends.
 struct TeeState {
     upstream: Option<BodyStream<Body>>,
     captured: BytesMut,
@@ -331,43 +324,71 @@ struct TeeState {
     clock: Arc<HlcClock>,
     kind: &'static str,
     size_attr: &'static str,
+    emitted: bool,
 }
 
 impl TeeState {
-    async fn emit(&self) {
-        emit_signal(
-            &self.signal_tx,
+    fn build(&mut self, truncated: bool) -> RawSignal {
+        build_raw(
             &self.clock,
             self.kind,
             self.size_attr,
-            self.attributes.clone(),
-            self.captured.clone().freeze(),
+            std::mem::take(&mut self.attributes),
+            std::mem::take(&mut self.captured).freeze(),
+            truncated,
         )
-        .await;
+    }
+
+    /// Idempotent so the end-of-stream emit and the Drop fallback can't double-send.
+    async fn emit(&mut self, truncated: bool) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        let raw = self.build(truncated);
+        let _ = self.signal_tx.send(Ok(raw)).await;
     }
 }
 
-async fn emit_signal(
-    signal_tx: &mpsc::Sender<Result<RawSignal, SourceError>>,
+impl Drop for TeeState {
+    fn drop(&mut self) {
+        // Drop can't await, so best-effort try_send the partial (truncated) rather
+        // than losing a response the client abandoned mid-stream.
+        if !self.emitted {
+            self.emitted = true;
+            let raw = self.build(true);
+            let _ = self.signal_tx.try_send(Ok(raw));
+        }
+    }
+}
+
+fn build_raw(
     clock: &HlcClock,
     kind: &'static str,
     size_attr: &'static str,
     attributes: Vec<(&'static str, String)>,
     body: Bytes,
-) {
-    let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), body.clone())
-        .with_attribute(size_attr, body.len().to_string());
+    truncated: bool,
+) -> RawSignal {
+    let size = body.len();
+    let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), body)
+        .with_attribute(size_attr, size.to_string());
+    if truncated {
+        raw = raw.with_attribute(TRUNCATED_ATTR, "true");
+    }
     for (key, value) in attributes {
         raw = raw.with_attribute(key, value);
     }
-    let _ = signal_tx.send(Ok(raw)).await;
+    raw
 }
 
-async fn collect_body(body: Body) -> Bytes {
-    body.collect()
-        .await
-        .map(http_body_util::Collected::to_bytes)
-        .unwrap_or_default()
+/// The bool is whether an upstream error truncated collection — so an error-emptied
+/// body isn't mistaken for a genuinely empty one.
+async fn collect_body(body: Body) -> (Bytes, bool) {
+    match body.collect().await {
+        Ok(collected) => (collected.to_bytes(), false),
+        Err(_) => (Bytes::new(), true),
+    }
 }
 
 fn next_exchange_id() -> String {
@@ -569,6 +590,36 @@ mod tests {
             .map(|chunk| Ok::<_, hudsucker::Error>(Frame::data(Bytes::from_static(chunk))))
             .collect::<Vec<_>>();
         Body::from(StreamBody::new(futures_util::stream::iter(frames)))
+    }
+
+    #[tokio::test]
+    async fn response_partial_is_captured_when_client_disconnects() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
+        let response = Response::builder()
+            .status(200)
+            .body(streaming_body(&[b"chunk-1", b"chunk-2", b"chunk-3"]))
+            .expect("response");
+
+        let teed = handler.on_response(response);
+        let mut stream = BodyStream::new(teed.into_body());
+        let first = stream
+            .next()
+            .await
+            .expect("frame")
+            .expect("ok")
+            .into_data()
+            .expect("data");
+        assert_eq!(first.as_ref(), b"chunk-1");
+        drop(stream);
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(signal.kind, RESPONSE_KIND);
+        assert_eq!(signal.body.as_ref(), b"chunk-1");
+        assert_eq!(
+            signal.attributes.get(TRUNCATED_ATTR).map(String::as_str),
+            Some("true")
+        );
     }
 
     #[tokio::test]

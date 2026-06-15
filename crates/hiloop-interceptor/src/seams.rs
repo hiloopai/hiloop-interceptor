@@ -44,13 +44,11 @@ pub type RawSignalStream = Pin<Box<dyn Stream<Item = Result<RawSignal, SourceErr
 /// [`Event`] contract. Revisit these raw fields once source/kind categories
 /// stabilize.
 ///
-/// `body` holds the inline bytes. For large payloads a source may *additionally*
-/// stash an out-of-line [`PayloadRef`] via [`RawSignal::with_payload_ref`] so the
-/// heavy bytes can travel by reference (object storage, content-addressed blob,
-/// …) instead of being copied through every pipeline channel. The escape hatch is
-/// purely additive: `body` stays authoritative when present, and a source that
-/// fully offloads its bytes can pair an empty `body` with a populated
-/// `payload_ref`. Whether to inline, reference, or both is the source's choice.
+/// A source with a large payload may set an out-of-line [`PayloadRef`] via
+/// [`with_payload_ref`](RawSignal::with_payload_ref) and leave `body` empty, so the
+/// bytes travel by reference rather than through every pipeline channel.
+/// **Authority rule:** when `payload_ref` is `Some` it is where the body lives and
+/// `body` may be empty; when it is `None`, `body` holds the bytes inline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawSignal {
     pub source: String,
@@ -87,13 +85,8 @@ impl RawSignal {
         self
     }
 
-    /// Attach an out-of-line payload reference for a large body.
-    ///
-    /// This does not clear or shrink `body`; a source that hands off its bytes
-    /// entirely should construct the signal with an empty body and then call
-    /// this. Normalizers may consult [`RawSignal::payload_ref`] to fetch the
-    /// bytes lazily or to carry the reference straight onto the emitted
-    /// [`Event::with_payload_ref`].
+    /// Attach an out-of-line payload reference. Does not touch `body`; a source
+    /// offloading its bytes should pass an empty `body` to `new`.
     #[must_use]
     pub fn with_payload_ref(mut self, payload_ref: PayloadRef) -> Self {
         self.payload_ref = Some(payload_ref);
@@ -687,19 +680,16 @@ pub mod testing {
     };
     use async_trait::async_trait;
     use hiloop_core::event::Event;
-    use hiloop_core::identity::ForkContext;
+    use hiloop_core::identity::{ForkContext, Hlc};
     use std::sync::Mutex;
 
-    /// Drive a [`Source`] to completion and collect everything it delivered.
-    ///
-    /// Wires the source to a bounded sink, resolves `shutdown` immediately (so
-    /// server sources stop after draining), and returns both the source's own
-    /// result and the ordered signals it produced. Shared by source conformance
-    /// suites so every implementation is exercised through the same lifecycle.
+    /// Drive a self-terminating [`Source`] (one whose input ends on its own) to
+    /// completion and collect what it delivered. `shutdown` never fires, so this
+    /// covers the input-exhausted exit path; use [`drain_source_until`] for a
+    /// server-style source that runs until told to stop.
     ///
     /// # Panics
-    ///
-    /// Panics if `queue_capacity` is zero, which a bounded channel forbids.
+    /// Panics if `queue_capacity` is zero.
     pub async fn drain_source<S>(
         source: S,
         queue_capacity: usize,
@@ -709,17 +699,51 @@ pub mod testing {
     {
         let (tx, mut rx) = tokio::sync::mpsc::channel(queue_capacity);
         let sink = RawSignalSink::new(tx);
-        // Never trigger shutdown: this helper exercises the input-exhausted exit
-        // path, so the source must run until its own input ends.
         let shutdown = Box::pin(std::future::pending());
 
-        // Drive the source and drain the receiver concurrently (not spawned) so
-        // borrowing, non-`'static` sources work and back-pressure still applies.
+        // Concurrent (not spawned) so borrowing, non-`'static` sources work.
         let driver = async move { Box::new(source).run(sink, shutdown).await };
         let collector = async {
             let mut collected = Vec::new();
             while let Some(item) = rx.recv().await {
                 collected.push(item);
+            }
+            collected
+        };
+
+        tokio::join!(driver, collector)
+    }
+
+    /// Drive a server-style [`Source`] through the same lifecycle: resolve
+    /// `shutdown` once `stop_after` signals have arrived, then collect what it
+    /// delivered. The source must emit at least `stop_after` signals before going
+    /// idle, or the collector would block.
+    pub async fn drain_source_until<S>(
+        source: S,
+        queue_capacity: usize,
+        stop_after: usize,
+    ) -> (Result<(), SourceError>, Vec<Result<RawSignal, SourceError>>)
+    where
+        S: Source,
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(queue_capacity);
+        let sink = RawSignalSink::new(tx);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let shutdown = Box::pin(async move {
+            let _ = shutdown_rx.await;
+        });
+
+        let driver = async move { Box::new(source).run(sink, shutdown).await };
+        let collector = async {
+            let mut collected = Vec::new();
+            let mut shutdown_tx = Some(shutdown_tx);
+            while let Some(item) = rx.recv().await {
+                collected.push(item);
+                if collected.len() >= stop_after
+                    && let Some(tx) = shutdown_tx.take()
+                {
+                    let _ = tx.send(());
+                }
             }
             collected
         };
@@ -745,10 +769,7 @@ pub mod testing {
             .collect()
     }
 
-    /// Minimal [`Source`] that replays a fixed list of signals, then returns.
-    ///
-    /// Exercises the trait's lifecycle (config in the constructor, delivery
-    /// through the sink, cooperative shutdown) without any real I/O.
+    /// Minimal pull [`Source`] that replays a fixed list of signals, then returns.
     pub struct VecSource {
         name: &'static str,
         signals: Vec<RawSignal>,
@@ -782,6 +803,53 @@ pub mod testing {
                 }
             }
             Ok(())
+        }
+    }
+
+    /// Server-style [`Source`] that emits forever until `shutdown` — the push
+    /// counterpart to [`VecSource`].
+    pub struct EndlessSource {
+        name: &'static str,
+    }
+
+    impl EndlessSource {
+        pub fn new(name: &'static str) -> Self {
+            Self { name }
+        }
+    }
+
+    #[async_trait]
+    impl Source for EndlessSource {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn run(
+            self: Box<Self>,
+            sink: RawSignalSink,
+            mut shutdown: super::ShutdownSignal,
+        ) -> Result<(), SourceError> {
+            let mut tick = 0_u64;
+            loop {
+                let raw = RawSignal::new(
+                    "endless",
+                    "tick",
+                    Hlc {
+                        wall_ns: tick,
+                        logical: 0,
+                    },
+                    tick.to_le_bytes().to_vec(),
+                );
+                tokio::select! {
+                    () = &mut shutdown => return Ok(()),
+                    sent = sink.send(raw) => {
+                        if !sent.is_open() {
+                            return Ok(());
+                        }
+                    }
+                }
+                tick += 1;
+            }
         }
     }
 
@@ -969,6 +1037,15 @@ mod tests {
             .map(|raw| raw.body.as_ref().to_vec())
             .collect::<Vec<_>>();
         assert_eq!(bodies, vec![b"one".to_vec(), b"two".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn endless_source_stops_on_shutdown() {
+        let (result, collected) =
+            testing::drain_source_until(testing::EndlessSource::new("endless"), 4, 3).await;
+
+        result.expect("server source should finish cleanly on shutdown");
+        assert!(collected.len() >= 3);
     }
 
     #[tokio::test]

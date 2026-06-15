@@ -80,17 +80,20 @@ drives a source through `Pipeline::run_source` (input-exhausted exit) or `run_so
 (external shutdown trigger).
 
 `RawSignal` now also carries an optional, additive out-of-line body reference via
-`RawSignal::with_payload_ref(PayloadRef)`. `body` stays authoritative and `RawSignal::new` is
-unchanged; a source that offloads a large body to content-addressed storage can pair an empty
-`body` with a populated `payload_ref` (aligned with `hiloop_core::event::PayloadRef`, so a
-normalizer can carry it straight onto `Event::with_payload_ref`).
+`RawSignal::with_payload_ref(PayloadRef)`. `RawSignal::new` is unchanged; when `payload_ref` is
+`Some` it is where the body lives and `body` may be empty (aligned with
+`hiloop_core::event::PayloadRef`, so a normalizer can carry it straight onto
+`Event::with_payload_ref`).
 
 The OTLP receiver and MITM proxy still feed the pipeline channel through their own
-`serve(signal_tx, shutdown)` methods rather than implementing `Source`; their `serve` signature is
-already the `run` shape, so adopting the trait is mechanical when convenient. The supervisor's
-inline `capture_stream` likewise predates `StdioSource`; see the `TODO(source-seam)` in
-`supervisor.rs` for why that migration is deferred (it treats a closed event pipeline as fatal,
-which `StdioSource::run` deliberately does not, and it fans four producers into one shared channel).
+`serve(signal_tx, shutdown)` methods rather than implementing `Source`. Adopting the trait is **not**
+mechanical: both are two-phase (bind, expose `local_addr()` so the supervisor can inject the
+endpoint/proxy env, *then* run), the proxy's `serve` takes extra config (the CA), and they would need
+to thread a `RawSignalSink` through their per-connection handlers. The trait does not yet model that
+bind→expose-addr→run lifecycle — that is the main thing to design when migrating them. The
+supervisor's inline `capture_stream` likewise predates `StdioSource`; see the `TODO(source-seam)` in
+`supervisor.rs` (it treats a closed event pipeline as fatal, which `StdioSource::run` deliberately
+does not, and it fans four producers into one shared channel).
 
 Expected growth:
 

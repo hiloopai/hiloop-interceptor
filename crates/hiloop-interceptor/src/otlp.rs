@@ -248,12 +248,10 @@ fn span_is_llm(span: &Span) -> bool {
 
 /// Map an OTLP attribute value into the narrow scalar attribute set.
 ///
-/// Bytes and nested array/map values are dropped for now (a diagnostic-worthy
-/// gap once the normalizer reports them); scalars are preserved with type.
 fn convert_any_value(value: &AnyValue) -> Option<AttributeValue> {
-    // Exhaustive on purpose — no `_` arm. When opentelemetry-proto adds a value
-    // variant, this stops compiling and forces a decision instead of silently
-    // dropping the new type.
+    // Wire enum designed to grow: map the scalars we model, drop the rest (bytes,
+    // nested array/map, profiling strindex). The `_` is intentional — the OTLP spec
+    // says receivers tolerate unknown value kinds.
     match value.value.as_ref()? {
         any_value::Value::StringValue(string) => Some(AttributeValue::String(string.clone())),
         any_value::Value::IntValue(int) => Some(AttributeValue::I64(*int)),
@@ -261,13 +259,7 @@ fn convert_any_value(value: &AnyValue) -> Option<AttributeValue> {
             FiniteF64::new(*double).ok().map(AttributeValue::F64)
         }
         any_value::Value::BoolValue(boolean) => Some(AttributeValue::Bool(*boolean)),
-        // Dropped from the narrow scalar set: bytes want a payload ref, array and
-        // kvlist are nested, and strindex points into an out-of-band profiling
-        // string table the OTLP spec says non-Profiling receivers ignore.
-        any_value::Value::BytesValue(_)
-        | any_value::Value::ArrayValue(_)
-        | any_value::Value::KvlistValue(_)
-        | any_value::Value::StringValueStrindex(_) => None,
+        _ => None,
     }
 }
 
