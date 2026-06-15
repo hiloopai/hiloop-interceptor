@@ -6,10 +6,7 @@ use crate::seams::{
     Source, SourceError, provenance_keys,
 };
 use futures_util::{FutureExt, StreamExt};
-use hiloop_core::{
-    event::{AttributeKey, Event},
-    identity::ForkContext,
-};
+use hiloop_core::event::{AttributeKey, Event};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -127,103 +124,99 @@ pub enum PipelineError {
     ChannelClosed { stage: &'static str },
 }
 
-/// Runs until the source is exhausted and the exporter has flushed.
-pub async fn run_source<S, N, E>(
-    context: &ForkContext,
-    source: &S,
-    normalizer: &N,
-    exporter: &E,
+/// Builder for a `source → normalize → export` pipeline run.
+///
+/// This is the single entry point for running the pipeline. Configure the
+/// optional pieces (normalizer router, raw store, queue/batch options) with
+/// chained methods, then finish with [`Pipeline::run`] for any raw-signal
+/// stream or [`Pipeline::run_source`] for a [`Source`].
+///
+/// ```ignore
+/// Pipeline::new(fork_context, &normalizer, &exporter)
+///     .options(options)
+///     .run(stream)
+///     .await?;
+/// ```
+pub struct Pipeline<'a, E> {
+    context: NormalizationContext,
+    router: NormalizerRouter<'a>,
+    exporter: &'a E,
+    raw_store: Option<&'a dyn RawStore>,
     options: PipelineOptions,
-) -> Result<PipelineReport, PipelineError>
-where
-    S: Source,
-    N: Normalizer,
-    E: Exporter,
-{
-    run_stream(context, source.signals(), normalizer, exporter, options).await
 }
 
-/// Accepts any raw-signal stream, including producer-backed Tokio channels.
-pub async fn run_stream<S, N, E>(
-    context: &ForkContext,
-    stream: S,
-    normalizer: &N,
-    exporter: &E,
-    options: PipelineOptions,
-) -> Result<PipelineReport, PipelineError>
+impl<'a, E> Pipeline<'a, E>
 where
-    S: futures_core::Stream<Item = Result<RawSignal, SourceError>> + Unpin,
-    N: Normalizer,
     E: Exporter,
 {
-    let normalization_context = NormalizationContext::new(context.clone());
-    run_stream_with_context(
-        &normalization_context,
-        stream,
-        normalizer,
-        exporter,
-        options,
-    )
-    .await
+    /// Start a pipeline that routes every signal through one normalizer.
+    ///
+    /// `context` accepts either a bare [`ForkContext`](hiloop_core::identity::ForkContext)
+    /// or a fully built [`NormalizationContext`].
+    pub fn new(
+        context: impl Into<NormalizationContext>,
+        normalizer: &'a dyn Normalizer,
+        exporter: &'a E,
+    ) -> Self {
+        Self::with_router(context, NormalizerRouter::single(normalizer), exporter)
+    }
+
+    /// Start a pipeline with a preconfigured normalizer router.
+    pub fn with_router(
+        context: impl Into<NormalizationContext>,
+        router: NormalizerRouter<'a>,
+        exporter: &'a E,
+    ) -> Self {
+        Self {
+            context: context.into(),
+            router,
+            exporter,
+            raw_store: None,
+            options: PipelineOptions::default(),
+        }
+    }
+
+    /// Attach a raw store so normalizers may request raw preservation.
+    #[must_use]
+    pub fn raw_store(mut self, raw_store: &'a dyn RawStore) -> Self {
+        self.raw_store = Some(raw_store);
+        self
+    }
+
+    /// Override the default queue and batch options.
+    #[must_use]
+    pub fn options(mut self, options: PipelineOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Run until the stream is exhausted and the exporter has flushed.
+    pub async fn run<S>(self, stream: S) -> Result<PipelineReport, PipelineError>
+    where
+        S: futures_core::Stream<Item = Result<RawSignal, SourceError>> + Unpin,
+    {
+        run_pipeline(
+            &self.context,
+            stream,
+            &self.router,
+            self.exporter,
+            self.raw_store,
+            self.options,
+        )
+        .await
+    }
+
+    /// Run directly from a [`Source`], consuming its raw-signal stream.
+    pub async fn run_source<S>(self, source: &S) -> Result<PipelineReport, PipelineError>
+    where
+        S: Source,
+    {
+        let signals = source.signals();
+        self.run(signals).await
+    }
 }
 
-pub async fn run_stream_with_context<S, N, E>(
-    context: &NormalizationContext,
-    stream: S,
-    normalizer: &N,
-    exporter: &E,
-    options: PipelineOptions,
-) -> Result<PipelineReport, PipelineError>
-where
-    S: futures_core::Stream<Item = Result<RawSignal, SourceError>> + Unpin,
-    N: Normalizer,
-    E: Exporter,
-{
-    let router = NormalizerRouter::single(normalizer);
-    run_stream_with_router(context, stream, &router, exporter, options).await
-}
-
-pub async fn run_stream_with_context_and_raw_store<S, N, E, R>(
-    context: &NormalizationContext,
-    stream: S,
-    normalizer: &N,
-    exporter: &E,
-    raw_store: &R,
-    options: PipelineOptions,
-) -> Result<PipelineReport, PipelineError>
-where
-    S: futures_core::Stream<Item = Result<RawSignal, SourceError>> + Unpin,
-    N: Normalizer,
-    E: Exporter,
-    R: RawStore,
-{
-    let router = NormalizerRouter::single(normalizer);
-    run_stream_with_router_and_raw_store(
-        context,
-        stream,
-        &router,
-        exporter,
-        Some(raw_store),
-        options,
-    )
-    .await
-}
-
-pub async fn run_stream_with_router<S, E>(
-    context: &NormalizationContext,
-    stream: S,
-    router: &NormalizerRouter<'_>,
-    exporter: &E,
-    options: PipelineOptions,
-) -> Result<PipelineReport, PipelineError>
-where
-    S: futures_core::Stream<Item = Result<RawSignal, SourceError>> + Unpin,
-    E: Exporter,
-{
-    run_stream_with_router_and_raw_store(context, stream, router, exporter, None, options).await
-}
-
-pub async fn run_stream_with_router_and_raw_store<S, E>(
+async fn run_pipeline<S, E>(
     context: &NormalizationContext,
     mut stream: S,
     router: &NormalizerRouter<'_>,
@@ -400,52 +393,46 @@ fn stamp_normalization_metadata(
     kind: &str,
     raw_observation: Option<&RawObservationRef>,
 ) -> Result<Event, PipelineError> {
+    use provenance_keys as keys;
+
     let mut event = event
         .with_attribute(
-            provenance_key(provenance_keys::NORMALIZER_NAME, descriptor)?,
+            AttributeKey::from_static(keys::NORMALIZER_NAME),
             descriptor.name(),
         )
         .with_attribute(
-            provenance_key(provenance_keys::NORMALIZER_VERSION, descriptor)?,
+            AttributeKey::from_static(keys::NORMALIZER_VERSION),
             descriptor.version(),
         )
         .with_attribute(
-            provenance_key(
-                provenance_keys::NORMALIZER_OUTPUT_SCHEMA_VERSION,
-                descriptor,
-            )?,
+            AttributeKey::from_static(keys::NORMALIZER_OUTPUT_SCHEMA_VERSION),
             descriptor.output_schema_version(),
         )
+        .with_attribute(AttributeKey::from_static(keys::RAW_SOURCE), source)
+        .with_attribute(AttributeKey::from_static(keys::RAW_KIND), kind)
         .with_attribute(
-            provenance_key(provenance_keys::RAW_SOURCE, descriptor)?,
-            source,
-        )
-        .with_attribute(provenance_key(provenance_keys::RAW_KIND, descriptor)?, kind)
-        .with_attribute(
-            provenance_key(provenance_keys::RAW_RETENTION, descriptor)?,
+            AttributeKey::from_static(keys::RAW_RETENTION),
             retention.as_str(),
         )
         .with_attribute(
-            provenance_key(provenance_keys::WRAPPER_NAME, descriptor)?,
+            AttributeKey::from_static(keys::WRAPPER_NAME),
             context.wrapper.name,
         )
         .with_attribute(
-            provenance_key(provenance_keys::WRAPPER_VERSION, descriptor)?,
+            AttributeKey::from_static(keys::WRAPPER_VERSION),
             context.wrapper.version,
         );
 
     if let Some(process) = &context.process {
         if let Some(pid) = process.pid {
-            event = event.with_attribute(
-                provenance_key(provenance_keys::PROCESS_PID, descriptor)?,
-                i64::from(pid),
-            );
+            event =
+                event.with_attribute(AttributeKey::from_static(keys::PROCESS_PID), i64::from(pid));
         }
         if let Some(command) = &process.command
             && !command.as_os_str().is_empty()
         {
             event = event.with_attribute(
-                provenance_key(provenance_keys::PROCESS_COMMAND, descriptor)?,
+                AttributeKey::from_static(keys::PROCESS_COMMAND),
                 command.display().to_string(),
             );
         }
@@ -456,16 +443,13 @@ fn stamp_normalization_metadata(
                     message: error.to_string(),
                 })
             })?;
-            event = event.with_attribute(
-                provenance_key(provenance_keys::PROCESS_ARGV, descriptor)?,
-                argv,
-            );
+            event = event.with_attribute(AttributeKey::from_static(keys::PROCESS_ARGV), argv);
         }
         if let Some(cwd) = &process.cwd
             && !cwd.as_os_str().is_empty()
         {
             event = event.with_attribute(
-                provenance_key(provenance_keys::PROCESS_CWD, descriptor)?,
+                AttributeKey::from_static(keys::PROCESS_CWD),
                 cwd.display().to_string(),
             );
         }
@@ -473,24 +457,12 @@ fn stamp_normalization_metadata(
 
     if let Some(raw_observation) = raw_observation {
         event = event.with_attribute(
-            provenance_key(provenance_keys::RAW_OBSERVATION_ID, descriptor)?,
+            AttributeKey::from_static(keys::RAW_OBSERVATION_ID),
             raw_observation.id(),
         );
     }
 
     Ok(event)
-}
-
-fn provenance_key(
-    value: &'static str,
-    descriptor: NormalizerDescriptor,
-) -> Result<AttributeKey, PipelineError> {
-    AttributeKey::new(value)
-        .map_err(|error| NormalizeError::InvalidOutput {
-            normalizer: descriptor.name(),
-            message: error.to_string(),
-        })
-        .map_err(PipelineError::Normalize)
 }
 
 #[cfg(test)]
@@ -646,15 +618,11 @@ mod tests {
         );
         let stream = futures_util::stream::iter([Ok(raw)]);
 
-        let report = run_stream(
-            &context,
-            stream,
-            &normalizer,
-            &exporter,
-            PipelineOptions::new(1, 1, 8).expect("pipeline options"),
-        )
-        .await
-        .expect("pipeline should run");
+        let report = Pipeline::new(context, &normalizer, &exporter)
+            .options(PipelineOptions::new(1, 1, 8).expect("pipeline options"))
+            .run(stream)
+            .await
+            .expect("pipeline should run");
 
         assert_eq!(
             report,
@@ -712,15 +680,11 @@ mod tests {
         );
         let stream = futures_util::stream::iter([Ok(raw)]);
 
-        run_stream_with_context(
-            &context,
-            stream,
-            &normalizer,
-            &exporter,
-            PipelineOptions::new(1, 1, 8).expect("pipeline options"),
-        )
-        .await
-        .expect("pipeline should run");
+        Pipeline::new(context, &normalizer, &exporter)
+            .options(PipelineOptions::new(1, 1, 8).expect("pipeline options"))
+            .run(stream)
+            .await
+            .expect("pipeline should run");
 
         let events = exporter.events();
         let value = serde_json::to_value(&events[0]).expect("serialize event");
@@ -765,16 +729,12 @@ mod tests {
         );
         let stream = futures_util::stream::iter([Ok(raw)]);
 
-        let report = run_stream_with_router_and_raw_store(
-            &context,
-            stream,
-            &router,
-            &exporter,
-            Some(&raw_store),
-            PipelineOptions::new(1, 1, 8).expect("pipeline options"),
-        )
-        .await
-        .expect("pipeline should run");
+        let report = Pipeline::with_router(context, router, &exporter)
+            .raw_store(&raw_store)
+            .options(PipelineOptions::new(1, 1, 8).expect("pipeline options"))
+            .run(stream)
+            .await
+            .expect("pipeline should run");
 
         assert_eq!(report.raw_observations, 1);
         let raw_refs = raw_store.raws();
@@ -808,15 +768,11 @@ mod tests {
         );
         let stream = futures_util::stream::iter([Ok(raw)]);
 
-        let error = run_stream(
-            &context,
-            stream,
-            &PreserveStdioNormalizer,
-            &exporter,
-            PipelineOptions::new(1, 1, 8).expect("pipeline options"),
-        )
-        .await
-        .expect_err("pipeline should reject unsupported raw preservation");
+        let error = Pipeline::new(context, &PreserveStdioNormalizer, &exporter)
+            .options(PipelineOptions::new(1, 1, 8).expect("pipeline options"))
+            .run(stream)
+            .await
+            .expect_err("pipeline should reject unsupported raw preservation");
 
         assert!(matches!(
             error,
@@ -843,15 +799,11 @@ mod tests {
         );
         let stream = futures_util::stream::iter([Ok(raw)]);
 
-        let report = run_stream_with_router(
-            &context,
-            stream,
-            &router,
-            &exporter,
-            PipelineOptions::new(1, 2, 8).expect("pipeline options"),
-        )
-        .await
-        .expect("pipeline should run");
+        let report = Pipeline::with_router(context, router, &exporter)
+            .options(PipelineOptions::new(1, 2, 8).expect("pipeline options"))
+            .run(stream)
+            .await
+            .expect("pipeline should run");
 
         assert_eq!(report.events, 2);
         let mut names = exporter
@@ -883,13 +835,9 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            run_stream(
-                &context,
-                stream,
-                &normalizer,
-                &FailingExporter,
-                PipelineOptions::new(1, 1, 1).expect("pipeline options"),
-            ),
+            Pipeline::new(context, &normalizer, &FailingExporter)
+                .options(PipelineOptions::new(1, 1, 1).expect("pipeline options"))
+                .run(stream),
         )
         .await
         .expect("pipeline should fail fast");
@@ -912,15 +860,11 @@ mod tests {
         let exporter = RecordingExporter::default();
         let stream = futures_util::stream::iter([]);
 
-        let report = run_stream(
-            &context,
-            stream,
-            &normalizer,
-            &exporter,
-            PipelineOptions::default(),
-        )
-        .await
-        .expect("pipeline should run");
+        let report = Pipeline::new(context, &normalizer, &exporter)
+            .options(PipelineOptions::default())
+            .run(stream)
+            .await
+            .expect("pipeline should run");
 
         assert_eq!(
             report,

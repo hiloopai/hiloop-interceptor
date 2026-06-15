@@ -49,6 +49,22 @@ macro_rules! impl_non_empty_text {
                 Ok(Self(value))
             }
 
+            /// Wrap a string constant known at compile time to be non-blank.
+            ///
+            /// Intended for fixed values such as provenance attribute keys and
+            /// fixed event names. Panics if `value` is blank: for a hardcoded
+            /// constant that is a programming error surfaced at first use, not a
+            /// runtime condition a caller should handle, so this stays infallible
+            /// and avoids threading a `Result` through code that cannot fail.
+            #[must_use]
+            pub fn from_static(value: &'static str) -> Self {
+                assert!(
+                    !value.trim().is_empty(),
+                    concat!($field, " constant must not be blank")
+                );
+                Self(value.to_owned())
+            }
+
             /// Original string slice.
             pub fn as_str(&self) -> &str {
                 &self.0
@@ -346,6 +362,24 @@ mod tests {
         assert!(EventName::new(" ").is_err());
         assert!(PayloadDigest::new("").is_err());
         assert!(MediaType::new("\t").is_err());
+    }
+
+    #[test]
+    fn from_static_wraps_non_blank_constants() {
+        assert_eq!(
+            AttributeKey::from_static("normalizer.name").as_str(),
+            "normalizer.name"
+        );
+        assert_eq!(
+            EventName::from_static("process.stdout").as_str(),
+            "process.stdout"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be blank")]
+    fn from_static_panics_on_blank_constant() {
+        let _ = AttributeKey::from_static("   ");
     }
 
     #[test]

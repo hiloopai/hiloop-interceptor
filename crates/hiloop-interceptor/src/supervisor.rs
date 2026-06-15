@@ -5,7 +5,8 @@ use bytes::Bytes;
 use hiloop_core::identity::ForkContext;
 use hiloop_interceptor::{
     exporters::JsonlExporter,
-    pipeline::{PipelineOptions, run_stream_with_router_and_raw_store},
+    framing::LineFramer,
+    pipeline::{Pipeline, PipelineOptions},
     raw::JsonlRawStore,
     seams::{
         Exporter, NormalizationContext, NormalizerRouter, ProcessContext, RawRetentionPolicy,
@@ -192,14 +193,12 @@ where
     let normalization_context =
         NormalizationContext::new(options.context.clone()).with_process(process);
     let stream = tokio_stream::wrappers::ReceiverStream::new(signal_rx);
-    let pipeline = run_stream_with_router_and_raw_store(
-        &normalization_context,
-        stream,
-        &router,
-        exporter,
-        raw_store,
-        options_pipeline,
-    );
+    let mut pipeline_builder =
+        Pipeline::with_router(normalization_context, router, exporter).options(options_pipeline);
+    if let Some(raw_store) = raw_store {
+        pipeline_builder = pipeline_builder.raw_store(raw_store);
+    }
+    let pipeline = pipeline_builder.run(stream);
 
     let (status_result, stdout_result, stderr_result, pipeline_result) = tokio::join!(
         async {
@@ -240,7 +239,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut pending = Vec::new();
+    let mut framer = LineFramer::new(MAX_STDIO_LINE_BYTES);
     let mut buffer = [0; 8192];
     let mut signal_tx = Some(signal_tx);
 
@@ -263,20 +262,13 @@ where
             .await
             .with_context(|| format!("failed to flush tee for child {stream_name}"))?;
 
-        pending.extend_from_slice(chunk);
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let mut line = pending.drain(..=newline).collect::<Vec<_>>();
-            trim_line_ending(&mut line);
-            send_stdio_signal(&mut signal_tx, stream_name, &clock, line).await;
-        }
-        while pending.len() > MAX_STDIO_LINE_BYTES {
-            let chunk = pending.drain(..MAX_STDIO_LINE_BYTES).collect::<Vec<_>>();
-            send_stdio_signal(&mut signal_tx, stream_name, &clock, chunk).await;
+        for record in framer.push(chunk) {
+            send_stdio_signal(&mut signal_tx, stream_name, &clock, record).await;
         }
     }
 
-    if !pending.is_empty() {
-        send_stdio_signal(&mut signal_tx, stream_name, &clock, pending).await;
+    if let Some(record) = framer.flush() {
+        send_stdio_signal(&mut signal_tx, stream_name, &clock, record).await;
     }
 
     if signal_tx.is_none() {
@@ -299,15 +291,6 @@ async fn send_stdio_signal(
     let raw = RawSignal::new("stdio", stream_name, clock.tick(), Bytes::from(line));
     if tx.send(Ok(raw)).await.is_err() {
         *signal_tx = None;
-    }
-}
-
-fn trim_line_ending(line: &mut Vec<u8>) {
-    if line.last() == Some(&b'\n') {
-        line.pop();
-    }
-    if line.last() == Some(&b'\r') {
-        line.pop();
     }
 }
 

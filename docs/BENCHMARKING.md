@@ -22,7 +22,7 @@ directional performance budgets and promotion rules live in [`TESTING.md`](TESTI
    - Track: ns/event, events/s, input bytes/s, and later instruction count.
 
 2. `pipeline_memory_exporter`
-   - Drive `run_stream_with_context` with generated `RawSignal`s and an in-memory exporter.
+   - Drive `Pipeline::new(...).run(stream)` with generated `RawSignal`s and an in-memory exporter.
    - Sweep raw/event queue capacities and export batch sizes.
    - Track: events/s, batch count, and producer stall time once instrumentation exists.
 

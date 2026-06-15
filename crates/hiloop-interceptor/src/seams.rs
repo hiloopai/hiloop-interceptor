@@ -301,6 +301,12 @@ impl NormalizationContext {
     }
 }
 
+impl From<ForkContext> for NormalizationContext {
+    fn from(fork: ForkContext) -> Self {
+        Self::new(fork)
+    }
+}
+
 /// Policy requested for the raw observation after semantic extraction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RawRetentionPolicy {
