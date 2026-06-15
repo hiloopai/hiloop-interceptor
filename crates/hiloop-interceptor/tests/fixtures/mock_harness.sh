@@ -71,6 +71,16 @@ case "$mode" in
         # Upstream is expected to fail; the decrypted request is what we capture.
         curl -s -o /dev/null --max-time 5 "$url" || true
         ;;
+    proxy-http)
+        # Like `proxy`, but targets a plain-HTTP upstream that returns a real
+        # (chunked) response, so both the request and its response are captured
+        # and can be checked for a shared exchange id. The hop is not TLS-
+        # intercepted, so no CA is involved.
+        url="${1:?proxy-http requires a url}"
+        : "${HTTP_PROXY:?proxy-http mode needs HTTP_PROXY}"
+        command -v curl >/dev/null 2>&1 || { printf 'curl not found\n' >&2; exit 69; }
+        curl -s -o /dev/null --max-time 5 "$url" || true
+        ;;
     *)
         printf 'unknown mock harness mode: %s\n' "$mode" >&2
         exit 64

@@ -443,6 +443,96 @@ async fn proxy_mitm_captures_decrypted_https_request() {
     );
 }
 
+#[tokio::test]
+async fn proxy_correlates_request_and_response_over_chunked_upstream() {
+    // A plain-HTTP upstream the proxy forwards to: it returns a chunked body so
+    // the capture exercises the streaming tee, and because a real response comes
+    // back, both the request and its response are captured — letting us assert
+    // they share an http.exchange_id and that the de-chunked body was retained.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = upstream.accept().await {
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/event-stream\r\n",
+                "Transfer-Encoding: chunked\r\n\r\n",
+                "7\r\nchunk-1\r\n",
+                "7\r\nchunk-2\r\n",
+                "0\r\n\r\n",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let raw_path = temp.path().join("raw.jsonl");
+
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--raw-jsonl")
+        .arg(&raw_path);
+    let url = format!("http://127.0.0.1:{upstream_port}/v1/stream");
+    append_mock_harness(&mut command, "proxy-http", &[&url]);
+
+    let output = run(command).await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = read_jsonl(&events_path);
+    let request = events
+        .iter()
+        .find(|event| {
+            event["name"] == "http.request"
+                && event["attributes"]["http.target"]
+                    .as_str()
+                    .is_some_and(|target| target.ends_with("/v1/stream"))
+        })
+        .expect("a captured http request");
+    let response = events
+        .iter()
+        .find(|event| event["name"] == "http.response")
+        .expect("a captured http response");
+
+    let request_id = request["attributes"]["http.exchange_id"]
+        .as_str()
+        .expect("request exchange id");
+    let response_id = response["attributes"]["http.exchange_id"]
+        .as_str()
+        .expect("response exchange id");
+    assert_eq!(
+        request_id, response_id,
+        "request and response must share an exchange id"
+    );
+
+    // The chunked response body was reassembled and offloaded to the raw store;
+    // base64("chunk-1chunk-2") proves frame boundaries did not corrupt capture.
+    let raw_observation = response["attributes"][provenance_keys::RAW_OBSERVATION_ID]
+        .as_str()
+        .expect("response body retained");
+    let raw_records = read_jsonl(&raw_path);
+    let raw_body = raw_records
+        .iter()
+        .find(|record| record["id"] == raw_observation)
+        .and_then(|record| record["body_base64"].as_str())
+        .expect("response raw body");
+    assert_eq!(raw_body, "Y2h1bmstMWNodW5rLTI=");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn forwards_sigterm_to_child_and_reports_signal_exit() {
