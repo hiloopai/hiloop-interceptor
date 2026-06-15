@@ -1,5 +1,6 @@
 //! Wrapper extension contracts for `hiloop-interceptor`.
 
+pub mod blob;
 pub mod exporters;
 pub mod framing;
 pub mod inspect;

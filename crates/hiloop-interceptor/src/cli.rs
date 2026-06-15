@@ -79,13 +79,18 @@ struct RunArgs {
     #[arg(long = "raw-jsonl", env = "HILOOP_RAW_JSONL")]
     raw_jsonl: Option<PathBuf>,
 
+    /// Directory for the content-addressed blob store the proxy streams bodies to.
+    /// Created if absent. Required by `--proxy`.
+    #[arg(long = "blob-dir", env = "HILOOP_BLOB_DIR")]
+    blob_dir: Option<PathBuf>,
+
     /// Run an embedded OTLP receiver and capture the child's OpenTelemetry
     /// export. Requires `--events-jsonl`.
     #[arg(long = "otlp")]
     otlp: bool,
 
     /// Run an embedded MITM proxy and capture the child's HTTP(S) traffic.
-    /// Requires `--events-jsonl` and `--raw-jsonl`.
+    /// Requires `--events-jsonl` and `--blob-dir`.
     #[arg(long = "proxy")]
     proxy: bool,
 
@@ -107,6 +112,7 @@ impl RunArgs {
             self.command,
             self.events_jsonl,
             self.raw_jsonl,
+            self.blob_dir,
             self.otlp,
             self.proxy,
         )
