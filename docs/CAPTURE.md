@@ -177,9 +177,28 @@ handling and large-body offload. The proxy follows for universal, cooperation-fr
 a per-run ECDSA CA, injects `HTTPS_PROXY` + a child-scoped CA bundle, and captures decrypted
 request/response bodies (offloaded to the bronze raw store via preserve retention; `net`, or `llm`
 for known hosts). Verified end-to-end by a hermetic MITM e2e (curl tunnels HTTPS through the proxy,
-the decrypted request is captured before the upstream attempt). First-slice gaps tracked in
-TESTING.md: bodies are fully buffered (no streaming/SSE passthrough yet), request/response pairs are
-not correlated, and offload is by observation id rather than content hash.
+the decrypted request is captured before the upstream attempt) and a plain-HTTP e2e against a
+chunked upstream (request/response correlation + streaming capture).
+
+**Streaming passthrough (shipped).** *Response* bodies are forwarded as a streaming tee: each frame
+is passed downstream the instant it arrives while a capture copy accumulates, and the `RawSignal`
+fires when the body stream ends — so SSE/chunked responses are no longer blocked on full-body
+buffering. *Request* bodies are still buffered eagerly (they are the small side of an exchange, and
+buffering guarantees a request signal even when the upstream connection fails before consuming the
+body, where a tee would never drain). The capture copy is in-memory per exchange; the
+bounded-memory / spill-to-disk concern is a separate follow-up.
+
+**Request/response correlation (shipped).** Each non-`CONNECT` exchange gets a monotonic
+`http.exchange_id` (process-global counter) stamped on both its request and response events.
+hudsucker clones the handler per request (`serve_stream` → `self.clone().proxy(req)`) and that one
+clone drives both `handle_request` and `handle_response`, so the id minted on the request is read
+back from per-instance state on the matching response — robust even under HTTP/2 multiplexing, since
+each multiplexed request still gets its own clone and `proxy()` future. Limit: when the upstream
+errors before a response, hudsucker calls `handle_error` (not `handle_response`), so a request event
+is recorded with no paired response — absent rather than mis-correlated.
+
+**Remaining first-slice gap (tracked in TESTING.md):** raw-body offload is keyed by observation id
+rather than content hash.
 
 **Status — OTLP shipped (`--otlp`).** `hiloop_interceptor::otlp` runs an embedded OTLP/HTTP receiver
 bound to an ephemeral localhost port; the supervisor injects the endpoint, registers

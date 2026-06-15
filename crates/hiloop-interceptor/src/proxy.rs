@@ -8,16 +8,23 @@
 //! LLM API hosts), and full bodies are offloaded to the bronze raw store via the
 //! preserve-retention path. See `docs/CAPTURE.md`.
 //!
-//! First-slice limitations (tracked there): bodies are fully buffered before
-//! forwarding (so streaming/SSE responses are not yet passed through
-//! incrementally), and request/response events are not yet correlated.
+//! Response bodies are forwarded as a streaming tee: each frame is passed
+//! downstream the moment it arrives (so SSE/chunked responses are not blocked on
+//! full-body buffering) while a capture copy accumulates in memory; the
+//! `RawSignal` is emitted when the body stream ends. Request bodies are buffered
+//! eagerly so a request signal is recorded even when the upstream never consumes
+//! the body. Request and response events are linked by an `http.exchange_id`
+//! attribute — see the `CaptureHandler` docs for the correlation mechanism and
+//! its reliability limits.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
+use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hudsucker::certificate_authority::RcgenAuthority;
 use hudsucker::hyper::header::{CONTENT_TYPE, HOST};
 use hudsucker::hyper::{Method, Request, Response};
@@ -42,9 +49,15 @@ use crate::seams::{
 const PROXY_SOURCE: &str = "proxy";
 const REQUEST_KIND: &str = "http.request";
 const RESPONSE_KIND: &str = "http.response";
+const EXCHANGE_ID_ATTR: &str = "http.exchange_id";
 const CA_CACHE_SIZE: u64 = 1_000;
 const DESCRIPTOR: NormalizerDescriptor =
     NormalizerDescriptor::new("proxy-http", env!("CARGO_PKG_VERSION"), "hiloop.event.v1");
+
+/// Process-global monotonic source of exchange ids. A plain counter (rather than
+/// a ULID) keeps the proxy dependency-free; uniqueness only needs to hold within
+/// a single wrapper run, and `u64` will not wrap in any realistic run.
+static EXCHANGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Known LLM API hosts whose traffic is tagged as `llm` rather than `net`.
 const LLM_HOSTS: &[&str] = &[
@@ -137,10 +150,7 @@ impl ProxyServer {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let handler = CaptureHandler {
-            signal_tx,
-            clock: self.clock,
-        };
+        let handler = CaptureHandler::new(signal_tx, self.clock);
         let proxy = Proxy::builder()
             .with_listener(self.listener)
             .with_ca(ca.authority)
@@ -156,29 +166,73 @@ impl ProxyServer {
     }
 }
 
+/// Captures decrypted request/response bodies and links the two by exchange id.
+///
+/// # Correlation
+///
+/// hudsucker clones the handler per HTTP request: `serve_stream` runs
+/// `self.clone().proxy(req)` for each request, and that one clone calls both
+/// `handle_request` and `handle_response` for that exchange (see hudsucker
+/// `proxy/internal.rs`). So an id minted in `handle_request` and stashed in
+/// `self.exchange_id` is readable in the matching `handle_response`, even when
+/// HTTP/2 multiplexes several requests over one connection — each request still
+/// gets its own clone and its own `proxy()` future.
+///
+/// # Reliability limits
+///
+/// The link is exact for any exchange that flows request → response through one
+/// `proxy()` call. It is *absent* (no response event, hence nothing to mismatch)
+/// when the upstream errors before a response — `handle_error` is invoked instead
+/// of `handle_response`. It does not survive request/response *reordering* across
+/// distinct exchanges because each exchange has an independent clone, which is the
+/// correct behavior: there is no shared mutable handler that could cross-link two
+/// in-flight exchanges.
 #[derive(Clone)]
 struct CaptureHandler {
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
     clock: Arc<HlcClock>,
+    /// Exchange id for the request currently being handled by this clone,
+    /// minted in `on_request` and read back in `on_response`.
+    exchange_id: Option<String>,
 }
 
 impl CaptureHandler {
-    /// Capture a request, emit its raw signal, and rebuild it for forwarding.
-    /// Split out of the trait impl so it is testable without an `HttpContext`.
-    async fn on_request(&self, request: Request<Body>) -> Request<Body> {
+    fn new(signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>, clock: Arc<HlcClock>) -> Self {
+        Self {
+            signal_tx,
+            clock,
+            exchange_id: None,
+        }
+    }
+
+    /// Capture a request, emit its raw signal, and rebuild it for forwarding. The
+    /// exchange id is minted here and remembered so `on_response` can stamp the
+    /// matching response. Split out of the trait impl so it is testable without an
+    /// `HttpContext`.
+    ///
+    /// Unlike the response path, the request body is buffered eagerly rather than
+    /// teed: a request signal must be emitted even when the upstream connection
+    /// fails before consuming the body (a teed signal only fires once the body is
+    /// drained downstream, which a failed upstream never does). Request bodies are
+    /// the small side of an exchange (LLM prompts are JSON, not SSE), so this does
+    /// not reintroduce the streaming-passthrough problem the response tee solves.
+    async fn on_request(&mut self, request: Request<Body>) -> Request<Body> {
         // CONNECT only establishes the TLS tunnel; the real request arrives after
         // interception, so skip it to avoid noise authority-form signals.
         if request.method() == Method::CONNECT {
             return request;
         }
 
+        let exchange_id = next_exchange_id();
+        self.exchange_id = Some(exchange_id.clone());
+
         let (parts, body) = request.into_parts();
         let bytes = collect_body(body).await;
 
         let mut attributes = vec![
+            (EXCHANGE_ID_ATTR, exchange_id),
             ("http.method", parts.method.as_str().to_owned()),
             ("http.target", parts.uri.to_string()),
-            ("http.request.body_size", bytes.len().to_string()),
         ];
         if let Some(host) = request_host(&parts.uri, &parts.headers) {
             attributes.push(("http.host", host));
@@ -186,39 +240,139 @@ impl CaptureHandler {
         if let Some(content_type) = header_str(&parts.headers, &CONTENT_TYPE) {
             attributes.push(("http.request.content_type", content_type));
         }
-        self.capture(REQUEST_KIND, attributes, bytes.clone()).await;
 
-        Request::from_parts(parts, Body::from(Full::new(bytes)))
+        emit_signal(
+            &self.signal_tx,
+            &self.clock,
+            REQUEST_KIND,
+            "http.request.body_size",
+            attributes,
+            bytes.clone(),
+        )
+        .await;
+
+        Request::from_parts(parts, Body::from(bytes))
     }
 
-    async fn on_response(&self, response: Response<Body>) -> Response<Body> {
+    fn on_response(&mut self, response: Response<Body>) -> Response<Body> {
         let (parts, body) = response.into_parts();
-        let bytes = collect_body(body).await;
 
-        let mut attributes = vec![
-            ("http.status_code", parts.status.as_u16().to_string()),
-            ("http.response.body_size", bytes.len().to_string()),
-        ];
+        let mut attributes = vec![("http.status_code", parts.status.as_u16().to_string())];
+        if let Some(exchange_id) = self.exchange_id.take() {
+            attributes.push((EXCHANGE_ID_ATTR, exchange_id));
+        }
         if let Some(content_type) = header_str(&parts.headers, &CONTENT_TYPE) {
             attributes.push(("http.response.content_type", content_type));
         }
-        self.capture(RESPONSE_KIND, attributes, bytes.clone()).await;
 
-        Response::from_parts(parts, Body::from(Full::new(bytes)))
+        let teed = self.tee_body(RESPONSE_KIND, "http.response.body_size", attributes, body);
+        Response::from_parts(parts, teed)
     }
 
-    async fn capture(
+    /// Build a forwarded [`Body`] that streams each frame downstream as it arrives
+    /// while accumulating a capture copy; the `RawSignal` (with `attributes` plus
+    /// the final body-size) is emitted once the upstream body ends.
+    fn tee_body(
         &self,
         kind: &'static str,
+        size_attr: &'static str,
         attributes: Vec<(&'static str, String)>,
-        body: Bytes,
-    ) {
-        let mut raw = RawSignal::new(PROXY_SOURCE, kind, self.clock.tick(), body);
-        for (key, value) in attributes {
-            raw = raw.with_attribute(key, value);
-        }
-        let _ = self.signal_tx.send(Ok(raw)).await;
+        body: Body,
+    ) -> Body {
+        let signal_tx = self.signal_tx.clone();
+        let clock = Arc::clone(&self.clock);
+        let state = TeeState {
+            upstream: Some(BodyStream::new(body)),
+            captured: BytesMut::new(),
+            attributes,
+            signal_tx,
+            clock,
+            kind,
+            size_attr,
+        };
+
+        // `async-stream` generators are unavailable, so drive the upstream body by
+        // hand with `unfold`: each step forwards one frame downstream and copies
+        // its data into the capture buffer. The first step that sees end-of-stream
+        // (or an upstream error) emits the captured signal, then the stream ends.
+        let teed = futures_util::stream::unfold(state, |mut state| async move {
+            let upstream = state.upstream.as_mut()?;
+            match upstream.next().await {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        state.captured.extend_from_slice(data);
+                    }
+                    Some((Ok(frame), state))
+                }
+                Some(Err(error)) => {
+                    state.upstream = None;
+                    state.emit().await;
+                    Some((Err(error), state))
+                }
+                None => {
+                    state.upstream = None;
+                    state.emit().await;
+                    None
+                }
+            }
+        });
+
+        Body::from(StreamBody::new(teed))
     }
+}
+
+/// Drives a single body's tee: forwards frames while accumulating `captured`,
+/// then emits one `RawSignal` when the upstream ends.
+struct TeeState {
+    upstream: Option<BodyStream<Body>>,
+    captured: BytesMut,
+    attributes: Vec<(&'static str, String)>,
+    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: Arc<HlcClock>,
+    kind: &'static str,
+    size_attr: &'static str,
+}
+
+impl TeeState {
+    async fn emit(&self) {
+        emit_signal(
+            &self.signal_tx,
+            &self.clock,
+            self.kind,
+            self.size_attr,
+            self.attributes.clone(),
+            self.captured.clone().freeze(),
+        )
+        .await;
+    }
+}
+
+async fn emit_signal(
+    signal_tx: &mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: &HlcClock,
+    kind: &'static str,
+    size_attr: &'static str,
+    attributes: Vec<(&'static str, String)>,
+    body: Bytes,
+) {
+    let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), body.clone())
+        .with_attribute(size_attr, body.len().to_string());
+    for (key, value) in attributes {
+        raw = raw.with_attribute(key, value);
+    }
+    let _ = signal_tx.send(Ok(raw)).await;
+}
+
+async fn collect_body(body: Body) -> Bytes {
+    body.collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default()
+}
+
+fn next_exchange_id() -> String {
+    let id = EXCHANGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("xchg-{id:016x}")
 }
 
 impl HttpHandler for CaptureHandler {
@@ -235,15 +389,8 @@ impl HttpHandler for CaptureHandler {
         _ctx: &HttpContext,
         response: Response<Body>,
     ) -> Response<Body> {
-        self.on_response(response).await
+        self.on_response(response)
     }
-}
-
-async fn collect_body(body: Body) -> Bytes {
-    body.collect()
-        .await
-        .map(http_body_util::Collected::to_bytes)
-        .unwrap_or_default()
 }
 
 fn request_host(
@@ -326,6 +473,7 @@ mod tests {
     use super::*;
     use hiloop_core::event::AttributeValue;
     use hiloop_core::identity::{ForkContext, Hlc};
+    use hudsucker::hyper::body::Frame;
 
     fn proxy_signal(kind: &str, attributes: &[(&str, &str)]) -> RawSignal {
         let mut raw = RawSignal::new(
@@ -401,17 +549,36 @@ mod tests {
         assert!(!is_llm_host("notapi.openai.com.evil.com"));
     }
 
+    /// Drive a forwarded body to completion, returning the frames the client
+    /// would have received downstream. Capturing into a `RawSignal` only happens
+    /// when the body is polled to its end, exactly as hudsucker forwards it.
+    async fn drain_body(body: Body) -> Vec<Bytes> {
+        let mut stream = BodyStream::new(body);
+        let mut chunks = Vec::new();
+        while let Some(frame) = stream.next().await {
+            if let Ok(data) = frame.expect("frame").into_data() {
+                chunks.push(data);
+            }
+        }
+        chunks
+    }
+
+    fn streaming_body(chunks: &[&'static [u8]]) -> Body {
+        let frames = chunks
+            .iter()
+            .map(|chunk| Ok::<_, hudsucker::Error>(Frame::data(Bytes::from_static(chunk))))
+            .collect::<Vec<_>>();
+        Body::from(StreamBody::new(futures_util::stream::iter(frames)))
+    }
+
     #[tokio::test]
     async fn connect_requests_are_not_captured() {
         let (tx, mut rx) = mpsc::channel(4);
-        let handler = CaptureHandler {
-            signal_tx: tx,
-            clock: Arc::new(HlcClock::new()),
-        };
+        let mut handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
         let request = Request::builder()
             .method("CONNECT")
             .uri("example.com:443")
-            .body(Body::from(Full::new(Bytes::new())))
+            .body(Body::empty())
             .expect("request");
 
         let _ = handler.on_request(request).await;
@@ -428,17 +595,16 @@ mod tests {
     #[tokio::test]
     async fn capture_handler_emits_request_signal() {
         let (tx, mut rx) = mpsc::channel(4);
-        let handler = CaptureHandler {
-            signal_tx: tx,
-            clock: Arc::new(HlcClock::new()),
-        };
+        let mut handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
         let request = Request::builder()
             .method("POST")
             .uri("http://example.com/v1/thing")
-            .body(Body::from(Full::new(Bytes::from_static(b"hello"))))
+            .body(Body::from(Bytes::from_static(b"hello")))
             .expect("request");
 
-        let _ = handler.on_request(request).await;
+        let forwarded = handler.on_request(request).await;
+        let chunks = drain_body(forwarded.into_body()).await;
+        assert_eq!(chunks.concat(), b"hello");
 
         let signal = rx.recv().await.expect("signal").expect("raw");
         assert_eq!(signal.source, PROXY_SOURCE);
@@ -452,5 +618,93 @@ mod tests {
             signal.attributes.get("http.host").map(String::as_str),
             Some("example.com")
         );
+        assert_eq!(
+            signal
+                .attributes
+                .get("http.request.body_size")
+                .map(String::as_str),
+            Some("5")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_and_response_share_an_exchange_id() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/v1/thing")
+            .body(Body::from(Bytes::from_static(b"req")))
+            .expect("request");
+        let forwarded = handler.on_request(request).await;
+        drain_body(forwarded.into_body()).await;
+        let request_signal = rx.recv().await.expect("request signal").expect("raw");
+
+        let response = Response::builder()
+            .status(200)
+            .body(Body::from(Bytes::from_static(b"resp")))
+            .expect("response");
+        let forwarded = handler.on_response(response);
+        drain_body(forwarded.into_body()).await;
+        let response_signal = rx.recv().await.expect("response signal").expect("raw");
+
+        let request_id = request_signal
+            .attributes
+            .get(EXCHANGE_ID_ATTR)
+            .expect("request exchange id");
+        let response_id = response_signal
+            .attributes
+            .get(EXCHANGE_ID_ATTR)
+            .expect("response exchange id");
+        assert_eq!(request_id, response_id, "exchange id must link the pair");
+    }
+
+    #[tokio::test]
+    async fn streaming_response_is_forwarded_incrementally_and_captured() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
+
+        let body = streaming_body(&[b"event: a\n", b"data: 1\n\n", b"data: 2\n\n"]);
+        let attributes = vec![("http.status_code", "200".to_owned())];
+        let teed = handler.tee_body(RESPONSE_KIND, "http.response.body_size", attributes, body);
+
+        // Three source frames must arrive downstream as three distinct frames,
+        // proving frame boundaries are preserved rather than coalesced after a
+        // full buffer.
+        let mut stream = BodyStream::new(teed);
+        let mut frames = Vec::new();
+        // No signal may be emitted until the body has been fully drained.
+        while let Some(frame) = stream.next().await {
+            let data = frame.expect("frame").into_data().expect("data frame");
+            assert!(
+                rx.try_recv().is_err(),
+                "signal must not fire before the body ends"
+            );
+            frames.push(data);
+        }
+        assert_eq!(
+            frames.len(),
+            3,
+            "each upstream frame forwarded individually"
+        );
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(signal.kind, RESPONSE_KIND);
+        assert_eq!(signal.body.as_ref(), b"event: a\ndata: 1\n\ndata: 2\n\n");
+        assert_eq!(
+            signal
+                .attributes
+                .get("http.response.body_size")
+                .map(String::as_str),
+            Some(signal.body.len().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn exchange_ids_are_unique() {
+        let first = next_exchange_id();
+        let second = next_exchange_id();
+        assert_ne!(first, second);
     }
 }
