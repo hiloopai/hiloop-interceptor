@@ -280,6 +280,62 @@ async fn invalid_output_configuration_fails_before_starting_child() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn forwards_sigterm_to_child_and_reports_signal_exit() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let started = temp.path().join("started");
+    let terminated = temp.path().join("terminated");
+
+    let mut command = interceptor_command();
+    append_mock_harness(
+        &mut command,
+        "trap",
+        &[
+            started.to_str().expect("started path"),
+            terminated.to_str().expect("terminated path"),
+        ],
+    );
+    let mut child = command.spawn().expect("spawn interceptor");
+
+    // The harness writes `started` only after installing its SIGTERM trap, and
+    // the wrapper installs its own handlers before the child can run, so once
+    // `started` exists both ends are ready for the signal.
+    wait_for_path(&started).await;
+
+    let pid = i32::try_from(child.id().expect("interceptor pid")).expect("interceptor pid fits i32");
+    kill(Pid::from_raw(pid), Signal::SIGTERM).expect("send SIGTERM to interceptor");
+
+    let status = tokio::time::timeout(E2E_TIMEOUT, child.wait())
+        .await
+        .expect("interceptor should exit after SIGTERM")
+        .expect("wait interceptor");
+
+    assert!(
+        terminated.exists(),
+        "the harness should have received the forwarded SIGTERM"
+    );
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "wrapper should report the child's 128 + SIGTERM exit code"
+    );
+}
+
+#[cfg(unix)]
+async fn wait_for_path(path: &std::path::Path) {
+    tokio::time::timeout(E2E_TIMEOUT, async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("path should appear before timeout");
+}
+
 fn interceptor_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hiloop-interceptor"));
     command.kill_on_drop(true);

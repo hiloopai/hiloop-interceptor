@@ -29,6 +29,12 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 
+# Signal forwarding and process-group teardown are Unix-only (the wrapper's
+# PID-1/supervisor product scope). nix is available to the binary and the
+# integration tests.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

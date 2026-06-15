@@ -24,6 +24,8 @@ thresholds.
 | B10 | On normal or nonzero child exit, capture drains and exporters/raw stores flush before the wrapper returns the child exit code. | Pipeline tests + E2E |
 | B11 | Invalid output configuration and output-file conflicts fail before the child starts. | Mock-harness E2E |
 | B12 | A telemetry pipeline failure does not abruptly kill a still-running child; the wrapper drains the child and then reports telemetry failure. | Supervisor unit test |
+| B13 | The child leads its own process group; on SIGINT/SIGTERM the wrapper forwards the signal to that group, then still drains the child and reports its exit. | Mock-harness E2E |
+| B14 | A normal child exit passes its code through; a child terminated by a signal is reported as `128 + signo`. | Supervisor unit test + E2E |
 
 These are desired contracts, not incidental implementation details. Changing one requires an
 explicit design decision and updated tests.
@@ -34,8 +36,10 @@ The following behavior is needed before the interceptor is a production supervis
 
 - **Live export latency:** a partial batch is currently exported only when it fills or the child
   exits. Add a configurable maximum batch delay and prove emit-to-export p95 stays under one second.
-- **Signals and process trees:** define and test signal forwarding, descendant cleanup, orphan
-  reaping when running as PID 1, and wrapper behavior when the parent disappears.
+- **Signals and process trees:** SIGINT/SIGTERM forwarding to the child's process group and
+  signal-aware exit codes (`128 + signo`) are implemented and tested (B13/B14). Still open: orphan
+  reaping when running as true PID 1 (Linux `PR_SET_CHILD_SUBREAPER`), SIGKILL escalation after a
+  configurable grace period, and wrapper behavior when its own parent disappears.
 - **Telemetry failure policy:** the current policy protects child liveness and reports failure
   afterward. Define configurable fail-open/fail-closed policy before production exporters land.
 - **Existing environment:** define merge/override behavior for pre-existing

@@ -45,6 +45,16 @@ case "$mode" in
         marker="${1:?marker requires a path}"
         : > "$marker"
         ;;
+    trap)
+        started="${1:?trap requires a started-marker path}"
+        terminated="${2:?trap requires a terminated-marker path}"
+        # Record that the trap is installed, then block until SIGTERM arrives.
+        trap ': > "$terminated"; exit 143' TERM
+        : > "$started"
+        while true; do
+            sleep 0.05
+        done
+        ;;
     *)
         printf 'unknown mock harness mode: %s\n' "$mode" >&2
         exit 64

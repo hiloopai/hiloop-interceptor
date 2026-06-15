@@ -124,12 +124,15 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
         return Box::pin(run_captured(options, &exporter, None)).await;
     }
 
-    let mut child = Command::new(&options.command[0]);
-    child.args(&options.command[1..]);
-    ChildEnv::for_context(&options.context).apply_to(&mut child);
+    let mut command = Command::new(&options.command[0]);
+    command.args(&options.command[1..]);
+    ChildEnv::for_context(&options.context).apply_to(&mut command);
+    set_child_process_group(&mut command);
 
-    let status = child
-        .status()
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
+    let status = with_signal_forwarding(child.id(), child.wait())
         .await
         .with_context(|| format!("failed to run child command `{}`", options.command[0]))?;
     Ok(exit_code_from_status(status))
@@ -150,11 +153,13 @@ where
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     ChildEnv::for_context(&options.context).apply_to(&mut child);
+    set_child_process_group(&mut child);
 
     let mut child = child
         .spawn()
         .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
-    let process = child_process_context(options, child.id());
+    let child_pid = child.id();
+    let process = child_process_context(options, child_pid);
     let stdout = child
         .stdout
         .take()
@@ -200,16 +205,20 @@ where
     }
     let pipeline = pipeline_builder.run(stream);
 
-    let (status_result, stdout_result, stderr_result, pipeline_result) = tokio::join!(
-        async {
-            child.wait().await.with_context(|| {
-                format!("failed to wait for child command `{}`", options.command[0])
-            })
-        },
-        stdout_capture,
-        stderr_capture,
-        async { pipeline.await.context("stdio event pipeline failed") },
-    );
+    let (status_result, stdout_result, stderr_result, pipeline_result) =
+        Box::pin(with_signal_forwarding(child_pid, async {
+            tokio::join!(
+                async {
+                    child.wait().await.with_context(|| {
+                        format!("failed to wait for child command `{}`", options.command[0])
+                    })
+                },
+                stdout_capture,
+                stderr_capture,
+                async { pipeline.await.context("stdio event pipeline failed") },
+            )
+        }))
+        .await;
 
     let status = status_result?;
     pipeline_result?;
@@ -295,10 +304,96 @@ async fn send_stdio_signal(
 }
 
 fn exit_code_from_status(status: ExitStatus) -> ExitCode {
-    status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .map_or(ExitCode::FAILURE, ExitCode::from)
+    ExitCode::from(exit_u8_from_status(status))
+}
+
+/// Map a child exit status to a process exit byte.
+///
+/// Normal exits pass their code through. On Unix a child terminated by a signal
+/// maps to the conventional `128 + signo`, so callers (and shells) can tell a
+/// signal kill from a clean nonzero exit.
+fn exit_u8_from_status(status: ExitStatus) -> u8 {
+    if let Some(code) = status.code() {
+        return u8::try_from(code).unwrap_or(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128u8.saturating_add(u8::try_from(signal).unwrap_or(0));
+        }
+    }
+    1
+}
+
+/// Put the child at the head of its own process group.
+///
+/// This lets the wrapper signal the whole harness subtree at once, and means
+/// terminal job-control signals reach the child only through the wrapper's
+/// deliberate forwarding rather than being delivered twice.
+fn set_child_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+/// Run `work` to completion while forwarding terminating signals to the child.
+///
+/// On Unix the wrapper installs SIGINT/SIGTERM handlers and re-sends the signal
+/// to the child's process group, so Ctrl-C and `kill` tear down the harness
+/// subtree once instead of racing the wrapper, while the wrapper still drains
+/// the child and reports its exit status. If handler installation fails, or off
+/// Unix, `work` runs without forwarding.
+#[cfg(unix)]
+async fn with_signal_forwarding<F, T>(child_pid: Option<u32>, work: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (Ok(mut sigint), Ok(mut sigterm)) = (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+    ) else {
+        return work.await;
+    };
+
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            _ = sigint.recv() => forward_signal(child_pid, nix::sys::signal::Signal::SIGINT),
+            _ = sigterm.recv() => forward_signal(child_pid, nix::sys::signal::Signal::SIGTERM),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn with_signal_forwarding<F, T>(_child_pid: Option<u32>, work: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    work.await
+}
+
+/// Best-effort forward of `signal` to the child's process group.
+#[cfg(unix)]
+fn forward_signal(child_pid: Option<u32>, signal: nix::sys::signal::Signal) {
+    let Some(pid) = child_pid else {
+        return;
+    };
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // The child leads its own process group (process_group(0)), so its pgid is
+    // its pid. The group may already be gone if the child just exited, so this
+    // is best effort.
+    let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pid), signal);
 }
 
 #[cfg(test)]
@@ -323,6 +418,19 @@ mod tests {
                 "intentional test failure",
             ))
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_u8_maps_normal_and_signal_termination() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // Normal exits pass their code through.
+        assert_eq!(exit_u8_from_status(ExitStatus::from_raw(0)), 0);
+        assert_eq!(exit_u8_from_status(ExitStatus::from_raw(3 << 8)), 3);
+        // Signal termination uses the conventional 128 + signo encoding.
+        assert_eq!(exit_u8_from_status(ExitStatus::from_raw(15)), 143); // SIGTERM
+        assert_eq!(exit_u8_from_status(ExitStatus::from_raw(2)), 130); // SIGINT
     }
 
     #[test]
