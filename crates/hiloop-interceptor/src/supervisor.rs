@@ -387,6 +387,20 @@ fn child_process_context(options: &RunOptions, pid: Option<u32>) -> ProcessConte
     }
 }
 
+// TODO(source-seam): migrate this inline capture to `stdio::StdioSource`, which
+// already composes the same `LineFramer` + verbatim-tee logic behind the
+// `Source` trait. The blocker is a deliberate behavior difference, not the
+// framing: this loop treats "the event pipeline closed before stdout/stderr
+// finished" as a hard error (see `capture_stream_drains_after_event_pipeline_closes`
+// and the `stdout_result`/`stderr_result` propagation in `run_captured`), whereas
+// `StdioSource::run` returns `Ok(())` when its `RawSignalSink` reports
+// `SinkSend::Closed` (a source must not assume *why* the pipeline went away).
+// `run_captured` also fans stdout, stderr, OTLP, and proxy into ONE shared
+// channel, so it cannot use `Pipeline::run_source` (which owns its channel);
+// the migration must instead drive two `StdioSource`s against a shared
+// `RawSignalSink` and decide how to preserve the closed-pipeline-is-fatal
+// contract (e.g. a sink-closed callback or a supervisor-side check). Until that
+// is designed, keep this path byte-for-byte to protect TESTING.md B1-B16.
 async fn capture_stream<R, W>(
     mut reader: R,
     mut writer: W,

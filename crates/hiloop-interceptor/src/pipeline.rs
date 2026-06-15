@@ -2,8 +2,8 @@
 
 use crate::seams::{
     ExportError, Exporter, NormalizationContext, NormalizeError, Normalizer, NormalizerDescriptor,
-    NormalizerRouter, RawObservationRef, RawRetentionPolicy, RawSignal, RawStore, RawStoreError,
-    Source, SourceError, provenance_keys,
+    NormalizerRouter, RawObservationRef, RawRetentionPolicy, RawSignal, RawSignalSink, RawStore,
+    RawStoreError, ShutdownSignal, Source, SourceError, provenance_keys,
 };
 use futures_util::{FutureExt, StreamExt};
 use hiloop_core::event::{AttributeKey, Event};
@@ -206,13 +206,48 @@ where
         .await
     }
 
-    /// Run directly from a [`Source`], consuming its raw-signal stream.
-    pub async fn run_source<S>(self, source: &S) -> Result<PipelineReport, PipelineError>
+    /// Run directly from a [`Source`], driving its lifecycle to completion.
+    ///
+    /// Bounds the source-to-pipeline hand-off at `raw_queue_capacity` so the
+    /// source's [`RawSignalSink`] applies the same
+    /// back-pressure the rest of the pipeline relies on. The source runs until
+    /// its input ends or `shutdown` resolves; a source-level failure is surfaced
+    /// as [`PipelineError::Source`]. Use [`Pipeline::run_source`] when no external
+    /// shutdown trigger is needed (the source ends on its own input).
+    pub async fn run_source_until<S>(
+        self,
+        source: S,
+        shutdown: ShutdownSignal,
+    ) -> Result<PipelineReport, PipelineError>
     where
-        S: Source,
+        S: Source + 'static,
     {
-        let signals = source.signals();
-        self.run(signals).await
+        let (tx, rx) = mpsc::channel(self.options.raw_queue_capacity());
+        let sink = RawSignalSink::new(tx);
+        let source_name = source.name();
+
+        let driver = tokio::spawn(async move { Box::new(source).run(sink, shutdown).await });
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+        let report = self.run(stream).await?;
+
+        match driver.await {
+            Ok(Ok(())) => Ok(report),
+            Ok(Err(error)) => Err(PipelineError::Source(error)),
+            Err(join) => Err(PipelineError::Source(SourceError::Other {
+                source_name: source_name.to_owned(),
+                message: format!("source task panicked: {join}"),
+            })),
+        }
+    }
+
+    /// Run directly from a [`Source`] until its input is exhausted.
+    pub async fn run_source<S>(self, source: S) -> Result<PipelineReport, PipelineError>
+    where
+        S: Source + 'static,
+    {
+        self.run_source_until(source, Box::pin(std::future::pending()))
+            .await
     }
 }
 
@@ -890,5 +925,114 @@ mod tests {
 
         assert_eq!(exporter.events().len(), 1);
         assert!(exporter.flushed());
+    }
+
+    #[tokio::test]
+    async fn pipeline_runs_a_source_to_completion() {
+        use crate::seams::testing::VecSource;
+
+        let context = ForkContext::new_local_root();
+        let normalizer = StdioLogNormalizer;
+        let exporter = RecordingExporter::default();
+        let signals = vec![
+            RawSignal::new(
+                "stdio",
+                "stdout",
+                Hlc {
+                    wall_ns: 1,
+                    logical: 0,
+                },
+                Bytes::from_static(b"hello"),
+            ),
+            RawSignal::new(
+                "stdio",
+                "stdout",
+                Hlc {
+                    wall_ns: 2,
+                    logical: 0,
+                },
+                Bytes::from_static(b"world"),
+            ),
+        ];
+
+        let report = Pipeline::new(context, &normalizer, &exporter)
+            .options(PipelineOptions::new(2, 2, 8).expect("pipeline options"))
+            .run_source(VecSource::new("stdio", signals))
+            .await
+            .expect("pipeline should run the source");
+
+        assert_eq!(report.raw_signals, 2);
+        assert_eq!(report.events, 2);
+        assert_eq!(exporter.events().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pipeline_stops_a_source_on_shutdown_signal() {
+        use crate::seams::{RawSignalSink, ShutdownSignal, Source, SourceError};
+        use async_trait::async_trait;
+
+        struct EndlessSource;
+
+        #[async_trait]
+        impl Source for EndlessSource {
+            fn name(&self) -> &'static str {
+                "endless"
+            }
+
+            async fn run(
+                self: Box<Self>,
+                sink: RawSignalSink,
+                mut shutdown: ShutdownSignal,
+            ) -> Result<(), SourceError> {
+                let mut tick = 0u64;
+                loop {
+                    let raw = RawSignal::new(
+                        "stdio",
+                        "stdout",
+                        Hlc {
+                            wall_ns: tick + 1,
+                            logical: 0,
+                        },
+                        Bytes::from_static(b"tick"),
+                    );
+                    tokio::select! {
+                        () = &mut shutdown => return Ok(()),
+                        sent = sink.send(raw) => {
+                            if !sent.is_open() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    tick += 1;
+                }
+            }
+        }
+
+        let context = ForkContext::new_local_root();
+        let normalizer = StdioLogNormalizer;
+        let exporter = RecordingExporter::default();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Stop almost immediately; the source must observe shutdown and return so
+        // the pipeline can drain and finish instead of running forever.
+        shutdown_tx.send(()).expect("send shutdown");
+        let shutdown = Box::pin(async move {
+            let _ = shutdown_rx.await;
+        });
+
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Pipeline::new(context, &normalizer, &exporter)
+                .options(PipelineOptions::new(1, 1, 8).expect("pipeline options"))
+                .run_source_until(EndlessSource, shutdown),
+        )
+        .await
+        .expect("pipeline should finish after shutdown")
+        .expect("pipeline should run");
+
+        assert!(exporter.flushed());
+        // A bounded but unspecified number of signals may have been queued before
+        // shutdown landed; the contract is that the run terminates, not the count.
+        let _ = report.raw_signals;
     }
 }

@@ -8,10 +8,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
 use hiloop_core::{
-    event::Event,
+    event::{Event, PayloadRef},
     identity::{ForkContext, Hlc},
 };
-use std::{collections::BTreeMap, error::Error as StdError, path::PathBuf, pin::Pin};
+use std::{
+    collections::BTreeMap, error::Error as StdError, future::Future, path::PathBuf, pin::Pin,
+};
 use thiserror::Error;
 
 /// Normalized attribute keys reserved for interceptor provenance.
@@ -41,6 +43,14 @@ pub type RawSignalStream = Pin<Box<dyn Stream<Item = Result<RawSignal, SourceErr
 /// [`Normalizer`] implementations must convert this loose shape into the narrow
 /// [`Event`] contract. Revisit these raw fields once source/kind categories
 /// stabilize.
+///
+/// `body` holds the inline bytes. For large payloads a source may *additionally*
+/// stash an out-of-line [`PayloadRef`] via [`RawSignal::with_payload_ref`] so the
+/// heavy bytes can travel by reference (object storage, content-addressed blob,
+/// …) instead of being copied through every pipeline channel. The escape hatch is
+/// purely additive: `body` stays authoritative when present, and a source that
+/// fully offloads its bytes can pair an empty `body` with a populated
+/// `payload_ref`. Whether to inline, reference, or both is the source's choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawSignal {
     pub source: String,
@@ -48,10 +58,12 @@ pub struct RawSignal {
     pub observed_at: Hlc,
     pub attributes: BTreeMap<String, String>,
     pub body: Bytes,
+    /// Optional out-of-line reference to the body for payloads too large to inline.
+    pub payload_ref: Option<PayloadRef>,
 }
 
 impl RawSignal {
-    /// Raw signals start with an empty attribute map.
+    /// Raw signals start with an empty attribute map and an inline body.
     pub fn new(
         source: impl Into<String>,
         kind: impl Into<String>,
@@ -64,6 +76,7 @@ impl RawSignal {
             observed_at,
             attributes: BTreeMap::new(),
             body: body.into(),
+            payload_ref: None,
         }
     }
 
@@ -72,6 +85,24 @@ impl RawSignal {
     pub fn with_attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.attributes.insert(key.into(), value.into());
         self
+    }
+
+    /// Attach an out-of-line payload reference for a large body.
+    ///
+    /// This does not clear or shrink `body`; a source that hands off its bytes
+    /// entirely should construct the signal with an empty body and then call
+    /// this. Normalizers may consult [`RawSignal::payload_ref`] to fetch the
+    /// bytes lazily or to carry the reference straight onto the emitted
+    /// [`Event::with_payload_ref`].
+    #[must_use]
+    pub fn with_payload_ref(mut self, payload_ref: PayloadRef) -> Self {
+        self.payload_ref = Some(payload_ref);
+        self
+    }
+
+    /// The out-of-line payload reference, when the source offloaded the body.
+    pub fn payload_ref(&self) -> Option<&PayloadRef> {
+        self.payload_ref.as_ref()
     }
 }
 
@@ -86,13 +117,123 @@ pub enum Backpressure {
     DropNewest,
 }
 
-/// Produces raw signals such as OTLP payloads, proxy events, or stdio lines.
-pub trait Source: Send + Sync {
-    /// Stable source name.
+/// Outcome of pushing one signal into a [`RawSignalSink`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkSend {
+    /// The signal was accepted by the downstream pipeline.
+    Delivered,
+    /// The pipeline closed its receiver; the source should stop producing.
+    Closed,
+}
+
+impl SinkSend {
+    /// Whether the downstream pipeline is still accepting signals.
+    pub const fn is_open(self) -> bool {
+        matches!(self, Self::Delivered)
+    }
+}
+
+/// Where a [`Source`] hands its raw signals during [`Source::run`].
+///
+/// This is the only channel a source needs: it hides the concrete transport
+/// (today a bounded Tokio channel into the pipeline) so push sources (an OTLP or
+/// proxy server accepting connections) and pull sources (reading process stdio)
+/// share one delivery surface. Sends apply back-pressure by awaiting capacity;
+/// once the pipeline closes its end, [`RawSignalSink::send`] reports
+/// [`SinkSend::Closed`] and the source should wind down.
+#[derive(Clone)]
+pub struct RawSignalSink {
+    inner: tokio::sync::mpsc::Sender<Result<RawSignal, SourceError>>,
+}
+
+impl RawSignalSink {
+    /// Wrap a pipeline channel sender as a sink.
+    pub fn new(inner: tokio::sync::mpsc::Sender<Result<RawSignal, SourceError>>) -> Self {
+        Self { inner }
+    }
+
+    /// Deliver one raw signal, awaiting capacity for back-pressure.
+    pub async fn send(&self, raw: RawSignal) -> SinkSend {
+        self.send_result(Ok(raw)).await
+    }
+
+    /// Report a source-level error to the pipeline (e.g. a fatal read failure).
+    ///
+    /// The pipeline treats this as terminal, so prefer it over silently dropping
+    /// signals when a source cannot continue.
+    pub async fn send_error(&self, error: SourceError) -> SinkSend {
+        self.send_result(Err(error)).await
+    }
+
+    async fn send_result(&self, item: Result<RawSignal, SourceError>) -> SinkSend {
+        if self.inner.send(item).await.is_ok() {
+            SinkSend::Delivered
+        } else {
+            SinkSend::Closed
+        }
+    }
+}
+
+/// Signal a [`Source`] to stop producing and return.
+///
+/// The future resolves once the supervisor wants the source to wind down (the
+/// child process exited, the run was cancelled, …). Server-style sources select
+/// on it against their accept loop; pull sources may ignore it and simply run to
+/// end-of-input. Sources should treat shutdown as cooperative: stop accepting new
+/// work, flush anything already buffered into the sink, then return.
+pub type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Produces ordered raw signals from one input: stdio, an OTLP/proxy server, a
+/// file, or a future harness integration.
+///
+/// # Lifecycle
+///
+/// A source is *constructed and configured* by its own constructor (binding a
+/// socket, opening a reader, holding credentials), then *driven* exactly once by
+/// [`run`](Source::run):
+///
+/// 1. construct the source with whatever config it needs;
+/// 2. the pipeline calls `run(sink, shutdown)`, handing it the delivery sink and
+///    a cooperative shutdown signal;
+/// 3. the source pushes [`RawSignal`]s into `sink`, applying back-pressure by
+///    awaiting each [`RawSignalSink::send`];
+/// 4. the source returns `Ok(())` when its input is exhausted, `shutdown`
+///    resolved, or the sink reported [`SinkSend::Closed`]; it returns
+///    `Err(SourceError)` only for a genuine capture failure.
+///
+/// This shape deliberately covers both producer styles with one method:
+///
+/// - **push** (OTLP receiver, MITM proxy): `run` is an accept loop that selects
+///   on `shutdown`; each request becomes a signal sent into the sink.
+/// - **pull** (stdio): `run` is a read loop that frames bytes into records and
+///   sends them, returning at end-of-input.
+///
+/// `run` takes `self` by value so a source can own non-`Sync` capture state and
+/// move it into the driving task. Construction-time config stays on the concrete
+/// type; the trait intentionally does not prescribe a config shape.
+///
+/// # Contract
+///
+/// - Preserve raw bytes, timestamps, source identity, and source-local metadata;
+///   never infer semantic meaning that belongs to a [`Normalizer`].
+/// - Keep buffering bounded; rely on the sink's back-pressure instead of
+///   accumulating unbounded internal queues.
+/// - Honor `shutdown` rather than hiding teardown failures.
+/// - Large bodies may travel out-of-line via [`RawSignal::with_payload_ref`].
+#[async_trait]
+pub trait Source: Send {
+    /// Stable source name, used for diagnostics and error attribution.
     fn name(&self) -> &'static str;
 
-    /// Start or attach to the raw signal stream.
-    fn signals(&self) -> RawSignalStream;
+    /// Drive the source to completion, delivering signals into `sink`.
+    ///
+    /// Returns once the input is exhausted, `shutdown` resolves, or `sink`
+    /// closes. Returns [`SourceError`] only on an unrecoverable capture failure.
+    async fn run(
+        self: Box<Self>,
+        sink: RawSignalSink,
+        shutdown: ShutdownSignal,
+    ) -> Result<(), SourceError>;
 }
 
 /// Stable identity and output schema of a normalizer implementation.
@@ -542,12 +683,107 @@ impl ExportError {
 pub mod testing {
     use super::{
         ExportError, Exporter, NormalizationContext, NormalizationOutcome, Normalizer,
-        RawObservationRef, RawSignal, RawStore, RawStoreError,
+        RawObservationRef, RawSignal, RawSignalSink, RawStore, RawStoreError, Source, SourceError,
     };
     use async_trait::async_trait;
     use hiloop_core::event::Event;
     use hiloop_core::identity::ForkContext;
     use std::sync::Mutex;
+
+    /// Drive a [`Source`] to completion and collect everything it delivered.
+    ///
+    /// Wires the source to a bounded sink, resolves `shutdown` immediately (so
+    /// server sources stop after draining), and returns both the source's own
+    /// result and the ordered signals it produced. Shared by source conformance
+    /// suites so every implementation is exercised through the same lifecycle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `queue_capacity` is zero, which a bounded channel forbids.
+    pub async fn drain_source<S>(
+        source: S,
+        queue_capacity: usize,
+    ) -> (Result<(), SourceError>, Vec<Result<RawSignal, SourceError>>)
+    where
+        S: Source,
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(queue_capacity);
+        let sink = RawSignalSink::new(tx);
+        // Never trigger shutdown: this helper exercises the input-exhausted exit
+        // path, so the source must run until its own input ends.
+        let shutdown = Box::pin(std::future::pending());
+
+        // Drive the source and drain the receiver concurrently (not spawned) so
+        // borrowing, non-`'static` sources work and back-pressure still applies.
+        let driver = async move { Box::new(source).run(sink, shutdown).await };
+        let collector = async {
+            let mut collected = Vec::new();
+            while let Some(item) = rx.recv().await {
+                collected.push(item);
+            }
+            collected
+        };
+
+        tokio::join!(driver, collector)
+    }
+
+    /// Assert the baseline [`Source`] contract: a non-blank name and a `run` that
+    /// terminates cleanly when the sink drains.
+    pub async fn assert_source_contract<S>(source: S, queue_capacity: usize) -> Vec<RawSignal>
+    where
+        S: Source,
+    {
+        let name = source.name();
+        assert!(!name.trim().is_empty(), "source name must not be blank");
+
+        let (result, collected) = drain_source(source, queue_capacity).await;
+        result.expect("source run should finish cleanly when its input ends");
+
+        collected
+            .into_iter()
+            .map(|item| item.expect("conformance source must not emit errors"))
+            .collect()
+    }
+
+    /// Minimal [`Source`] that replays a fixed list of signals, then returns.
+    ///
+    /// Exercises the trait's lifecycle (config in the constructor, delivery
+    /// through the sink, cooperative shutdown) without any real I/O.
+    pub struct VecSource {
+        name: &'static str,
+        signals: Vec<RawSignal>,
+    }
+
+    impl VecSource {
+        pub fn new(name: &'static str, signals: Vec<RawSignal>) -> Self {
+            Self { name, signals }
+        }
+    }
+
+    #[async_trait]
+    impl Source for VecSource {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn run(
+            self: Box<Self>,
+            sink: RawSignalSink,
+            mut shutdown: super::ShutdownSignal,
+        ) -> Result<(), SourceError> {
+            for raw in self.signals {
+                tokio::select! {
+                    () = &mut shutdown => break,
+                    sent = sink.send(raw) => {
+                        if !sent.is_open() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
 
     pub async fn assert_normalizer_accepts_supported_raw<N>(
         normalizer: &N,
@@ -694,5 +930,53 @@ mod tests {
         let normalizers: [&dyn Normalizer; 0] = [];
 
         assert!(NormalizerRouter::new(normalizers).is_err());
+    }
+
+    fn sample_raw(body: &'static [u8]) -> RawSignal {
+        RawSignal::new(
+            "test",
+            "kind",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::from_static(body),
+        )
+    }
+
+    #[test]
+    fn raw_signal_payload_ref_is_optional_and_additive() {
+        use hiloop_core::event::{PayloadDigest, PayloadRef};
+
+        let plain = sample_raw(b"inline");
+        assert!(plain.payload_ref().is_none());
+        assert_eq!(plain.body.as_ref(), b"inline");
+
+        let digest = PayloadDigest::new("sha256:abc").expect("digest");
+        let offloaded = sample_raw(b"").with_payload_ref(PayloadRef::new(digest));
+        assert!(offloaded.payload_ref().is_some());
+        assert!(offloaded.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vec_source_satisfies_source_contract() {
+        let source = testing::VecSource::new("test", vec![sample_raw(b"one"), sample_raw(b"two")]);
+
+        let signals = testing::assert_source_contract(source, 4).await;
+
+        let bodies = signals
+            .iter()
+            .map(|raw| raw.body.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, vec![b"one".to_vec(), b"two".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn raw_signal_sink_reports_closed_when_receiver_drops() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let sink = RawSignalSink::new(tx);
+        drop(rx);
+
+        assert_eq!(sink.send(sample_raw(b"x")).await, SinkSend::Closed);
     }
 }
