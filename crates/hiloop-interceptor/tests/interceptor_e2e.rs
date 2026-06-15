@@ -302,8 +302,14 @@ async fn inspect_summarizes_captured_events() {
         stdout.contains("4 events across 1 fork path(s)"),
         "summary header missing: {stdout}"
     );
-    assert!(stdout.contains("process.stdout: 2"), "stdout count: {stdout}");
-    assert!(stdout.contains("process.stderr: 2"), "stderr count: {stdout}");
+    assert!(
+        stdout.contains("process.stdout: 2"),
+        "stdout count: {stdout}"
+    );
+    assert!(
+        stdout.contains("process.stderr: 2"),
+        "stderr count: {stdout}"
+    );
 }
 
 #[cfg(unix)]

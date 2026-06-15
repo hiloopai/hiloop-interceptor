@@ -4,6 +4,21 @@ Use benchmarks to understand interceptor overhead over time. Start by recording 
 PRs, until workloads and runners are stable. Correctness under load remains a hard gate; the
 directional performance budgets and promotion rules live in [`TESTING.md`](TESTING.md).
 
+## Implemented
+
+`crates/hiloop-interceptor/benches/stdio_path.rs` (Criterion, `harness = false`) records the two
+synchronous CPU costs on the default capture path, run with `cargo bench -p hiloop-interceptor`:
+
+- `line_framer/{16,256,4096}` — `LineFramer::push` throughput over a ~64 KiB buffer of fixed-length
+  lines (covers part of `stdio_normalizer` and `stdio_e2e_binary` below). Early local readings show
+  short lines bottlenecked on the per-record `Vec` allocation, which is the first optimization
+  candidate if the events/s budget needs it.
+- `event_serialize_json` — `serde_json` cost per event (the CPU half of `jsonl_exporter`).
+
+These are recorded, not gated. The async end-to-end benchmarks below (`pipeline_memory_exporter`,
+`stdio_e2e_binary`, `backpressure_slow_exporter`) are still to come, as is iai-callgrind and Bencher
+historical tracking.
+
 ## Tooling
 
 - Start with Criterion for wall-clock and throughput benchmarks. It works on stable Rust, supports

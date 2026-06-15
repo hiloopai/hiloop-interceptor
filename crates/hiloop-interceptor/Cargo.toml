@@ -36,7 +36,12 @@ tokio-stream.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "stdio_path"
+harness = false
 
 [features]
 test-support = []
