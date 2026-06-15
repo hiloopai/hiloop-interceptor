@@ -43,13 +43,15 @@ and emits fork-stamped events — `gen_ai.*` / `llm.*` spans become `llm` events
 cargo run -p hiloop-interceptor -- run --otlp --events-jsonl ./events.jsonl -- <harness command>
 ```
 
-Add `--proxy` (with `--events-jsonl` and `--raw-jsonl`) to run an embedded MITM proxy: the wrapper
+Add `--proxy` (with `--events-jsonl` and `--blob-dir`) to run an embedded MITM proxy: the wrapper
 mints an ephemeral CA, injects `HTTPS_PROXY` plus a child-scoped CA bundle, decrypts the harness's
-HTTPS traffic, and emits fork-stamped `net` events (`llm` for known LLM API hosts) with bodies
-offloaded to the raw store. This captures traffic regardless of harness cooperation.
+HTTPS traffic, and emits fork-stamped `net` events (`llm` for known LLM API hosts). Bodies are
+streamed frame-by-frame into a content-addressed blob store (`--blob-dir`), so events carry only a
+`payload_ref` and memory stays bounded even for streaming/SSE responses. This captures traffic
+regardless of harness cooperation.
 
 ```sh
-cargo run -p hiloop-interceptor -- run --proxy --events-jsonl ./events.jsonl --raw-jsonl ./raw.jsonl -- <harness command>
+cargo run -p hiloop-interceptor -- run --proxy --events-jsonl ./events.jsonl --blob-dir ./blobs -- <harness command>
 ```
 
 Inspect a captured events file — counts grouped by fork-tree node, or how two branches diverged:

@@ -27,7 +27,7 @@ thresholds.
 | B13 | The child leads its own process group; on SIGINT/SIGTERM the wrapper forwards the signal to that group, then still drains the child and reports its exit. | Mock-harness E2E |
 | B14 | A normal child exit passes its code through; a child terminated by a signal is reported as `128 + signo`. | Supervisor unit test + E2E |
 | B15 | With `--otlp`, the wrapper injects `OTEL_EXPORTER_OTLP_ENDPOINT`, receives the child's OTLP trace export, and emits fork-stamped events; LLM spans become `llm`. | Mock-harness E2E + normalizer tests |
-| B16 | With `--proxy`, the wrapper injects `HTTPS_PROXY` + a child-scoped CA bundle, decrypts the child's HTTPS, and emits fork-stamped `net`/`llm` events with bodies offloaded to the raw store. | Mock-harness MITM E2E + handler/normalizer tests |
+| B16 | With `--proxy`, the wrapper injects `HTTPS_PROXY` + a child-scoped CA bundle, decrypts the child's HTTPS, and emits fork-stamped `net`/`llm` events; bodies stream frame-by-frame into a content-addressed blob store (`--blob-dir`) and events carry a `payload_ref`. | Mock-harness MITM E2E + blob/handler/normalizer tests |
 
 These are desired contracts, not incidental implementation details. Changing one requires an
 explicit design decision and updated tests.

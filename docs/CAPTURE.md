@@ -175,18 +175,19 @@ handling and large-body offload. The proxy follows for universal, cooperation-fr
 
 **Status — proxy shipped (`--proxy`).** `hiloop_interceptor::proxy` runs a hudsucker MITM proxy with
 a per-run ECDSA CA, injects `HTTPS_PROXY` + a child-scoped CA bundle, and captures decrypted
-request/response bodies (offloaded to the bronze raw store via preserve retention; `net`, or `llm`
-for known hosts). Verified end-to-end by a hermetic MITM e2e (curl tunnels HTTPS through the proxy,
-the decrypted request is captured before the upstream attempt) and a plain-HTTP e2e against a
-chunked upstream (request/response correlation + streaming capture).
+request/response traffic as `net` (or `llm` for known hosts). Verified end-to-end by a hermetic MITM
+e2e (curl tunnels HTTPS through the proxy, the decrypted request is captured before the upstream
+attempt) and a plain-HTTP e2e against a chunked upstream (request/response correlation + streaming
+capture + blob offload).
 
-**Streaming passthrough (shipped).** *Response* bodies are forwarded as a streaming tee: each frame
-is passed downstream the instant it arrives while a capture copy accumulates, and the `RawSignal`
-fires when the body stream ends — so SSE/chunked responses are no longer blocked on full-body
-buffering. *Request* bodies are still buffered eagerly (they are the small side of an exchange, and
-buffering guarantees a request signal even when the upstream connection fails before consuming the
-body, where a tee would never drain). The capture copy is in-memory per exchange; the
-bounded-memory / spill-to-disk concern is a separate follow-up.
+**Streaming passthrough + content-addressed offload (shipped).** *Response* bodies are forwarded as a
+streaming tee: each frame is passed downstream the instant it arrives and simultaneously streamed
+into the content-addressed blob store (`crate::blob`, sha256-keyed, `--blob-dir`) — so memory is
+bounded to one frame, SSE/chunked responses are not blocked on buffering, and the event carries only
+a `payload_ref` (empty inline `body`). On client disconnect a `Drop` finalizes the partial blob on a
+detached task and emits a `http.capture.truncated` signal. *Request* bodies are buffered eagerly
+(the small side of an exchange; buffering guarantees a request signal even when the upstream fails
+before draining the body) then offloaded too, with an inline-body fallback if the blob write fails.
 
 **Request/response correlation (shipped).** Each non-`CONNECT` exchange gets a monotonic
 `http.exchange_id` (process-global counter) stamped on both its request and response events.
@@ -197,8 +198,9 @@ each multiplexed request still gets its own clone and `proxy()` future. Limit: w
 errors before a response, hudsucker calls `handle_error` (not `handle_response`), so a request event
 is recorded with no paired response — absent rather than mis-correlated.
 
-**Remaining first-slice gap (tracked in TESTING.md):** raw-body offload is keyed by observation id
-rather than content hash.
+**Remaining gaps (tracked in TESTING.md):** request bodies are still buffered whole before offload
+(responses stream); on a blob-write failure a streamed response degrades to metadata only (no inline
+fallback, unlike requests).
 
 **Status — OTLP shipped (`--otlp`).** `hiloop_interceptor::otlp` runs an embedded OTLP/HTTP receiver
 bound to an ephemeral localhost port; the supervisor injects the endpoint, registers

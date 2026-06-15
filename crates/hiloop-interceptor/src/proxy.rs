@@ -360,8 +360,9 @@ struct TeeState {
 impl TeeState {
     async fn write(&mut self, data: &[u8]) {
         if let Some(writer) = self.writer.as_mut() {
-            // A failed write drops the writer: finish then falls back to an
-            // inline-body signal rather than committing a truncated blob.
+            // On write failure the writer is dropped; the streamed frames aren't
+            // buffered, so the response signal degrades to metadata only (no
+            // payload_ref). Unlike the request path, there is no inline fallback.
             if writer.write(data).await.is_err() {
                 self.writer = None;
             } else {
