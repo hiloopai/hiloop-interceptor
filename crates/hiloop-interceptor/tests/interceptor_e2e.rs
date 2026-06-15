@@ -398,15 +398,15 @@ async fn proxy_mitm_captures_decrypted_https_request() {
 
     let temp = tempfile::tempdir().expect("tempdir");
     let events_path = temp.path().join("events.jsonl");
-    let raw_path = temp.path().join("raw.jsonl");
+    let blob_dir = temp.path().join("blobs");
 
     let mut command = interceptor_command();
     command
         .arg("--proxy")
         .arg("--events-jsonl")
         .arg(&events_path)
-        .arg("--raw-jsonl")
-        .arg(&raw_path);
+        .arg("--blob-dir")
+        .arg(&blob_dir);
     let url = format!("https://localhost:{sink_port}/v1/thing");
     append_mock_harness(&mut command, "proxy", &[&url]);
 
@@ -436,10 +436,18 @@ async fn proxy_mitm_captures_decrypted_https_request() {
         "captured host: {}",
         request["attributes"]["http.host"]
     );
-    // Body offloaded to the bronze store, linked from the event.
+    // Body streamed to the content-addressed blob store, referenced from the event.
+    let digest = request["payload_ref"]["digest"]
+        .as_str()
+        .expect("request payload_ref digest");
     assert!(
-        request["attributes"][provenance_keys::RAW_OBSERVATION_ID].is_string(),
-        "request body should be retained in the raw store"
+        digest.starts_with("sha256:"),
+        "payload digest should be sha256: {digest}"
+    );
+    let hex = digest.strip_prefix("sha256:").expect("sha256 prefix");
+    assert!(
+        blob_dir.join(format!("sha256-{hex}")).exists(),
+        "the request body blob should exist in the blob dir"
     );
 }
 
@@ -474,15 +482,15 @@ async fn proxy_correlates_request_and_response_over_chunked_upstream() {
 
     let temp = tempfile::tempdir().expect("tempdir");
     let events_path = temp.path().join("events.jsonl");
-    let raw_path = temp.path().join("raw.jsonl");
+    let blob_dir = temp.path().join("blobs");
 
     let mut command = interceptor_command();
     command
         .arg("--proxy")
         .arg("--events-jsonl")
         .arg(&events_path)
-        .arg("--raw-jsonl")
-        .arg(&raw_path);
+        .arg("--blob-dir")
+        .arg(&blob_dir);
     let url = format!("http://127.0.0.1:{upstream_port}/v1/stream");
     append_mock_harness(&mut command, "proxy-http", &[&url]);
 
@@ -519,18 +527,15 @@ async fn proxy_correlates_request_and_response_over_chunked_upstream() {
         "request and response must share an exchange id"
     );
 
-    // The chunked response body was reassembled and offloaded to the raw store;
-    // base64("chunk-1chunk-2") proves frame boundaries did not corrupt capture.
-    let raw_observation = response["attributes"][provenance_keys::RAW_OBSERVATION_ID]
+    // The chunked response body was reassembled and streamed to the blob store;
+    // the blob's bytes are "chunk-1chunk-2", proving frame boundaries did not
+    // corrupt capture.
+    let digest = response["payload_ref"]["digest"]
         .as_str()
-        .expect("response body retained");
-    let raw_records = read_jsonl(&raw_path);
-    let raw_body = raw_records
-        .iter()
-        .find(|record| record["id"] == raw_observation)
-        .and_then(|record| record["body_base64"].as_str())
-        .expect("response raw body");
-    assert_eq!(raw_body, "Y2h1bmstMWNodW5rLTI=");
+        .expect("response payload_ref digest");
+    let hex = digest.strip_prefix("sha256:").expect("sha256 prefix");
+    let blob = std::fs::read(blob_dir.join(format!("sha256-{hex}"))).expect("read response blob");
+    assert_eq!(blob, b"chunk-1chunk-2");
 }
 
 #[cfg(unix)]

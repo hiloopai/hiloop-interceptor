@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use hiloop_core::identity::ForkContext;
 use hiloop_interceptor::{
+    blob::DirBlobStore,
     exporters::JsonlExporter,
     framing::LineFramer,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
@@ -41,16 +42,19 @@ pub(crate) struct RunOptions {
     command: Vec<String>,
     events_jsonl: Option<PathBuf>,
     raw_jsonl: Option<PathBuf>,
+    blob_dir: Option<PathBuf>,
     otlp: bool,
     proxy: bool,
 }
 
 impl RunOptions {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         context: ForkContext,
         command: Vec<String>,
         events_jsonl: Option<PathBuf>,
         raw_jsonl: Option<PathBuf>,
+        blob_dir: Option<PathBuf>,
         otlp: bool,
         proxy: bool,
     ) -> Self {
@@ -59,6 +63,7 @@ impl RunOptions {
             command,
             events_jsonl,
             raw_jsonl,
+            blob_dir,
             otlp,
             proxy,
         }
@@ -147,8 +152,10 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
         bail!("--otlp requires --events-jsonl so received telemetry has an exporter");
     }
 
-    if options.proxy && (options.events_jsonl.is_none() || options.raw_jsonl.is_none()) {
-        bail!("--proxy requires --events-jsonl and --raw-jsonl so captured bodies are retained");
+    if options.proxy && (options.events_jsonl.is_none() || options.blob_dir.is_none()) {
+        bail!(
+            "--proxy requires --events-jsonl and --blob-dir so captured bodies are streamed to the blob store"
+        );
     }
 
     if let Some(path) = &options.events_jsonl {
@@ -230,6 +237,14 @@ where
     } else {
         None
     };
+    let blob_store = match (options.proxy, &options.blob_dir) {
+        (true, Some(dir)) => {
+            Some(Arc::new(DirBlobStore::create(dir).await.with_context(
+                || format!("failed to create blob store at `{}`", dir.display()),
+            )?))
+        }
+        _ => None,
+    };
 
     let mut child = Command::new(&options.command[0]);
     child
@@ -299,10 +314,10 @@ where
         }
         None => (None, None),
     };
-    let (proxy_shutdown_tx, proxy_server_task) = match (proxy_server, proxy_ca) {
-        (Some(server), Some(ca)) => {
+    let (proxy_shutdown_tx, proxy_server_task) = match (proxy_server, proxy_ca, blob_store) {
+        (Some(server), Some(ca), Some(blob_store)) => {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let task = server.serve(ca, signal_tx.clone(), async move {
+            let task = server.serve(ca, signal_tx.clone(), blob_store, async move {
                 let _ = shutdown_rx.await;
             });
             (Some(shutdown_tx), Some(task))
@@ -760,6 +775,7 @@ mod tests {
                 "printf 'hello\\n'; sleep 0.1; touch \"$0\"".to_owned(),
                 marker_arg,
             ],
+            None,
             None,
             None,
             false,

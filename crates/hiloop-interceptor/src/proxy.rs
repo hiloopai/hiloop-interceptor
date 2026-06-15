@@ -5,24 +5,26 @@
 //! harness's HTTPS traffic is decrypted, captured, and fork-stamped regardless
 //! of whether the harness cooperates. Each request and response becomes one raw
 //! signal; [`ProxyNormalizer`] turns it into a `net` event (or `llm` for known
-//! LLM API hosts), and full bodies are offloaded to the bronze raw store via the
-//! preserve-retention path. See `docs/CAPTURE.md`.
+//! LLM API hosts), and full bodies are streamed to a content-addressed blob store
+//! (the [`crate::blob`] seam) so the event carries only a `payload_ref`. See
+//! `docs/CAPTURE.md`.
 //!
 //! Response bodies are forwarded as a streaming tee: each frame is passed
 //! downstream the moment it arrives (so SSE/chunked responses are not blocked on
-//! full-body buffering) while a capture copy accumulates in memory; the
-//! `RawSignal` is emitted when the body stream ends. Request bodies are buffered
-//! eagerly so a request signal is recorded even when the upstream never consumes
-//! the body. Request and response events are linked by an `http.exchange_id`
-//! attribute — see the `CaptureHandler` docs for the correlation mechanism and
-//! its reliability limits.
+//! full-body buffering) and simultaneously written to the blob store, bounding
+//! memory to one frame; the `RawSignal` (empty `body` + `payload_ref`) is emitted
+//! when the body stream ends. Request bodies are buffered eagerly so a request
+//! signal is recorded even when the upstream never consumes the body, then
+//! offloaded to the store too. Request and response events are linked by an
+//! `http.exchange_id` attribute — see the `CaptureHandler` docs for the
+//! correlation mechanism and its reliability limits.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hudsucker::certificate_authority::RcgenAuthority;
@@ -37,13 +39,14 @@ use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use hiloop_core::event::{AttributeKey, Event, EventName, SignalType};
+use hiloop_core::event::{AttributeKey, Event, EventName, MediaType, PayloadRef, SignalType};
 use hiloop_core::identity::HlcClock;
 use thiserror::Error;
 
+use crate::blob::{BlobStore, BlobWriter};
 use crate::seams::{
     NormalizationContext, NormalizationOutcome, NormalizeError, Normalizer, NormalizerDescriptor,
-    NormalizerSupport, RawRetentionPolicy, RawSignal, SourceError,
+    NormalizerSupport, RawSignal, SourceError,
 };
 
 const PROXY_SOURCE: &str = "proxy";
@@ -141,17 +144,19 @@ impl ProxyServer {
         self.listener.local_addr()
     }
 
-    /// Run the proxy until `shutdown` resolves, capturing traffic to `signal_tx`.
+    /// Run the proxy until `shutdown` resolves, capturing traffic to `signal_tx`
+    /// and streaming bodies to `blob_store`.
     pub async fn serve<F>(
         self,
         ca: ProxyCa,
         signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+        blob_store: Arc<dyn BlobStore>,
         shutdown: F,
     ) -> Result<(), ProxyError>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let handler = CaptureHandler::new(signal_tx, self.clock);
+        let handler = CaptureHandler::new(signal_tx, self.clock, blob_store);
         let proxy = Proxy::builder()
             .with_listener(self.listener)
             .with_ca(ca.authority)
@@ -192,16 +197,22 @@ impl ProxyServer {
 struct CaptureHandler {
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
     clock: Arc<HlcClock>,
+    blob_store: Arc<dyn BlobStore>,
     /// Exchange id for the request currently being handled by this clone,
     /// minted in `on_request` and read back in `on_response`.
     exchange_id: Option<String>,
 }
 
 impl CaptureHandler {
-    fn new(signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>, clock: Arc<HlcClock>) -> Self {
+    fn new(
+        signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+        clock: Arc<HlcClock>,
+        blob_store: Arc<dyn BlobStore>,
+    ) -> Self {
         Self {
             signal_tx,
             clock,
+            blob_store,
             exchange_id: None,
         }
     }
@@ -223,6 +234,7 @@ impl CaptureHandler {
         let (parts, body) = request.into_parts();
         let (bytes, truncated) = collect_body(body).await;
 
+        let content_type = header_str(&parts.headers, &CONTENT_TYPE);
         let mut attributes = vec![
             (EXCHANGE_ID_ATTR, exchange_id),
             ("http.method", parts.method.as_str().to_owned()),
@@ -231,10 +243,16 @@ impl CaptureHandler {
         if let Some(host) = request_host(&parts.uri, &parts.headers) {
             attributes.push(("http.host", host));
         }
-        if let Some(content_type) = header_str(&parts.headers, &CONTENT_TYPE) {
-            attributes.push(("http.request.content_type", content_type));
+        if let Some(content_type) = &content_type {
+            attributes.push(("http.request.content_type", content_type.clone()));
         }
 
+        // Offload the buffered body to the blob store; on any failure fall back to
+        // an inline body so the capture is never lost. The forwarded request keeps
+        // the buffered bytes either way.
+        let payload_ref = offload_bytes(self.blob_store.as_ref(), &bytes, content_type.as_deref())
+            .await
+            .ok();
         let raw = build_raw(
             &self.clock,
             REQUEST_KIND,
@@ -242,6 +260,7 @@ impl CaptureHandler {
             attributes,
             bytes.clone(),
             truncated,
+            payload_ref,
         );
         let _ = self.signal_tx.send(Ok(raw)).await;
 
@@ -251,49 +270,58 @@ impl CaptureHandler {
     fn on_response(&mut self, response: Response<Body>) -> Response<Body> {
         let (parts, body) = response.into_parts();
 
+        let content_type = header_str(&parts.headers, &CONTENT_TYPE);
         let mut attributes = vec![("http.status_code", parts.status.as_u16().to_string())];
         if let Some(exchange_id) = self.exchange_id.take() {
             attributes.push((EXCHANGE_ID_ATTR, exchange_id));
         }
-        if let Some(content_type) = header_str(&parts.headers, &CONTENT_TYPE) {
-            attributes.push(("http.response.content_type", content_type));
+        if let Some(content_type) = &content_type {
+            attributes.push(("http.response.content_type", content_type.clone()));
         }
 
-        let teed = self.tee_body(RESPONSE_KIND, "http.response.body_size", attributes, body);
+        let teed = self.tee_body(
+            RESPONSE_KIND,
+            "http.response.body_size",
+            attributes,
+            content_type,
+            body,
+        );
         Response::from_parts(parts, teed)
     }
 
     /// Build a forwarded [`Body`] that streams each frame downstream as it arrives
-    /// while accumulating a capture copy; the `RawSignal` (with `attributes` plus
-    /// the final body-size) is emitted once the upstream body ends.
+    /// while writing the same bytes to the blob store; the `RawSignal` (empty body
+    /// plus a `payload_ref`) is emitted once the upstream body ends.
     fn tee_body(
         &self,
         kind: &'static str,
         size_attr: &'static str,
         attributes: Vec<(&'static str, String)>,
+        media_type: Option<String>,
         body: Body,
     ) -> Body {
-        let signal_tx = self.signal_tx.clone();
-        let clock = Arc::clone(&self.clock);
         let state = TeeState {
             upstream: Some(BodyStream::new(body)),
-            captured: BytesMut::new(),
+            writer: Some(self.blob_store.writer()),
+            size: 0,
+            media_type,
             attributes,
-            signal_tx,
-            clock,
+            signal_tx: self.signal_tx.clone(),
+            clock: Arc::clone(&self.clock),
             kind,
             size_attr,
             emitted: false,
         };
 
-        // Streaming tee: forward each frame as it arrives; never collect() the whole
-        // body. Mid-stream client disconnect is handled by TeeState's Drop.
+        // Streaming tee: forward each frame as it arrives and write it to the blob
+        // store; never collect() the whole body. Mid-stream client disconnect is
+        // handled by TeeState's Drop.
         let teed = futures_util::stream::unfold(state, |mut state| async move {
             let upstream = state.upstream.as_mut()?;
             match upstream.next().await {
                 Some(Ok(frame)) => {
                     if let Some(data) = frame.data_ref() {
-                        state.captured.extend_from_slice(data);
+                        state.write(data).await;
                     }
                     Some((Ok(frame), state))
                 }
@@ -314,11 +342,13 @@ impl CaptureHandler {
     }
 }
 
-/// State for one streaming body tee. `Drop` emits a partial (truncated) signal if
-/// the client disconnects before the body ends.
+/// State for one streaming body tee. `Drop` finalizes a partial (truncated) blob
+/// and emits its signal if the client disconnects before the body ends.
 struct TeeState {
     upstream: Option<BodyStream<Body>>,
-    captured: BytesMut,
+    writer: Option<Box<dyn BlobWriter>>,
+    size: u64,
+    media_type: Option<String>,
     attributes: Vec<(&'static str, String)>,
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
     clock: Arc<HlcClock>,
@@ -328,15 +358,16 @@ struct TeeState {
 }
 
 impl TeeState {
-    fn build(&mut self, truncated: bool) -> RawSignal {
-        build_raw(
-            &self.clock,
-            self.kind,
-            self.size_attr,
-            std::mem::take(&mut self.attributes),
-            std::mem::take(&mut self.captured).freeze(),
-            truncated,
-        )
+    async fn write(&mut self, data: &[u8]) {
+        if let Some(writer) = self.writer.as_mut() {
+            // A failed write drops the writer: finish then falls back to an
+            // inline-body signal rather than committing a truncated blob.
+            if writer.write(data).await.is_err() {
+                self.writer = None;
+            } else {
+                self.size += data.len() as u64;
+            }
+        }
     }
 
     /// Idempotent so the end-of-stream emit and the Drop fallback can't double-send.
@@ -345,23 +376,86 @@ impl TeeState {
             return;
         }
         self.emitted = true;
-        let raw = self.build(truncated);
+        let raw = finalize_tee(
+            &self.clock,
+            self.kind,
+            self.size_attr,
+            std::mem::take(&mut self.attributes),
+            self.writer.take(),
+            self.size,
+            self.media_type.take(),
+            truncated,
+        )
+        .await;
         let _ = self.signal_tx.send(Ok(raw)).await;
     }
 }
 
 impl Drop for TeeState {
     fn drop(&mut self) {
-        // Drop can't await, so best-effort try_send the partial (truncated) rather
-        // than losing a response the client abandoned mid-stream.
-        if !self.emitted {
-            self.emitted = true;
-            let raw = self.build(true);
-            let _ = self.signal_tx.try_send(Ok(raw));
+        if self.emitted {
+            return;
         }
+        self.emitted = true;
+        // Drop can't await, so finalize the partial blob on a detached task.
+        // TeeState is always dropped inside the proxy's tokio runtime, so spawn is
+        // safe here.
+        let clock = Arc::clone(&self.clock);
+        let kind = self.kind;
+        let size_attr = self.size_attr;
+        let attributes = std::mem::take(&mut self.attributes);
+        let writer = self.writer.take();
+        let size = self.size;
+        let media_type = self.media_type.take();
+        let signal_tx = self.signal_tx.clone();
+        tokio::spawn(async move {
+            let raw = finalize_tee(
+                &clock, kind, size_attr, attributes, writer, size, media_type, true,
+            )
+            .await;
+            let _ = signal_tx.send(Ok(raw)).await;
+        });
     }
 }
 
+/// Finalize a teed body's blob and build its offloaded (or fallback) signal.
+/// `size` is the byte count tracked across frames, so the size attribute is
+/// correct even when the blob finalize fails and no `payload_ref` is produced.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_tee(
+    clock: &HlcClock,
+    kind: &'static str,
+    size_attr: &'static str,
+    attributes: Vec<(&'static str, String)>,
+    writer: Option<Box<dyn BlobWriter>>,
+    size: u64,
+    media_type: Option<String>,
+    truncated: bool,
+) -> RawSignal {
+    let payload_ref = match writer {
+        Some(writer) => writer
+            .finish()
+            .await
+            .ok()
+            .map(|payload_ref| apply_media_type(payload_ref, media_type.as_deref())),
+        None => None,
+    };
+    let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), Bytes::new())
+        .with_attribute(size_attr, size.to_string());
+    if truncated {
+        raw = raw.with_attribute(TRUNCATED_ATTR, "true");
+    }
+    for (key, value) in attributes {
+        raw = raw.with_attribute(key, value);
+    }
+    if let Some(payload_ref) = payload_ref {
+        raw = raw.with_payload_ref(payload_ref);
+    }
+    raw
+}
+
+/// Builds a request signal: offloaded (empty body + `payload_ref`) when the blob
+/// store succeeded, else an inline-body fallback so the capture is not lost.
 fn build_raw(
     clock: &HlcClock,
     kind: &'static str,
@@ -369,8 +463,14 @@ fn build_raw(
     attributes: Vec<(&'static str, String)>,
     body: Bytes,
     truncated: bool,
+    payload_ref: Option<PayloadRef>,
 ) -> RawSignal {
     let size = body.len();
+    let body = if payload_ref.is_some() {
+        Bytes::new()
+    } else {
+        body
+    };
     let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), body)
         .with_attribute(size_attr, size.to_string());
     if truncated {
@@ -379,7 +479,29 @@ fn build_raw(
     for (key, value) in attributes {
         raw = raw.with_attribute(key, value);
     }
+    if let Some(payload_ref) = payload_ref {
+        raw = raw.with_payload_ref(payload_ref);
+    }
     raw
+}
+
+fn apply_media_type(payload_ref: PayloadRef, media_type: Option<&str>) -> PayloadRef {
+    match media_type.and_then(|value| MediaType::new(value).ok()) {
+        Some(media_type) => payload_ref.with_media_type(media_type),
+        None => payload_ref,
+    }
+}
+
+/// Offload `bytes` to `store`, returning a `payload_ref` with media-type applied.
+async fn offload_bytes(
+    store: &dyn BlobStore,
+    bytes: &[u8],
+    media_type: Option<&str>,
+) -> Result<PayloadRef, crate::blob::BlobStoreError> {
+    let mut writer = store.writer();
+    writer.write(bytes).await?;
+    let payload_ref = writer.finish().await?;
+    Ok(apply_media_type(payload_ref, media_type))
 }
 
 /// The bool is whether an upstream error truncated collection — so an error-emptied
@@ -476,10 +598,13 @@ impl Normalizer for ProxyNormalizer {
             event = event.with_attribute(key, value.as_str());
         }
 
-        // The full body lives in raw.body; preserve it to the bronze store so the
-        // event stays small and the body is retrievable via raw.observation_id.
-        Ok(NormalizationOutcome::from_events(vec![event])
-            .with_raw_retention(RawRetentionPolicy::Preserve))
+        // The body already lives in the blob store; carry its reference onto the
+        // event and let the raw observation be discarded (default retention).
+        if let Some(payload_ref) = raw.payload_ref() {
+            event = event.with_payload_ref(payload_ref.clone());
+        }
+
+        Ok(NormalizationOutcome::from_events(vec![event]))
     }
 }
 
@@ -492,9 +617,33 @@ fn is_llm_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hiloop_core::event::AttributeValue;
+    use crate::blob::testing::MemoryBlobStore;
+    use hiloop_core::event::{AttributeValue, PayloadDigest};
     use hiloop_core::identity::{ForkContext, Hlc};
     use hudsucker::hyper::body::Frame;
+    use sha2::{Digest, Sha256};
+
+    fn handler() -> (
+        CaptureHandler,
+        mpsc::Receiver<Result<RawSignal, SourceError>>,
+        Arc<MemoryBlobStore>,
+    ) {
+        let (tx, rx) = mpsc::channel(4);
+        let store = Arc::new(MemoryBlobStore::default());
+        let handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()), store.clone());
+        (handler, rx, store)
+    }
+
+    fn expected_digest(body: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let hex = Sha256::digest(body)
+            .iter()
+            .fold(String::new(), |mut acc, byte| {
+                let _ = write!(acc, "{byte:02x}");
+                acc
+            });
+        format!("sha256:{hex}")
+    }
 
     fn proxy_signal(kind: &str, attributes: &[(&str, &str)]) -> RawSignal {
         let mut raw = RawSignal::new(
@@ -513,7 +662,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normalizes_request_as_net_event_and_preserves_body() {
+    async fn normalizes_request_as_net_event_and_carries_payload_ref() {
+        use crate::seams::RawRetentionPolicy;
+        let digest = PayloadDigest::new("sha256:abc").expect("digest");
         let raw = proxy_signal(
             REQUEST_KIND,
             &[
@@ -521,7 +672,8 @@ mod tests {
                 ("http.host", "example.com"),
                 ("http.target", "/v1/thing"),
             ],
-        );
+        )
+        .with_payload_ref(PayloadRef::new(digest));
         let context = NormalizationContext::new(ForkContext::new_local_root());
 
         let outcome = ProxyNormalizer
@@ -529,11 +681,19 @@ mod tests {
             .await
             .expect("normalize");
 
-        assert_eq!(outcome.raw_retention_policy(), RawRetentionPolicy::Preserve);
+        // The body lives in the blob store now, so nothing is retained in bronze.
+        assert_eq!(
+            outcome.raw_retention_policy(),
+            RawRetentionPolicy::DiscardAfterNormalize
+        );
         let events = outcome.into_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].signal, SignalType::Net);
         assert_eq!(events[0].name.as_str(), "http.request");
+        assert_eq!(
+            events[0].payload_ref.as_ref().map(|p| p.digest.as_str()),
+            Some("sha256:abc")
+        );
         assert_eq!(
             events[0]
                 .attributes
@@ -594,8 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_partial_is_captured_when_client_disconnects() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let mut handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
+        let (mut handler, mut rx, store) = handler();
         let response = Response::builder()
             .status(200)
             .body(streaming_body(&[b"chunk-1", b"chunk-2", b"chunk-3"]))
@@ -613,19 +772,25 @@ mod tests {
         assert_eq!(first.as_ref(), b"chunk-1");
         drop(stream);
 
+        // Drop finalizes the partial blob on a detached task; recv awaits it.
         let signal = rx.recv().await.expect("signal").expect("raw");
         assert_eq!(signal.kind, RESPONSE_KIND);
-        assert_eq!(signal.body.as_ref(), b"chunk-1");
+        assert!(signal.body.is_empty(), "offloaded body must be empty");
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(b"chunk-1").as_str())
+        );
+        assert_eq!(signal.payload_ref().and_then(|p| p.size_bytes), Some(7));
         assert_eq!(
             signal.attributes.get(TRUNCATED_ATTR).map(String::as_str),
             Some("true")
         );
+        assert_eq!(store.blobs().len(), 1);
     }
 
     #[tokio::test]
     async fn connect_requests_are_not_captured() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let mut handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
+        let (mut handler, mut rx, _store) = handler();
         let request = Request::builder()
             .method("CONNECT")
             .uri("example.com:443")
@@ -645,14 +810,14 @@ mod tests {
 
     #[tokio::test]
     async fn capture_handler_emits_request_signal() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let mut handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
+        let (mut handler, mut rx, _store) = handler();
         let request = Request::builder()
             .method("POST")
             .uri("http://example.com/v1/thing")
             .body(Body::from(Bytes::from_static(b"hello")))
             .expect("request");
 
+        // The forwarded request still carries the buffered bytes upstream.
         let forwarded = handler.on_request(request).await;
         let chunks = drain_body(forwarded.into_body()).await;
         assert_eq!(chunks.concat(), b"hello");
@@ -660,7 +825,11 @@ mod tests {
         let signal = rx.recv().await.expect("signal").expect("raw");
         assert_eq!(signal.source, PROXY_SOURCE);
         assert_eq!(signal.kind, REQUEST_KIND);
-        assert_eq!(signal.body.as_ref(), b"hello");
+        assert!(signal.body.is_empty(), "offloaded body must be empty");
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(b"hello").as_str())
+        );
         assert_eq!(
             signal.attributes.get("http.method").map(String::as_str),
             Some("POST")
@@ -680,8 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_and_response_share_an_exchange_id() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let mut handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
+        let (mut handler, mut rx, _store) = handler();
 
         let request = Request::builder()
             .method("POST")
@@ -712,13 +880,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_response_is_forwarded_incrementally_and_captured() {
-        let (tx, mut rx) = mpsc::channel(4);
-        let handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()));
+    async fn streaming_response_is_forwarded_incrementally_and_offloaded() {
+        let (handler, mut rx, _store) = handler();
 
         let body = streaming_body(&[b"event: a\n", b"data: 1\n\n", b"data: 2\n\n"]);
         let attributes = vec![("http.status_code", "200".to_owned())];
-        let teed = handler.tee_body(RESPONSE_KIND, "http.response.body_size", attributes, body);
+        let teed = handler.tee_body(
+            RESPONSE_KIND,
+            "http.response.body_size",
+            attributes,
+            None,
+            body,
+        );
 
         // Three source frames must arrive downstream as three distinct frames,
         // proving frame boundaries are preserved rather than coalesced after a
@@ -740,15 +913,24 @@ mod tests {
             "each upstream frame forwarded individually"
         );
 
+        let full = b"event: a\ndata: 1\n\ndata: 2\n\n";
         let signal = rx.recv().await.expect("signal").expect("raw");
         assert_eq!(signal.kind, RESPONSE_KIND);
-        assert_eq!(signal.body.as_ref(), b"event: a\ndata: 1\n\ndata: 2\n\n");
+        assert!(signal.body.is_empty(), "offloaded body must be empty");
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(full).as_str())
+        );
+        assert_eq!(
+            signal.payload_ref().and_then(|p| p.size_bytes),
+            Some(full.len() as u64)
+        );
         assert_eq!(
             signal
                 .attributes
                 .get("http.response.body_size")
                 .map(String::as_str),
-            Some(signal.body.len().to_string().as_str())
+            Some(full.len().to_string().as_str())
         );
     }
 
