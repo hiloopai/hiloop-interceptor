@@ -6,16 +6,18 @@ use hiloop_core::identity::ForkContext;
 use hiloop_interceptor::{
     exporters::JsonlExporter,
     framing::LineFramer,
+    otlp::{OtlpReceiver, OtlpTraceNormalizer},
     pipeline::{Pipeline, PipelineOptions},
     raw::JsonlRawStore,
     seams::{
-        Exporter, NormalizationContext, NormalizerRouter, ProcessContext, RawRetentionPolicy,
-        RawSignal, RawStore, SourceError,
+        Exporter, NormalizationContext, Normalizer, NormalizerRouter, ProcessContext,
+        RawRetentionPolicy, RawSignal, RawStore, SourceError,
     },
     stdio::StdioLogNormalizer,
 };
 use std::{
     ffi::OsString,
+    net::SocketAddr,
     path::PathBuf,
     process::{ExitCode, ExitStatus, Stdio},
     sync::Arc,
@@ -37,6 +39,7 @@ pub(crate) struct RunOptions {
     command: Vec<String>,
     events_jsonl: Option<PathBuf>,
     raw_jsonl: Option<PathBuf>,
+    otlp: bool,
 }
 
 impl RunOptions {
@@ -45,12 +48,14 @@ impl RunOptions {
         command: Vec<String>,
         events_jsonl: Option<PathBuf>,
         raw_jsonl: Option<PathBuf>,
+        otlp: bool,
     ) -> Self {
         Self {
             context,
             command,
             events_jsonl,
             raw_jsonl,
+            otlp,
         }
     }
 }
@@ -91,6 +96,15 @@ impl ChildEnv {
         &self.vars
     }
 
+    fn set_otlp_endpoint(&mut self, addr: SocketAddr) {
+        self.vars.push((
+            "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
+            format!("http://{addr}").into(),
+        ));
+        self.vars
+            .push(("OTEL_EXPORTER_OTLP_PROTOCOL".into(), "http/protobuf".into()));
+    }
+
     fn apply_to(&self, command: &mut Command) {
         command.envs(self.vars.iter().cloned());
     }
@@ -103,6 +117,10 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
 
     if options.raw_jsonl.is_some() && options.events_jsonl.is_none() {
         bail!("--raw-jsonl requires --events-jsonl so raw capture and normalization run together");
+    }
+
+    if options.otlp && options.events_jsonl.is_none() {
+        bail!("--otlp requires --events-jsonl so received telemetry has an exporter");
     }
 
     if let Some(path) = &options.events_jsonl {
@@ -146,13 +164,33 @@ async fn run_captured<E>(
 where
     E: Exporter,
 {
+    let clock = Arc::new(hiloop_core::identity::HlcClock::new());
+
+    // Bind before spawning so the child env can point at the receiver.
+    let otlp_receiver = if options.otlp {
+        Some(
+            OtlpReceiver::bind(Arc::clone(&clock))
+                .await
+                .context("failed to bind OTLP receiver")?,
+        )
+    } else {
+        None
+    };
+
     let mut child = Command::new(&options.command[0]);
     child
         .args(&options.command[1..])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    ChildEnv::for_context(&options.context).apply_to(&mut child);
+    let mut child_env = ChildEnv::for_context(&options.context);
+    if let Some(receiver) = &otlp_receiver {
+        let addr = receiver
+            .local_addr()
+            .context("failed to read OTLP receiver address")?;
+        child_env.set_otlp_endpoint(addr);
+    }
+    child_env.apply_to(&mut child);
     set_child_process_group(&mut child);
 
     let mut child = child
@@ -175,7 +213,6 @@ where
             options_pipeline.with_raw_retention_override(RawRetentionPolicy::Preserve);
     }
     let (signal_tx, signal_rx) = mpsc::channel(options_pipeline.raw_queue_capacity());
-    let clock = Arc::new(hiloop_core::identity::HlcClock::new());
 
     let stdout_capture = capture_stream(
         stdout,
@@ -191,10 +228,30 @@ where
         signal_tx.clone(),
         Arc::clone(&clock),
     );
+
+    let (otlp_shutdown_tx, otlp_server) = match otlp_receiver {
+        Some(receiver) => {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let server = receiver.serve(signal_tx.clone(), async move {
+                let _ = shutdown_rx.await;
+            });
+            (Some(shutdown_tx), Some(server))
+        }
+        None => (None, None),
+    };
     drop(signal_tx);
 
-    let normalizer = StdioLogNormalizer;
-    let router = NormalizerRouter::single(&normalizer);
+    let stdio_normalizer = StdioLogNormalizer;
+    let otlp_normalizer = OtlpTraceNormalizer;
+    let router = if options.otlp {
+        NormalizerRouter::new([
+            &stdio_normalizer as &dyn Normalizer,
+            &otlp_normalizer as &dyn Normalizer,
+        ])
+        .expect("router has at least one normalizer")
+    } else {
+        NormalizerRouter::single(&stdio_normalizer)
+    };
     let normalization_context =
         NormalizationContext::new(options.context.clone()).with_process(process);
     let stream = tokio_stream::wrappers::ReceiverStream::new(signal_rx);
@@ -205,20 +262,33 @@ where
     }
     let pipeline = pipeline_builder.run(stream);
 
-    let (status_result, stdout_result, stderr_result, pipeline_result) =
-        Box::pin(with_signal_forwarding(child_pid, async {
-            tokio::join!(
-                async {
-                    child.wait().await.with_context(|| {
-                        format!("failed to wait for child command `{}`", options.command[0])
-                    })
-                },
-                stdout_capture,
-                stderr_capture,
-                async { pipeline.await.context("stdio event pipeline failed") },
-            )
-        }))
-        .await;
+    // The child exiting is the cue to stop the receiver: dropping its sender lets
+    // the pipeline drain and finish.
+    let child_and_shutdown = async {
+        let status = with_signal_forwarding(child_pid, child.wait())
+            .await
+            .with_context(|| format!("failed to wait for child command `{}`", options.command[0]));
+        if let Some(shutdown_tx) = otlp_shutdown_tx {
+            let _ = shutdown_tx.send(());
+        }
+        status
+    };
+    let otlp_task = async {
+        if let Some(server) = otlp_server {
+            server.await;
+        }
+    };
+
+    let (status_result, stdout_result, stderr_result, (), pipeline_result) = Box::pin(async {
+        tokio::join!(
+            child_and_shutdown,
+            stdout_capture,
+            stderr_capture,
+            otlp_task,
+            async { pipeline.await.context("stdio event pipeline failed") },
+        )
+    })
+    .await;
 
     let status = status_result?;
     pipeline_result?;
@@ -420,6 +490,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_env_sets_otlp_endpoint_and_protocol() {
+        let mut env = ChildEnv::for_context(&ForkContext::new_local_root());
+        env.set_otlp_endpoint("127.0.0.1:4317".parse().expect("addr"));
+
+        let vars = env
+            .vars()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            vars.get("OTEL_EXPORTER_OTLP_ENDPOINT").map(String::as_str),
+            Some("http://127.0.0.1:4317")
+        );
+        assert_eq!(
+            vars.get("OTEL_EXPORTER_OTLP_PROTOCOL").map(String::as_str),
+            Some("http/protobuf")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn exit_u8_maps_normal_and_signal_termination() {
@@ -572,6 +668,7 @@ mod tests {
             ],
             None,
             None,
+            false,
         );
 
         let error = Box::pin(run_captured(&options, &FailingExporter, None))

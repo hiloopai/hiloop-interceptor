@@ -55,6 +55,14 @@ case "$mode" in
             sleep 0.05
         done
         ;;
+    otlp)
+        fixture="${1:?otlp requires a fixture path}"
+        : "${OTEL_EXPORTER_OTLP_ENDPOINT:?otlp mode needs OTEL_EXPORTER_OTLP_ENDPOINT}"
+        command -v curl >/dev/null 2>&1 || { printf 'curl not found\n' >&2; exit 69; }
+        curl -s -X POST -H 'Content-Type: application/x-protobuf' \
+            --data-binary @"$fixture" \
+            "$OTEL_EXPORTER_OTLP_ENDPOINT/v1/traces" >/dev/null
+        ;;
     *)
         printf 'unknown mock harness mode: %s\n' "$mode" >&2
         exit 64

@@ -35,6 +35,14 @@ cargo run -p hiloop-interceptor -- run --events-jsonl ./events.jsonl -- sh -c 'p
 Add `--raw-jsonl ./raw.jsonl` with `--events-jsonl` to preserve captured raw observations and stamp
 `raw.observation_id` on the normalized events that came from them.
 
+Add `--otlp` (with `--events-jsonl`) to also run an embedded OTLP/HTTP receiver: the wrapper injects
+`OTEL_EXPORTER_OTLP_ENDPOINT` into the child, captures the harness's own OpenTelemetry trace export,
+and emits fork-stamped events — `gen_ai.*` / `llm.*` spans become `llm` events.
+
+```sh
+cargo run -p hiloop-interceptor -- run --otlp --events-jsonl ./events.jsonl -- <harness command>
+```
+
 Inspect a captured events file — counts grouped by fork-tree node, or how two branches diverged:
 
 ```sh
@@ -42,11 +50,11 @@ cargo run -p hiloop-interceptor -- inspect ./events.jsonl
 cargo run -p hiloop-interceptor -- inspect ./events.jsonl --diff /0 /1
 ```
 
-The current integration test wraps a real command and asserts child output is teed while
-fork-stamped stdio events are flushed to JSONL. That proves the supervisor, env stamping, local
-normalization, and exporter seam wiring. It does not yet prove OTLP ingest, HTTPS proxy capture,
-ClickHouse export, or harness-aware semantic normalization; those are still planned behind the
-existing seams.
+The integration tests wrap a real command and assert child output is teed while fork-stamped stdio
+events are flushed to JSONL, and that an OTLP trace export from the child is captured as fork-stamped
+events. That proves the supervisor, env stamping, OTLP ingest, local normalization, and exporter
+seam wiring. It does not yet prove HTTPS proxy capture, ClickHouse export, or harness-aware semantic
+normalization; those are still planned behind the existing seams.
 
 ## Workspace
 

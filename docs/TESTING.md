@@ -26,6 +26,7 @@ thresholds.
 | B12 | A telemetry pipeline failure does not abruptly kill a still-running child; the wrapper drains the child and then reports telemetry failure. | Supervisor unit test |
 | B13 | The child leads its own process group; on SIGINT/SIGTERM the wrapper forwards the signal to that group, then still drains the child and reports its exit. | Mock-harness E2E |
 | B14 | A normal child exit passes its code through; a child terminated by a signal is reported as `128 + signo`. | Supervisor unit test + E2E |
+| B15 | With `--otlp`, the wrapper injects `OTEL_EXPORTER_OTLP_ENDPOINT`, receives the child's OTLP trace export, and emits fork-stamped events; LLM spans become `llm`. | Mock-harness E2E + normalizer tests |
 
 These are desired contracts, not incidental implementation details. Changing one requires an
 explicit design decision and updated tests.
@@ -46,7 +47,8 @@ The following behavior is needed before the interceptor is a production supervis
   `OTEL_RESOURCE_ATTRIBUTES`, proxy variables, and CA bundle variables.
 - **Slow and failed sinks:** prove bounded memory, lossless blocking, cancellation, flush ordering,
   and recovery with a deliberately slow/failing exporter and raw store.
-- **Capture surfaces:** add the same contract coverage for OTLP, proxy, and future eBPF sources.
+- **Capture surfaces:** OTLP trace ingest is covered (B15); add the same contract coverage for the
+  proxy and future eBPF sources, and extend OTLP to logs/metrics and large-payload offload.
 
 ## Test Layers
 

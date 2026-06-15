@@ -118,6 +118,54 @@ OTLP-first captures nothing useful and the proxy is the only path to value — i
 proxy first and accept the larger lift. **This hinges on a fact we should check: does our intended
 first dogfooding harness emit OpenTelemetry?**
 
+## Dependency selection — OTLP receiver (verified 2026-06)
+
+Versions were web-checked against crates.io for the newest viable releases, not pinned to whatever
+was already in cache. Recorded so the next person can re-evaluate, and so the proxy (WS-B2) follows
+the same discipline.
+
+| Crate | Version | Why |
+|---|---|---|
+| `opentelemetry-proto` | `0.32` | Latest (2026-05-08; prior was 0.31, Sep 2025). The canonical OTLP protobuf message types, tracking the spec upstream. `default-features = false, features = ["gen-tonic-messages", "trace"]`: `gen-tonic-messages` gives prost-decodable structs without tonic transport, and `trace` is required for the trace message module. See the footprint note below — `trace` also pulls the `opentelemetry` SDK, which we don't use but which LTO strips. |
+| `prost` | `0.14` | Latest (0.14.4, 2026-06-13). **Pinned to match** opentelemetry-proto 0.32's `prost ^0.14` requirement so the `prost::Message` trait is the same crate; a mismatch would make `.decode()` not resolve. |
+| `hyper` | `1` (`server`, `http1`) | The leanest production HTTP server; `tonic` itself is built on it. |
+| `hyper-util` / `http-body-util` | `0.1` | The current companion crates for hyper 1.x connection serving and body collection. |
+
+**Transport — `http/protobuf` over hyper, not gRPC over tonic.** OTLP defines three transports
+(`grpc` on `:4317`, `http/protobuf` and `http/json` on `:4318`). gRPC is the SDK default and is the
+most ecosystem-native (opentelemetry-proto's `gen-tonic` even generates the service trait), but
+`tonic` pulls `h2` + `tower` into the **shipped** binary, and the wrapper's footprint multiplies
+across every sandbox (DESIGN.md's core mandate). Because the wrapper *controls the child
+environment*, it injects `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` and forces the SDK onto the
+lean HTTP path — keeping the ecosystem-compat win without the gRPC dependency weight. A gRPC
+receiver can be added later behind the same `Source` seam if a harness can't be steered off gRPC.
+
+**Server — raw `hyper`, not `axum`.** `axum` is cleaner for multi-route apps but adds `tower` +
+routing for what is one internal endpoint (`POST /v1/traces`, later `/v1/logs`, `/v1/metrics`).
+Footprint wins for a handful of routes.
+
+**Footprint note — the unused SDK that LTO removes.** `opentelemetry-proto` 0.32 gates the trace
+*message* module behind the same `trace` feature that adds proto↔SDK conversions, so enabling it
+drags `opentelemetry` + `opentelemetry_sdk` into the dependency graph even though a receiver only
+decodes protobuf and never touches the SDK. That looked wrong, so it was measured rather than
+assumed: the release binary (profile `release`: `lto = "fat"`, `strip = true`, `codegen-units = 1`)
+is **~1.4 MB** — dead-code elimination removes the unreachable SDK, so the graph size does not become
+binary size. If a future binary-size budget regresses on this, the lean alternative is to own the
+OTLP `.proto` files and generate just the messages with `prost-build` + `protox` (pure-Rust, no
+`protoc`), dropping the SDK from the graph entirely. Deferred under record-don't-gate: the canonical,
+spec-tracking crate is worth more than shaving an already-stripped dependency.
+
 ## Decision
 
-_TBD — fill in once chosen, with the date and the rationale, and link the implementing commits._
+**2026-06-14 — build both, OTLP receiver first, then the MITM proxy.** We want both surfaces; OTLP
+leads because it is the faster, lower-risk path to structured LLM telemetry and lets the `Source`
+trait's lifecycle/config shape settle under a simpler (no-TLS) load before the proxy adds cert
+handling and large-body offload. The proxy follows for universal, cooperation-free coverage.
+
+**Status — OTLP shipped (`--otlp`).** `hiloop_interceptor::otlp` runs an embedded OTLP/HTTP receiver
+bound to an ephemeral localhost port; the supervisor injects the endpoint, registers
+`OtlpTraceNormalizer` alongside the stdio normalizer, and shuts the receiver down on child exit so
+the pipeline drains. As predicted, the receiver does **not** yet flow through the `Source` trait — it
+feeds the supervisor's signal channel directly, the same shortcut stdio capture takes. Now that two
+real producers exist, the next `Source` refactor should give the trait construction-time config and
+a shutdown handle (and `RawSignal` a large-body escape hatch before the proxy lands).

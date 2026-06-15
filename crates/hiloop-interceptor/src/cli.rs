@@ -79,6 +79,11 @@ struct RunArgs {
     #[arg(long = "raw-jsonl", env = "HILOOP_RAW_JSONL")]
     raw_jsonl: Option<PathBuf>,
 
+    /// Run an embedded OTLP receiver and capture the child's OpenTelemetry
+    /// export. Requires `--events-jsonl`.
+    #[arg(long = "otlp")]
+    otlp: bool,
+
     /// Command to wrap. Everything after `--` is passed to the child.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -92,6 +97,12 @@ impl RunArgs {
             self.fork_path.unwrap_or_default(),
         );
 
-        RunOptions::new(context, self.command, self.events_jsonl, self.raw_jsonl)
+        RunOptions::new(
+            context,
+            self.command,
+            self.events_jsonl,
+            self.raw_jsonl,
+            self.otlp,
+        )
     }
 }

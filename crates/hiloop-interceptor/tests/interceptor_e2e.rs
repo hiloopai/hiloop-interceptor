@@ -312,6 +312,75 @@ async fn inspect_summarizes_captured_events() {
     );
 }
 
+#[tokio::test]
+async fn captures_otlp_traces_from_child_export() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let fixture_path = temp.path().join("trace.pb");
+    std::fs::write(&fixture_path, otlp_trace_fixture()).expect("write fixture");
+
+    let mut command = interceptor_command();
+    command
+        .arg("--otlp")
+        .arg("--events-jsonl")
+        .arg(&events_path);
+    append_mock_harness(
+        &mut command,
+        "otlp",
+        &[fixture_path.to_str().expect("fixture path")],
+    );
+
+    let output = run(command).await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = read_jsonl(&events_path);
+    let llm = events
+        .iter()
+        .find(|event| event["signal"] == "llm")
+        .expect("an llm event from the OTLP export");
+    assert_eq!(llm["name"], "chat");
+    assert_eq!(llm["fork_path"], FORK_PATH);
+    assert_eq!(llm["attributes"]["gen_ai.system"], "anthropic");
+    assert_eq!(
+        llm["attributes"][provenance_keys::NORMALIZER_NAME],
+        "otlp-trace"
+    );
+}
+
+fn otlp_trace_fixture() -> Vec<u8> {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use prost::Message as _;
+
+    let span = Span {
+        name: "chat".to_owned(),
+        start_time_unix_nano: 7,
+        attributes: vec![KeyValue {
+            key: "gen_ai.system".to_owned(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue("anthropic".to_owned())),
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![span],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec()
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn forwards_sigterm_to_child_and_reports_signal_exit() {
