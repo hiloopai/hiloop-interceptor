@@ -63,6 +63,14 @@ case "$mode" in
             --data-binary @"$fixture" \
             "$OTEL_EXPORTER_OTLP_ENDPOINT/v1/traces" >/dev/null
         ;;
+    proxy)
+        url="${1:?proxy requires a url}"
+        : "${HTTPS_PROXY:?proxy mode needs HTTPS_PROXY}"
+        command -v curl >/dev/null 2>&1 || { printf 'curl not found\n' >&2; exit 69; }
+        # curl picks up HTTPS_PROXY and the injected CURL_CA_BUNDLE from the env.
+        # Upstream is expected to fail; the decrypted request is what we capture.
+        curl -s -o /dev/null --max-time 5 "$url" || true
+        ;;
     *)
         printf 'unknown mock harness mode: %s\n' "$mode" >&2
         exit 64

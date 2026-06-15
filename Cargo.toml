@@ -19,6 +19,7 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 futures-core = "0.3"
 futures-util = "0.3"
 hiloop-core = { version = "0.0.0", path = "crates/hiloop-core" }
+hudsucker = { version = "0.24", features = ["http2"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

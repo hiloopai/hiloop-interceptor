@@ -25,11 +25,13 @@ futures-core.workspace = true
 futures-util.workspace = true
 hiloop-core.workspace = true
 http-body-util.workspace = true
+hudsucker.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -42,7 +44,6 @@ nix.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-tempfile.workspace = true
 
 [[bench]]
 name = "stdio_path"

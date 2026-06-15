@@ -84,6 +84,11 @@ struct RunArgs {
     #[arg(long = "otlp")]
     otlp: bool,
 
+    /// Run an embedded MITM proxy and capture the child's HTTP(S) traffic.
+    /// Requires `--events-jsonl` and `--raw-jsonl`.
+    #[arg(long = "proxy")]
+    proxy: bool,
+
     /// Command to wrap. Everything after `--` is passed to the child.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -103,6 +108,7 @@ impl RunArgs {
             self.events_jsonl,
             self.raw_jsonl,
             self.otlp,
+            self.proxy,
         )
     }
 }

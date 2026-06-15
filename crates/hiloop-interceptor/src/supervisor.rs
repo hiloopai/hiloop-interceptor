@@ -8,6 +8,7 @@ use hiloop_interceptor::{
     framing::LineFramer,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
     pipeline::{Pipeline, PipelineOptions},
+    proxy::{ProxyCa, ProxyNormalizer, ProxyServer},
     raw::JsonlRawStore,
     seams::{
         Exporter, NormalizationContext, Normalizer, NormalizerRouter, ProcessContext,
@@ -17,8 +18,9 @@ use hiloop_interceptor::{
 };
 use std::{
     ffi::OsString,
+    io::Write as _,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ExitCode, ExitStatus, Stdio},
     sync::Arc,
 };
@@ -40,6 +42,7 @@ pub(crate) struct RunOptions {
     events_jsonl: Option<PathBuf>,
     raw_jsonl: Option<PathBuf>,
     otlp: bool,
+    proxy: bool,
 }
 
 impl RunOptions {
@@ -49,6 +52,7 @@ impl RunOptions {
         events_jsonl: Option<PathBuf>,
         raw_jsonl: Option<PathBuf>,
         otlp: bool,
+        proxy: bool,
     ) -> Self {
         Self {
             context,
@@ -56,6 +60,7 @@ impl RunOptions {
             events_jsonl,
             raw_jsonl,
             otlp,
+            proxy,
         }
     }
 }
@@ -105,6 +110,25 @@ impl ChildEnv {
             .push(("OTEL_EXPORTER_OTLP_PROTOCOL".into(), "http/protobuf".into()));
     }
 
+    fn set_proxy(&mut self, addr: SocketAddr, ca_path: &Path) {
+        let proxy_url: OsString = format!("http://{addr}").into();
+        // Both cases: tools split on which they read (curl uses lowercase).
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+            self.vars.push((var.into(), proxy_url.clone()));
+        }
+        // Child-scoped trust for the proxy CA across common runtimes; never the
+        // system trust store.
+        let ca = ca_path.as_os_str().to_owned();
+        for var in [
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
+            "CURL_CA_BUNDLE",
+        ] {
+            self.vars.push((var.into(), ca.clone()));
+        }
+    }
+
     fn apply_to(&self, command: &mut Command) {
         command.envs(self.vars.iter().cloned());
     }
@@ -121,6 +145,10 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
 
     if options.otlp && options.events_jsonl.is_none() {
         bail!("--otlp requires --events-jsonl so received telemetry has an exporter");
+    }
+
+    if options.proxy && (options.events_jsonl.is_none() || options.raw_jsonl.is_none()) {
+        bail!("--proxy requires --events-jsonl and --raw-jsonl so captured bodies are retained");
     }
 
     if let Some(path) = &options.events_jsonl {
@@ -166,12 +194,38 @@ where
 {
     let clock = Arc::new(hiloop_core::identity::HlcClock::new());
 
-    // Bind before spawning so the child env can point at the receiver.
+    // Bind capture servers before spawning so the child env can point at them.
     let otlp_receiver = if options.otlp {
         Some(
             OtlpReceiver::bind(Arc::clone(&clock))
                 .await
                 .context("failed to bind OTLP receiver")?,
+        )
+    } else {
+        None
+    };
+
+    let proxy_ca = if options.proxy {
+        Some(ProxyCa::generate().context("failed to generate proxy CA")?)
+    } else {
+        None
+    };
+    // The child-scoped CA bundle file must outlive the child, so keep the handle.
+    let proxy_ca_file = match &proxy_ca {
+        Some(ca) => {
+            let mut file =
+                tempfile::NamedTempFile::new().context("failed to create proxy CA bundle file")?;
+            file.write_all(ca.cert_pem().as_bytes())
+                .context("failed to write proxy CA bundle")?;
+            Some(file)
+        }
+        None => None,
+    };
+    let proxy_server = if options.proxy {
+        Some(
+            ProxyServer::bind(Arc::clone(&clock))
+                .await
+                .context("failed to bind proxy server")?,
         )
     } else {
         None
@@ -189,6 +243,12 @@ where
             .local_addr()
             .context("failed to read OTLP receiver address")?;
         child_env.set_otlp_endpoint(addr);
+    }
+    if let (Some(server), Some(file)) = (&proxy_server, &proxy_ca_file) {
+        let addr = server
+            .local_addr()
+            .context("failed to read proxy server address")?;
+        child_env.set_proxy(addr, file.path());
     }
     child_env.apply_to(&mut child);
     set_child_process_group(&mut child);
@@ -239,19 +299,30 @@ where
         }
         None => (None, None),
     };
+    let (proxy_shutdown_tx, proxy_server_task) = match (proxy_server, proxy_ca) {
+        (Some(server), Some(ca)) => {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let task = server.serve(ca, signal_tx.clone(), async move {
+                let _ = shutdown_rx.await;
+            });
+            (Some(shutdown_tx), Some(task))
+        }
+        _ => (None, None),
+    };
     drop(signal_tx);
 
     let stdio_normalizer = StdioLogNormalizer;
     let otlp_normalizer = OtlpTraceNormalizer;
-    let router = if options.otlp {
-        NormalizerRouter::new([
-            &stdio_normalizer as &dyn Normalizer,
-            &otlp_normalizer as &dyn Normalizer,
-        ])
-        .expect("router has at least one normalizer")
-    } else {
-        NormalizerRouter::single(&stdio_normalizer)
-    };
+    let proxy_normalizer = ProxyNormalizer;
+    let mut normalizers: Vec<&dyn Normalizer> = vec![&stdio_normalizer];
+    if options.otlp {
+        normalizers.push(&otlp_normalizer);
+    }
+    if options.proxy {
+        normalizers.push(&proxy_normalizer);
+    }
+    let router = NormalizerRouter::new(normalizers).expect("router has at least one normalizer");
+
     let normalization_context =
         NormalizationContext::new(options.context.clone()).with_process(process);
     let stream = tokio_stream::wrappers::ReceiverStream::new(signal_rx);
@@ -262,13 +333,13 @@ where
     }
     let pipeline = pipeline_builder.run(stream);
 
-    // The child exiting is the cue to stop the receiver: dropping its sender lets
-    // the pipeline drain and finish.
+    // The child exiting is the cue to stop the capture servers: dropping their
+    // senders lets the pipeline drain and finish.
     let child_and_shutdown = async {
         let status = with_signal_forwarding(child_pid, child.wait())
             .await
             .with_context(|| format!("failed to wait for child command `{}`", options.command[0]));
-        if let Some(shutdown_tx) = otlp_shutdown_tx {
+        for shutdown_tx in [otlp_shutdown_tx, proxy_shutdown_tx].into_iter().flatten() {
             let _ = shutdown_tx.send(());
         }
         status
@@ -278,13 +349,22 @@ where
             server.await;
         }
     };
+    let proxy_task = async {
+        // Capture is best effort: a proxy failure is reported, not fatal to the child.
+        if let Some(task) = proxy_server_task
+            && let Err(error) = task.await
+        {
+            eprintln!("hiloop-interceptor: proxy capture failed: {error}");
+        }
+    };
 
-    let (status_result, stdout_result, stderr_result, (), pipeline_result) = Box::pin(async {
+    let (status_result, stdout_result, stderr_result, (), (), pipeline_result) = Box::pin(async {
         tokio::join!(
             child_and_shutdown,
             stdout_capture,
             stderr_capture,
             otlp_task,
+            proxy_task,
             async { pipeline.await.context("stdio event pipeline failed") },
         )
     })
@@ -668,6 +748,7 @@ mod tests {
             ],
             None,
             None,
+            false,
             false,
         );
 

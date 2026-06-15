@@ -155,12 +155,31 @@ OTLP `.proto` files and generate just the messages with `prost-build` + `protox`
 `protoc`), dropping the SDK from the graph entirely. Deferred under record-don't-gate: the canonical,
 spec-tracking crate is worth more than shaving an already-stripped dependency.
 
+## Dependency selection — MITM proxy (verified 2026-06)
+
+| Crate | Version | Why |
+|---|---|---|
+| `hudsucker` | `0.24` | Latest (0.24.1, 2026-05-04). The maintained Rust MITM proxy (Rust 2024 edition); gives the `HttpHandler` capture seam, `RcgenAuthority` (rcgen CA + `moka` leaf-cert cache — exactly DESIGN.md's "ECDSA CA + cached leaf certs"), and CONNECT/TLS/HTTP-2 handling we'd otherwise hand-roll. Alternatives `third-wheel` and `http-mitm-proxy` are less active. Enable `http2` (LLM APIs need it); `rustls-client` + `rcgen-ca` are default. |
+| `rcgen` (via `hudsucker::rcgen`) | `0.14` | hudsucker **re-exports** `rcgen`, so we use `hudsucker::rcgen` instead of a direct dep — guarantees the `KeyPair`/`Issuer` types we generate match what `RcgenAuthority::new` accepts (no version-skew risk). Used to mint an ephemeral **ECDSA P-256** CA per run. |
+| `rustls` (via `hudsucker::rustls`) crypto provider | `aws-lc-rs` | rustls 0.23 requires an explicit `CryptoProvider`. I wanted `ring` (no C toolchain), but hudsucker pulls `hyper-rustls` with rustls's default `aws-lc-rs` and exposes no feature to swap it — forcing ring-only would mean forking hudsucker's feature graph. So we align on `aws-lc-rs` (the rustls-recommended default; needs `cmake` + a C compiler at build, which standard CI has). hudsucker also re-exports rustls and takes the provider explicitly, so we use `hudsucker::rustls::crypto::aws_lc_rs::default_provider()` and need no direct rustls dep or process-wide provider install. If the build matrix ever can't host the C toolchain, revisit (own the proxy on raw rustls+ring, or a hudsucker fork). |
+
+The proxy's TLS stack (hudsucker + rustls + aws-lc-rs + moka) takes the release binary from ~1.4 MB
+to **~5.8 MB** — still well under the `< 20 MB` wrapper budget (`TESTING.md`).
+
 ## Decision
 
 **2026-06-14 — build both, OTLP receiver first, then the MITM proxy.** We want both surfaces; OTLP
 leads because it is the faster, lower-risk path to structured LLM telemetry and lets the `Source`
 trait's lifecycle/config shape settle under a simpler (no-TLS) load before the proxy adds cert
 handling and large-body offload. The proxy follows for universal, cooperation-free coverage.
+
+**Status — proxy shipped (`--proxy`).** `hiloop_interceptor::proxy` runs a hudsucker MITM proxy with
+a per-run ECDSA CA, injects `HTTPS_PROXY` + a child-scoped CA bundle, and captures decrypted
+request/response bodies (offloaded to the bronze raw store via preserve retention; `net`, or `llm`
+for known hosts). Verified end-to-end by a hermetic MITM e2e (curl tunnels HTTPS through the proxy,
+the decrypted request is captured before the upstream attempt). First-slice gaps tracked in
+TESTING.md: bodies are fully buffered (no streaming/SSE passthrough yet), request/response pairs are
+not correlated, and offload is by observation id rather than content hash.
 
 **Status — OTLP shipped (`--otlp`).** `hiloop_interceptor::otlp` runs an embedded OTLP/HTTP receiver
 bound to an ephemeral localhost port; the supervisor injects the endpoint, registers

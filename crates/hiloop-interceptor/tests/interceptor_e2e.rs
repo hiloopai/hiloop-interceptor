@@ -381,6 +381,68 @@ fn otlp_trace_fixture() -> Vec<u8> {
     .encode_to_vec()
 }
 
+#[tokio::test]
+async fn proxy_mitm_captures_decrypted_https_request() {
+    // A local TCP sink the proxy reaches upstream: it accepts then drops, so the
+    // proxy's upstream TLS fails (502) — but the decrypted request is captured
+    // first, which is exactly what proves the MITM + injected CA worked.
+    let sink = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind sink");
+    let sink_port = sink.local_addr().expect("sink addr").port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = sink.accept().await {
+            drop(stream);
+        }
+    });
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let raw_path = temp.path().join("raw.jsonl");
+
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--raw-jsonl")
+        .arg(&raw_path);
+    let url = format!("https://localhost:{sink_port}/v1/thing");
+    append_mock_harness(&mut command, "proxy", &[&url]);
+
+    let output = run(command).await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = read_jsonl(&events_path);
+    let request = events
+        .iter()
+        .find(|event| {
+            event["name"] == "http.request"
+                && event["attributes"]["http.target"]
+                    .as_str()
+                    .is_some_and(|target| target.ends_with("/v1/thing"))
+        })
+        .expect("a captured https request proves TLS interception");
+    assert_eq!(request["signal"], "net");
+    assert_eq!(request["fork_path"], FORK_PATH);
+    assert!(
+        request["attributes"]["http.host"]
+            .as_str()
+            .is_some_and(|host| host.starts_with("localhost")),
+        "captured host: {}",
+        request["attributes"]["http.host"]
+    );
+    // Body offloaded to the bronze store, linked from the event.
+    assert!(
+        request["attributes"][provenance_keys::RAW_OBSERVATION_ID].is_string(),
+        "request body should be retained in the raw store"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn forwards_sigterm_to_child_and_reports_signal_exit() {
