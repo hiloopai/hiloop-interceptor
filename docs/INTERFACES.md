@@ -29,6 +29,21 @@ represents heterogeneous pre-normalization input. This is an explicit exception 
 rule, not a precedent for normalized schemas. Revisit those fields once the source and kind
 taxonomy is stable.
 
+## Contract Stability
+
+`hiloop_core::event::Event` and the `hiloop_core::identity` types are **persisted and wire
+contracts**. Treat their serialized shape as frozen at v1: a change to the field set, field
+names, enum discriminants, or the fork-path / HLC encoding is a coordinated schema decision
+plus a migration, never an incidental edit.
+
+This policy is enforced executably by
+[`crates/hiloop-core/tests/spine_conformance.rs`](../crates/hiloop-core/tests/spine_conformance.rs)
+(`event_v1_schema_is_locked`). If that test fails, either revert the change or, when the schema
+change is intended, bump the normalizer `output_schema_version`, update the lock, and document the
+migration. Internal, non-serialized APIs such as the `Source` / `Normalizer` trait signatures and
+the pipeline internals are *not* frozen and may change freely — that is the whole point of keeping
+them out of `hiloop-core`.
+
 ## Current Seams
 
 ### Source

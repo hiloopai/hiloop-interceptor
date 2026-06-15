@@ -274,6 +274,21 @@ impl ForkContext {
             fork_path,
         }
     }
+
+    /// Derive a child fork node from this node.
+    ///
+    /// The child stays in the same run, mints a fresh [`ForkNodeId`], and
+    /// extends `fork_path` with the parent-assigned `ordinal`. Pair this with a
+    /// per-parent [`ChildOrdinalAllocator`] so sibling ordinals stay unique and
+    /// gap-free under concurrent forking. Fails only if the child would exceed
+    /// [`MAX_FORK_PATH_DEPTH`].
+    pub fn child(&self, ordinal: ForkOrdinal) -> Result<Self, IdentityError> {
+        Ok(Self {
+            run_id: self.run_id,
+            fork_node_id: ForkNodeId::new(),
+            fork_path: self.fork_path.child(ordinal)?,
+        })
+    }
 }
 
 /// Parent-owned atomic allocator for sibling fork ordinals.
@@ -536,6 +551,18 @@ mod tests {
         for value in ["0", "/", "/01", "/0//1", "/x", "/0/"] {
             assert!(ForkPath::parse(value).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn fork_context_child_extends_path_and_keeps_run() {
+        let parent = ForkContext::new_local_root();
+        let child = parent.child(ordinal(2)).expect("child context");
+
+        assert_eq!(child.run_id, parent.run_id);
+        assert_ne!(child.fork_node_id, parent.fork_node_id);
+        assert!(parent.fork_path.is_ancestor_of(&child.fork_path));
+        assert_eq!(child.fork_path.depth(), parent.fork_path.depth() + 1);
+        assert_eq!(child.fork_path.ordinals().last(), Some(&ordinal(2)));
     }
 
     #[test]
