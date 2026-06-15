@@ -54,20 +54,57 @@ payloads, OTLP/protobuf input, files, or future harness integrations.
 A source should preserve raw bytes, timestamps, source identity, and source-local metadata. It
 should not infer semantic event meaning that belongs in a normalizer.
 
+The trait is a one-shot async lifecycle, not a stream accessor:
+
+```rust
+#[async_trait]
+pub trait Source: Send {
+    fn name(&self) -> &'static str;
+    async fn run(
+        self: Box<Self>,
+        sink: RawSignalSink,
+        shutdown: ShutdownSignal,
+    ) -> Result<(), SourceError>;
+}
+```
+
+Construction-time config (a bound socket, an open reader, credentials) lives on the concrete type;
+the trait does not prescribe a config shape. `run` consumes the source, pushes signals into the
+`RawSignalSink` (a transport-hiding wrapper over the pipeline's bounded channel, so sends apply
+real back-pressure), and returns when its input is exhausted, `shutdown` resolves, or the sink
+reports `SinkSend::Closed`. This single method covers both producer styles: **push** sources
+(OTLP/proxy servers) make `run` an accept loop that selects on `shutdown`; **pull** sources (stdio)
+make `run` a read loop that returns at end-of-input. `StdioSource` is the reference pull
+implementation — it composes `LineFramer` and tees bytes verbatim before framing. The pipeline
+drives a source through `Pipeline::run_source` (input-exhausted exit) or `run_source_until`
+(external shutdown trigger).
+
+`RawSignal` now also carries an optional, additive out-of-line body reference via
+`RawSignal::with_payload_ref(PayloadRef)`. `body` stays authoritative and `RawSignal::new` is
+unchanged; a source that offloads a large body to content-addressed storage can pair an empty
+`body` with a populated `payload_ref` (aligned with `hiloop_core::event::PayloadRef`, so a
+normalizer can carry it straight onto `Event::with_payload_ref`).
+
+The OTLP receiver and MITM proxy still feed the pipeline channel through their own
+`serve(signal_tx, shutdown)` methods rather than implementing `Source`; their `serve` signature is
+already the `run` shape, so adopting the trait is mechanical when convenient. The supervisor's
+inline `capture_stream` likewise predates `StdioSource`; see the `TODO(source-seam)` in
+`supervisor.rs` for why that migration is deferred (it treats a closed event pipeline as fatal,
+which `StdioSource::run` deliberately does not, and it fans four producers into one shared channel).
+
 Expected growth:
 
-- cancellation and child process lifecycle handling;
-- source-specific back-pressure reporting;
-- credentials and config for networked sources;
-- richer source identity;
-- durable raw payload references when bodies become too large to inline.
+- richer source identity and credential/config types for networked sources;
+- adopting `Source` in the OTLP/proxy receivers and the supervisor stdio path;
+- durable raw payload references becoming the default for large bodies (the hatch exists; the
+  offload backend does not yet).
 
 Ways this may go awry:
 
-- buffering without bounds;
+- buffering without bounds (rely on the sink's back-pressure, not internal queues);
 - losing raw bytes or timestamps;
 - over-normalizing too early;
-- hiding shutdown failures;
+- hiding shutdown failures or ignoring the `shutdown` signal;
 - letting source/kind string conventions leak into normalized schemas.
 
 ### Normalizer
