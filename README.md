@@ -35,6 +35,13 @@ cargo run -p hiloop-interceptor -- run --events-jsonl ./events.jsonl -- sh -c 'p
 Add `--raw-jsonl ./raw.jsonl` with `--events-jsonl` to preserve captured raw observations and stamp
 `raw.observation_id` on the normalized events that came from them.
 
+Inspect a captured events file — counts grouped by fork-tree node, or how two branches diverged:
+
+```sh
+cargo run -p hiloop-interceptor -- inspect ./events.jsonl
+cargo run -p hiloop-interceptor -- inspect ./events.jsonl --diff /0 /1
+```
+
 The current integration test wraps a real command and asserts child output is teed while
 fork-stamped stdio events are flushed to JSONL. That proves the supervisor, env stamping, local
 normalization, and exporter seam wiring. It does not yet prove OTLP ingest, HTTPS proxy capture,

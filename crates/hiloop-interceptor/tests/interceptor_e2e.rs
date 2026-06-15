@@ -280,6 +280,32 @@ async fn invalid_output_configuration_fails_before_starting_child() {
     );
 }
 
+#[tokio::test]
+async fn inspect_summarizes_captured_events() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+
+    let mut capture = interceptor_command();
+    capture.arg("--events-jsonl").arg(&events_path);
+    append_mock_harness(&mut capture, "mixed", &[]);
+    let captured = run(capture).await;
+    assert!(captured.status.success());
+
+    let mut inspect = Command::new(env!("CARGO_BIN_EXE_hiloop-interceptor"));
+    inspect.kill_on_drop(true);
+    inspect.arg("inspect").arg(&events_path);
+    let output = run(inspect).await;
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(
+        stdout.contains("4 events across 1 fork path(s)"),
+        "summary header missing: {stdout}"
+    );
+    assert!(stdout.contains("process.stdout: 2"), "stdout count: {stdout}");
+    assert!(stdout.contains("process.stderr: 2"), "stderr count: {stdout}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn forwards_sigterm_to_child_and_reports_signal_exit() {
@@ -306,7 +332,8 @@ async fn forwards_sigterm_to_child_and_reports_signal_exit() {
     // `started` exists both ends are ready for the signal.
     wait_for_path(&started).await;
 
-    let pid = i32::try_from(child.id().expect("interceptor pid")).expect("interceptor pid fits i32");
+    let pid =
+        i32::try_from(child.id().expect("interceptor pid")).expect("interceptor pid fits i32");
     kill(Pid::from_raw(pid), Signal::SIGTERM).expect("send SIGTERM to interceptor");
 
     let status = tokio::time::timeout(E2E_TIMEOUT, child.wait())

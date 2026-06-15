@@ -24,6 +24,13 @@ impl Cli {
                 let options = args.into_run_options();
                 Box::pin(run(&options)).await
             }
+            Command::Inspect(args) => {
+                let diff = args
+                    .diff
+                    .as_ref()
+                    .map(|paths| (paths[0].as_str(), paths[1].as_str()));
+                crate::inspect_cli::run(&args.events_jsonl, diff)
+            }
         }
     }
 }
@@ -32,6 +39,18 @@ impl Cli {
 enum Command {
     /// Run a command under the interceptor supervisor.
     Run(RunArgs),
+    /// Summarize a captured events JSONL file, grouped by fork path.
+    Inspect(InspectArgs),
+}
+
+#[derive(Debug, Args)]
+struct InspectArgs {
+    /// Newline-delimited JSON events file produced by `run --events-jsonl`.
+    events_jsonl: PathBuf,
+
+    /// Compare two fork paths' event-name distributions, e.g. `--diff "" /0`.
+    #[arg(long, num_args = 2, value_names = ["PATH_A", "PATH_B"])]
+    diff: Option<Vec<String>>,
 }
 
 #[derive(Debug, Args)]

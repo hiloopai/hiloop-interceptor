@@ -2,6 +2,7 @@
 
 pub mod exporters;
 pub mod framing;
+pub mod inspect;
 pub mod pipeline;
 pub mod raw;
 pub mod seams;
