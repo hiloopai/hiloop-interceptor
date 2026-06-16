@@ -202,6 +202,14 @@ is recorded with no paired response — absent rather than mis-correlated.
 (responses stream); on a blob-write failure a streamed response degrades to metadata only (no inline
 fallback, unlike requests).
 
+**Blobs are local-only — getting them to the backend is the next step.** `DirBlobStore` writes blobs
+to a local directory and the `Event` carries only the `payload_ref` digest; nothing yet uploads the
+bytes to the telemetry backend, so a digest is currently unresolvable downstream. The cross-repo
+design for that (a separate digest-first uploader behind the `BlobStore` seam, plus the sha256-vs-
+blake3 / one-CAS decision) is in [`PAYLOAD-HANDOFF.md`](PAYLOAD-HANDOFF.md) and the interceptor-side
+reply [`PAYLOAD-HANDOFF-RESPONSE.md`](PAYLOAD-HANDOFF-RESPONSE.md). A configurable max blob size at
+the edge is also still open.
+
 **Status — OTLP shipped (`--otlp`).** `hiloop_interceptor::otlp` runs an embedded OTLP/HTTP receiver
 bound to an ephemeral localhost port; the supervisor injects the endpoint, registers
 `OtlpTraceNormalizer` alongside the stdio normalizer, and shuts the receiver down on child exit so
