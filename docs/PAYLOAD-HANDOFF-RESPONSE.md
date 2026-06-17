@@ -65,9 +65,84 @@ show "uploading…" rather than "missing." One line in the proto/contract.
    everything.
 
 ## Cross-repo points still to settle together
-- **Hash algorithm** (adjustment 2) — the one real decision.
-- **Wire shape** for `HasBlobs`/`UploadBlob` — design together so the edge's digest is exactly the
-  backend's key (and so the backend re-hash uses the same algorithm).
-- **Truncated/oversized payloads** — edge caps + stamps (adjustment 3); define backend behavior for a
-  truncated blob (store partial? keep event, drop blob?).
+- **Hash algorithm** (adjustment 2) — **decided: blake3.** The edge now content-addresses with blake3
+  (matches the snapshot store's CAS; registered CAS digest in OCI image-spec and Bazel REAPI). The
+  digest is algorithm-prefixed (`blake3:<hex>`), so a mixed store stays possible. The backend's CAS
+  must key + re-hash on blake3.
+- **Wire shape** for the blob API — design together (see the ingestion-interface section below) so
+  the edge's digest is exactly the backend's key, and the backend re-hash uses blake3.
+- **Truncated/oversized payloads** — edge caps + stamps `http.capture.truncated` (configurable
+  `--max-capture-bytes`); define backend behavior for a truncated blob (store partial? keep event,
+  drop blob?).
 - `media_type` / `size_bytes` on `PayloadRef` — we keep populating them.
+
+## Ingestion interface — recommended design
+
+Backed by a survey of how production telemetry + CAS systems solve exactly this (Sentry, OTLP,
+Honeycomb, Datadog, Grafana, Langfuse/LangSmith/Helicone for LLM-body offload; OCI Distribution,
+Bazel REAPI, Git, restic/casync for content-addressed upload; the OAuth RFCs for untrusted-client
+auth). The findings converge hard.
+
+### One control plane, two data planes
+
+The team's "single ingestor is nicer for auth" intuition is **right about auth/control and wrong
+about transport.** The split that matters is **events vs payloads, not events-by-type** — splitting
+the *event* stream into per-signal endpoints (OTLP/Datadog/Grafana style) is an ecosystem-interop
+choice with no scaling payoff for a first-party agent (Sentry and Honeycomb run high rate over one
+multiplexed event endpoint). So:
+
+- **One authenticated front door** — one per-agent credential; auth, TLS, rate-limiting, quota, and
+  audit enforced once. Concretely an API gateway fanning out to two backends, **or** (lighter) one
+  gRPC service with `IngestEvents` (unary) + `UploadBlob` (client-streaming) behind a single auth
+  interceptor.
+- **Two independently-tuned data paths behind it.** Events: small body limit (~1 MB, the universal
+  in-band cap), tight timeout, request-count rate limits → the telemetry store. Blobs: long timeout,
+  byte/bandwidth limits, and ideally **not proxied through the API tier at all** — the front door
+  hands back a presigned/short-lived URL and the edge uploads the bytes **direct to object storage**.
+
+**Transport caveat:** do not co-mingle blob and event bytes on one connection. HTTP/2 multiplexing
+does not save you — a lost TCP segment on a stalled blob upload head-of-line-blocks interleaved
+event streams at the TCP layer. Blobs get their own connection, or (better) presigned direct upload.
+
+### The blob upload protocol (digest-first, dedup-on-upload, verify-on-write)
+
+From OCI / Bazel REAPI / Langfuse, the proven shape:
+
+1. **Negotiate**: the edge asks `find-missing([{digest, size}…])` and the backend returns only the
+   digests it lacks. This collapses the common case (retries, shared system prompts, sibling-fork
+   duplicates) to no-ops in one round trip (Bazel `FindMissingBlobs`; Git have/want; Langfuse
+   "already have it → skip upload").
+2. **Transfer the missing**: batch small blobs in one call; stream large ones resumably
+   (offset-query + append). Or hand back a presigned object-storage PUT and upload direct.
+3. **Verify-on-write (the trust spine)**: because the edge is an untrusted OSS client, the backend
+   **MUST recompute the blake3 of received bytes and reject mismatches** — otherwise a client could
+   claim digest X but upload Y and poison the CAS. Existence checks are an optimization, sound only
+   because every stored blob was verified on write. The digest *is* the idempotency key (re-upload =
+   no-op).
+
+### Auth for the OSS edge
+
+The edge is a "public client" (RFC 6749) — it ships **no long-lived secret** (anything embedded is
+extractable). Use a **public, write-only ingest credential** like Sentry's DSN / Datadog's client
+token: safe to be non-secret because it is write-only + rate-limited + namespace-scoped, and it can
+*never* make the backend assert it has a blob (only a verified write can). Security rests on
+server-side rate limits + quotas, not secrecy. Hosted deployments can provision per-tenant /
+short-lived tokens (device-authorization grant, RFC 8628) or mTLS / certificate-bound tokens
+(RFC 8705) for replay-resistant agent identity when the PKI cost is worth it.
+
+### Edge-side seams
+
+Two seams on the edge, both pointed at the **same endpoint + credential**:
+
+- **`Exporter`** (exists) → events. `JsonlExporter` is the local impl; a `RemoteExporter` is the
+  hosted impl.
+- **`BlobUploader`** (new; sketched in `src/blob.rs`) → drains the local `DirBlobStore` to the
+  backend with `find_missing` + `upload`, **decoupled from the proxy hot path via a background
+  queue**. `DirBlobStore` stays as the durable buffer and the OSS / air-gapped mode (a `NoopUploader`
+  keeps everything local). The real hosted uploader (HTTP/gRPC, presigned direct-to-object-storage)
+  lives in the private monorepo, behind this seam.
+
+**Net:** one ingest endpoint + one credential (control plane); `Exporter` and `BlobUploader` as the
+two edge seams; events → telemetry store and blobs → object storage on separate connections; upload
+decoupled from capture. Don't split events by signal; don't couple the blob backend to the event
+backend.
