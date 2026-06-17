@@ -16,6 +16,41 @@ use std::{
 };
 use thiserror::Error;
 
+/// Generate `other()` and `with_source()` constructors for a seam error enum's
+/// `Other` variant.
+///
+/// Every seam error (export, raw store, blob store) carries the same shape:
+/// `Other { $field: String, message: String, source: Option<Box<dyn StdError …>> }`.
+/// This macro eliminates the boilerplate so adding a new seam error only needs
+/// the enum definition and one invocation.
+macro_rules! impl_seam_error_constructors {
+    ($type:ident, $field:ident) => {
+        impl $type {
+            pub fn other($field: impl Into<String>, message: impl Into<String>) -> Self {
+                Self::Other {
+                    $field: $field.into(),
+                    message: message.into(),
+                    source: None,
+                }
+            }
+
+            pub fn with_source(
+                $field: impl Into<String>,
+                message: impl Into<String>,
+                source: impl std::error::Error + Send + Sync + 'static,
+            ) -> Self {
+                Self::Other {
+                    $field: $field.into(),
+                    message: message.into(),
+                    source: Some(Box::new(source)),
+                }
+            }
+        }
+    };
+}
+
+pub(crate) use impl_seam_error_constructors;
+
 /// Normalized attribute keys reserved for interceptor provenance.
 pub mod provenance_keys {
     pub const NORMALIZER_NAME: &str = "normalizer.name";
@@ -627,49 +662,8 @@ pub enum RawStoreError {
     },
 }
 
-impl RawStoreError {
-    pub fn other(store: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Other {
-            store: store.into(),
-            message: message.into(),
-            source: None,
-        }
-    }
-
-    pub fn with_source(
-        store: impl Into<String>,
-        message: impl Into<String>,
-        source: impl StdError + Send + Sync + 'static,
-    ) -> Self {
-        Self::Other {
-            store: store.into(),
-            message: message.into(),
-            source: Some(Box::new(source)),
-        }
-    }
-}
-
-impl ExportError {
-    pub fn other(exporter: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Other {
-            exporter: exporter.into(),
-            message: message.into(),
-            source: None,
-        }
-    }
-
-    pub fn with_source(
-        exporter: impl Into<String>,
-        message: impl Into<String>,
-        source: impl StdError + Send + Sync + 'static,
-    ) -> Self {
-        Self::Other {
-            exporter: exporter.into(),
-            message: message.into(),
-            source: Some(Box::new(source)),
-        }
-    }
-}
+impl_seam_error_constructors!(RawStoreError, store);
+impl_seam_error_constructors!(ExportError, exporter);
 
 /// Test helpers and mock implementations for seam conformance suites.
 #[cfg(any(test, feature = "test-support"))]

@@ -462,6 +462,34 @@ impl Drop for TeeState {
     }
 }
 
+/// Build a proxy `RawSignal` with size, truncation, attributes, and optional
+/// payload ref. Shared by request (eager-buffered) and response (streaming tee)
+/// capture paths.
+#[allow(clippy::too_many_arguments)]
+fn build_proxy_signal(
+    clock: &HlcClock,
+    kind: &'static str,
+    size_attr: &'static str,
+    attributes: Vec<(&'static str, String)>,
+    body: Bytes,
+    size: u64,
+    truncated: bool,
+    payload_ref: Option<PayloadRef>,
+) -> RawSignal {
+    let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), body)
+        .with_attribute(size_attr, size.to_string());
+    if truncated {
+        raw = raw.with_attribute(TRUNCATED_ATTR, "true");
+    }
+    for (key, value) in attributes {
+        raw = raw.with_attribute(key, value);
+    }
+    if let Some(payload_ref) = payload_ref {
+        raw = raw.with_payload_ref(payload_ref);
+    }
+    raw
+}
+
 /// Finalize a teed body's blob and build its offloaded (or fallback) signal.
 /// `size` is the byte count tracked across frames, so the size attribute is
 /// correct even when the blob finalize fails and no `payload_ref` is produced.
@@ -484,18 +512,16 @@ async fn finalize_tee(
             .map(|payload_ref| apply_media_type(payload_ref, media_type.as_deref())),
         None => None,
     };
-    let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), Bytes::new())
-        .with_attribute(size_attr, size.to_string());
-    if truncated {
-        raw = raw.with_attribute(TRUNCATED_ATTR, "true");
-    }
-    for (key, value) in attributes {
-        raw = raw.with_attribute(key, value);
-    }
-    if let Some(payload_ref) = payload_ref {
-        raw = raw.with_payload_ref(payload_ref);
-    }
-    raw
+    build_proxy_signal(
+        clock,
+        kind,
+        size_attr,
+        attributes,
+        Bytes::new(),
+        size,
+        truncated,
+        payload_ref,
+    )
 }
 
 /// Builds a request signal: offloaded (empty body + `payload_ref`) when the blob
@@ -509,24 +535,22 @@ fn build_raw(
     truncated: bool,
     payload_ref: Option<PayloadRef>,
 ) -> RawSignal {
-    let size = body.len();
+    let size = body.len() as u64;
     let body = if payload_ref.is_some() {
         Bytes::new()
     } else {
         body
     };
-    let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), body)
-        .with_attribute(size_attr, size.to_string());
-    if truncated {
-        raw = raw.with_attribute(TRUNCATED_ATTR, "true");
-    }
-    for (key, value) in attributes {
-        raw = raw.with_attribute(key, value);
-    }
-    if let Some(payload_ref) = payload_ref {
-        raw = raw.with_payload_ref(payload_ref);
-    }
-    raw
+    build_proxy_signal(
+        clock,
+        kind,
+        size_attr,
+        attributes,
+        body,
+        size,
+        truncated,
+        payload_ref,
+    )
 }
 
 fn apply_media_type(payload_ref: PayloadRef, media_type: Option<&str>) -> PayloadRef {

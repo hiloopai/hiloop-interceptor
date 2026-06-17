@@ -1,31 +1,22 @@
 //! Local exporters used by the interceptor runtime and tests.
 
+use crate::jsonl::JsonlWriter;
 use crate::seams::{ExportError, Exporter};
 use async_trait::async_trait;
 use hiloop_core::event::Event;
 use std::{io, path::Path};
-use tokio::{
-    fs::{File, OpenOptions},
-    io::AsyncWriteExt,
-    sync::Mutex,
-};
 
 /// Writes normalized events as newline-delimited JSON.
 #[derive(Debug)]
 pub struct JsonlExporter {
-    file: Mutex<File>,
+    writer: JsonlWriter,
 }
 
 impl JsonlExporter {
     /// Creates a JSONL output file, failing if the path already exists.
     pub async fn create(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(path)
-            .await?;
         Ok(Self {
-            file: Mutex::new(file),
+            writer: JsonlWriter::create(path).await?,
         })
     }
 }
@@ -33,23 +24,18 @@ impl JsonlExporter {
 #[async_trait]
 impl Exporter for JsonlExporter {
     async fn export(&self, events: &[Event]) -> Result<(), ExportError> {
-        let mut file = self.file.lock().await;
         for event in events {
             let line = serde_json::to_vec(event).map_err(jsonl_error)?;
-            file.write_all(&line)
+            self.writer
+                .write_line(&line)
                 .await
                 .map_err(|error| io_error("failed to write event", error))?;
-            file.write_all(b"\n")
-                .await
-                .map_err(|error| io_error("failed to write event separator", error))?;
         }
         Ok(())
     }
 
     async fn flush(&self) -> Result<(), ExportError> {
-        self.file
-            .lock()
-            .await
+        self.writer
             .flush()
             .await
             .map_err(|error| io_error("failed to flush events", error))

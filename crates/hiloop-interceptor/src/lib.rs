@@ -4,6 +4,7 @@ pub mod blob;
 pub mod exporters;
 pub mod framing;
 pub mod inspect;
+pub mod jsonl;
 pub mod otlp;
 pub mod pipeline;
 pub mod proxy;

@@ -1,5 +1,6 @@
 //! Raw observation storage implementations.
 
+use crate::jsonl::JsonlWriter;
 use crate::seams::{NormalizationContext, RawObservationRef, RawSignal, RawStore, RawStoreError};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -9,29 +10,19 @@ use std::{
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
-use tokio::{
-    fs::{File, OpenOptions},
-    io::AsyncWriteExt,
-    sync::Mutex,
-};
 
 /// Writes retained raw observations as newline-delimited JSON.
 #[derive(Debug)]
 pub struct JsonlRawStore {
-    file: Mutex<File>,
+    writer: JsonlWriter,
     next_id: AtomicU64,
 }
 
 impl JsonlRawStore {
     /// Creates a raw-observation JSONL file, failing if the path already exists.
     pub async fn create(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(path)
-            .await?;
         Ok(Self {
-            file: Mutex::new(file),
+            writer: JsonlWriter::create(path).await?,
             next_id: AtomicU64::new(1),
         })
     }
@@ -51,21 +42,16 @@ impl RawStore for JsonlRawStore {
             RawStoreError::with_source("raw-jsonl", "failed to encode raw observation", error)
         })?;
 
-        let mut file = self.file.lock().await;
-        file.write_all(&line)
+        self.writer
+            .write_line(&line)
             .await
             .map_err(|error| raw_io_error("failed to write raw observation", error))?;
-        file.write_all(b"\n")
-            .await
-            .map_err(|error| raw_io_error("failed to write raw observation separator", error))?;
 
         Ok(raw_ref)
     }
 
     async fn flush(&self) -> Result<(), RawStoreError> {
-        self.file
-            .lock()
-            .await
+        self.writer
             .flush()
             .await
             .map_err(|error| raw_io_error("failed to flush raw observations", error))

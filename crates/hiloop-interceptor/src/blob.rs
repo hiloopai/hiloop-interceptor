@@ -55,27 +55,7 @@ pub enum BlobStoreError {
     },
 }
 
-impl BlobStoreError {
-    pub fn other(store: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Other {
-            store: store.into(),
-            message: message.into(),
-            source: None,
-        }
-    }
-
-    pub fn with_source(
-        store: impl Into<String>,
-        message: impl Into<String>,
-        source: impl StdError + Send + Sync + 'static,
-    ) -> Self {
-        Self::Other {
-            store: store.into(),
-            message: message.into(),
-            source: Some(Box::new(source)),
-        }
-    }
-}
+crate::seams::impl_seam_error_constructors!(BlobStoreError, store);
 
 const STORE_NAME: &str = "blob-dir";
 
