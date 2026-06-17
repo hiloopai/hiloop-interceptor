@@ -192,15 +192,82 @@ impl BlobWriter for DirBlobWriter {
     }
 }
 
+/// Ships local blobs to a hosted backend, deduplicating by digest first.
+///
+/// The protocol is digest-first: ask the backend which digests it lacks via
+/// [`find_missing`](BlobUploader::find_missing), then [`upload`](BlobUploader::upload)
+/// only those. The backend re-hashes on receipt, so a corrupt or mislabeled
+/// blob is rejected rather than trusted. This sits off the capture hot path;
+/// the OSS repo ships only the seam and [`NoopUploader`], with the real hosted
+/// uploader (HTTP/gRPC, presigned-URL direct-to-object-storage) living elsewhere.
+#[async_trait]
+pub trait BlobUploader: Send + Sync {
+    /// Digest-first dedup: of these digests, return the subset the backend lacks.
+    async fn find_missing(
+        &self,
+        digests: &[PayloadDigest],
+    ) -> Result<Vec<PayloadDigest>, BlobStoreError>;
+
+    /// Upload one blob's bytes; the backend re-hashes and rejects a mismatch.
+    // Takes the full bytes for the sketch; a streaming reader is a future refinement.
+    async fn upload(&self, digest: &PayloadDigest, bytes: &[u8]) -> Result<(), BlobStoreError>;
+}
+
+/// Standalone/air-gapped default: reports nothing missing, so blobs stay local.
+#[derive(Debug, Default, Clone)]
+pub struct NoopUploader;
+
+#[async_trait]
+impl BlobUploader for NoopUploader {
+    async fn find_missing(
+        &self,
+        _digests: &[PayloadDigest],
+    ) -> Result<Vec<PayloadDigest>, BlobStoreError> {
+        Ok(Vec::new())
+    }
+
+    async fn upload(&self, _digest: &PayloadDigest, _bytes: &[u8]) -> Result<(), BlobStoreError> {
+        Ok(())
+    }
+}
+
+/// Upload the given blobs to `uploader`, skipping any the backend already has.
+///
+/// `blobs` pairs each digest with its already-read bytes (the caller supplies
+/// these, e.g. by reading `<dir>/blake3-<hex>`), keeping this helper pure and
+/// free of filesystem coupling. Returns how many blobs were uploaded.
+//
+// The real hosted path adds the "read from DirBlobStore + background queue +
+// retry" wiring around this digest-first core.
+pub async fn drain_to_uploader(
+    uploader: &dyn BlobUploader,
+    blobs: &[(PayloadDigest, Vec<u8>)],
+) -> Result<usize, BlobStoreError> {
+    let digests: Vec<PayloadDigest> = blobs.iter().map(|(digest, _)| digest.clone()).collect();
+    let missing: std::collections::HashSet<PayloadDigest> =
+        uploader.find_missing(&digests).await?.into_iter().collect();
+
+    let mut uploaded = 0;
+    for (digest, bytes) in blobs {
+        if missing.contains(digest) {
+            uploader.upload(digest, bytes).await?;
+            uploaded += 1;
+        }
+    }
+    Ok(uploaded)
+}
+
 /// Test helpers and an in-memory store for conformance suites.
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
-    use super::{BlobFuture, BlobStore, BlobStoreError, BlobWriter};
+    use super::{BlobFuture, BlobStore, BlobStoreError, BlobUploader, BlobWriter};
     use async_trait::async_trait;
     use hiloop_core::event::{PayloadDigest, PayloadRef};
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     type Recorded = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+    type RecordedUploads = Arc<Mutex<Vec<(PayloadDigest, Vec<u8>)>>>;
 
     /// In-memory [`BlobStore`] that records finalized blobs by digest.
     #[derive(Debug, Default, Clone)]
@@ -251,6 +318,68 @@ pub mod testing {
                 })?;
                 Ok(PayloadRef::new(digest).with_size_bytes(size))
             })
+        }
+    }
+
+    /// Test [`BlobUploader`] recording every `find_missing` and `upload` call.
+    ///
+    /// Constructed with the digests the backend already "has"; `find_missing`
+    /// returns the complement of that set, so a test can assert the dedup path.
+    #[derive(Debug, Default, Clone)]
+    pub struct RecordingUploader {
+        have: Arc<HashSet<PayloadDigest>>,
+        queried: Arc<Mutex<Vec<PayloadDigest>>>,
+        uploaded: RecordedUploads,
+    }
+
+    impl RecordingUploader {
+        /// Backend already holds `have`; everything else is reported missing.
+        pub fn with_existing(have: impl IntoIterator<Item = PayloadDigest>) -> Self {
+            Self {
+                have: Arc::new(have.into_iter().collect()),
+                queried: Arc::default(),
+                uploaded: Arc::default(),
+            }
+        }
+
+        pub fn queried(&self) -> Vec<PayloadDigest> {
+            self.queried
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        pub fn uploaded(&self) -> Vec<(PayloadDigest, Vec<u8>)> {
+            self.uploaded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl BlobUploader for RecordingUploader {
+        async fn find_missing(
+            &self,
+            digests: &[PayloadDigest],
+        ) -> Result<Vec<PayloadDigest>, BlobStoreError> {
+            self.queried
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(digests);
+            Ok(digests
+                .iter()
+                .filter(|digest| !self.have.contains(*digest))
+                .cloned()
+                .collect())
+        }
+
+        async fn upload(&self, digest: &PayloadDigest, bytes: &[u8]) -> Result<(), BlobStoreError> {
+            self.uploaded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((digest.clone(), bytes.to_vec()));
+            Ok(())
         }
     }
 }
@@ -326,5 +455,37 @@ mod tests {
         let second_ref = second.finish().await.expect("finish");
 
         assert_ne!(first_ref.digest, second_ref.digest);
+    }
+
+    fn digest(label: &str) -> PayloadDigest {
+        // Any well-formed blake3 digest works here; the bytes are opaque to the seam.
+        let hex = blake3::hash(label.as_bytes()).to_hex().to_string();
+        PayloadDigest::new(format!("blake3:{hex}")).expect("valid digest")
+    }
+
+    #[tokio::test]
+    async fn drain_uploads_only_missing_digests() {
+        let have = digest("have");
+        let missing = digest("missing");
+        let uploader = testing::RecordingUploader::with_existing([have.clone()]);
+
+        let blobs = vec![
+            (have.clone(), b"existing".to_vec()),
+            (missing.clone(), b"new".to_vec()),
+        ];
+        let count = drain_to_uploader(&uploader, &blobs).await.expect("drain");
+
+        assert_eq!(count, 1);
+        assert_eq!(uploader.queried(), vec![have, missing.clone()]);
+        assert_eq!(uploader.uploaded(), vec![(missing, b"new".to_vec())]);
+    }
+
+    #[tokio::test]
+    async fn noop_uploader_uploads_nothing() {
+        let blobs = vec![(digest("a"), b"a".to_vec()), (digest("b"), b"b".to_vec())];
+        let count = drain_to_uploader(&NoopUploader, &blobs)
+            .await
+            .expect("drain");
+        assert_eq!(count, 0);
     }
 }
