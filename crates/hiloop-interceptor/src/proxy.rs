@@ -151,12 +151,13 @@ impl ProxyServer {
         ca: ProxyCa,
         signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
         blob_store: Arc<dyn BlobStore>,
+        max_capture_bytes: Option<u64>,
         shutdown: F,
     ) -> Result<(), ProxyError>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let handler = CaptureHandler::new(signal_tx, self.clock, blob_store);
+        let handler = CaptureHandler::new(signal_tx, self.clock, blob_store, max_capture_bytes);
         let proxy = Proxy::builder()
             .with_listener(self.listener)
             .with_ca(ca.authority)
@@ -198,6 +199,9 @@ struct CaptureHandler {
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
     clock: Arc<HlcClock>,
     blob_store: Arc<dyn BlobStore>,
+    /// Cap on captured body bytes (blob + reported size); `None` is unlimited.
+    /// Never bounds what is forwarded to the client/upstream.
+    max_capture_bytes: Option<u64>,
     /// Exchange id for the request currently being handled by this clone,
     /// minted in `on_request` and read back in `on_response`.
     exchange_id: Option<String>,
@@ -208,11 +212,13 @@ impl CaptureHandler {
         signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
         clock: Arc<HlcClock>,
         blob_store: Arc<dyn BlobStore>,
+        max_capture_bytes: Option<u64>,
     ) -> Self {
         Self {
             signal_tx,
             clock,
             blob_store,
+            max_capture_bytes,
             exchange_id: None,
         }
     }
@@ -232,7 +238,16 @@ impl CaptureHandler {
         self.exchange_id = Some(exchange_id.clone());
 
         let (parts, body) = request.into_parts();
-        let (bytes, truncated) = collect_body(body).await;
+        let (bytes, mut truncated) = collect_body(body).await;
+
+        // Capture at most `cap` bytes, but always forward the full body upstream.
+        let captured = match self.max_capture_bytes {
+            Some(cap) if bytes.len() as u64 > cap => {
+                truncated = true;
+                bytes.slice(..usize::try_from(cap).unwrap_or(usize::MAX))
+            }
+            _ => bytes.clone(),
+        };
 
         let content_type = header_str(&parts.headers, &CONTENT_TYPE);
         let mut attributes = vec![
@@ -250,15 +265,16 @@ impl CaptureHandler {
         // Offload the buffered body to the blob store; on any failure fall back to
         // an inline body so the capture is never lost. The forwarded request keeps
         // the buffered bytes either way.
-        let payload_ref = offload_bytes(self.blob_store.as_ref(), &bytes, content_type.as_deref())
-            .await
-            .ok();
+        let payload_ref =
+            offload_bytes(self.blob_store.as_ref(), &captured, content_type.as_deref())
+                .await
+                .ok();
         let raw = build_raw(
             &self.clock,
             REQUEST_KIND,
             "http.request.body_size",
             attributes,
-            bytes.clone(),
+            captured,
             truncated,
             payload_ref,
         );
@@ -304,6 +320,8 @@ impl CaptureHandler {
             upstream: Some(BodyStream::new(body)),
             writer: Some(self.blob_store.writer()),
             size: 0,
+            max_capture_bytes: self.max_capture_bytes,
+            capped: false,
             media_type,
             attributes,
             signal_tx: self.signal_tx.clone(),
@@ -348,6 +366,10 @@ struct TeeState {
     upstream: Option<BodyStream<Body>>,
     writer: Option<Box<dyn BlobWriter>>,
     size: u64,
+    /// Cap on captured bytes; `None` is unlimited. Forwarding is unaffected.
+    max_capture_bytes: Option<u64>,
+    /// Set once the cap is hit and further frames stop being captured.
+    capped: bool,
     media_type: Option<String>,
     attributes: Vec<(&'static str, String)>,
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
@@ -359,6 +381,27 @@ struct TeeState {
 
 impl TeeState {
     async fn write(&mut self, data: &[u8]) {
+        if self.capped {
+            return;
+        }
+        // Capture only up to the cap; the writer is kept (not dropped) so the
+        // capped prefix still finalizes into a blob. Forwarding is untouched.
+        let data = match self.max_capture_bytes {
+            Some(cap) => {
+                let remaining = cap.saturating_sub(self.size);
+                let take = usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(data.len());
+                if take < data.len() {
+                    self.capped = true;
+                }
+                &data[..take]
+            }
+            None => data,
+        };
+        if data.is_empty() {
+            return;
+        }
         if let Some(writer) = self.writer.as_mut() {
             // On write failure the writer is dropped; the streamed frames aren't
             // buffered, so the response signal degrades to metadata only (no
@@ -385,7 +428,7 @@ impl TeeState {
             self.writer.take(),
             self.size,
             self.media_type.take(),
-            truncated,
+            truncated || self.capped,
         )
         .await;
         let _ = self.signal_tx.send(Ok(raw)).await;
@@ -628,9 +671,24 @@ mod tests {
         mpsc::Receiver<Result<RawSignal, SourceError>>,
         Arc<MemoryBlobStore>,
     ) {
+        handler_with_cap(None)
+    }
+
+    fn handler_with_cap(
+        max_capture_bytes: Option<u64>,
+    ) -> (
+        CaptureHandler,
+        mpsc::Receiver<Result<RawSignal, SourceError>>,
+        Arc<MemoryBlobStore>,
+    ) {
         let (tx, rx) = mpsc::channel(4);
         let store = Arc::new(MemoryBlobStore::default());
-        let handler = CaptureHandler::new(tx, Arc::new(HlcClock::new()), store.clone());
+        let handler = CaptureHandler::new(
+            tx,
+            Arc::new(HlcClock::new()),
+            store.clone(),
+            max_capture_bytes,
+        );
         (handler, rx, store)
     }
 
@@ -924,6 +982,105 @@ mod tests {
                 .get("http.response.body_size")
                 .map(String::as_str),
             Some(full.len().to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn response_over_cap_is_truncated_but_fully_forwarded() {
+        // Cap 10 bytes splits mid second frame (7 + 7 = 14 > 10).
+        let (handler, mut rx, store) = handler_with_cap(Some(10));
+        let teed = handler.tee_body(
+            RESPONSE_KIND,
+            "http.response.body_size",
+            vec![("http.status_code", "200".to_owned())],
+            None,
+            streaming_body(&[b"chunk-1", b"chunk-2", b"chunk-3"]),
+        );
+
+        // The client still receives every frame in full.
+        let chunks = drain_body(teed).await;
+        assert_eq!(chunks.concat(), b"chunk-1chunk-2chunk-3");
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get(TRUNCATED_ATTR).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get("http.response.body_size")
+                .map(String::as_str),
+            Some("10")
+        );
+        assert_eq!(
+            signal.payload_ref().and_then(|p| p.size_bytes),
+            Some(10),
+            "blob holds exactly the cap"
+        );
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(b"chunk-1chu").as_str())
+        );
+        assert_eq!(store.blobs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_under_cap_is_not_truncated() {
+        let (handler, mut rx, _store) = handler_with_cap(Some(1024));
+        let teed = handler.tee_body(
+            RESPONSE_KIND,
+            "http.response.body_size",
+            vec![("http.status_code", "200".to_owned())],
+            None,
+            streaming_body(&[b"chunk-1", b"chunk-2"]),
+        );
+        drain_body(teed).await;
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert!(!signal.attributes.contains_key(TRUNCATED_ATTR));
+        assert_eq!(
+            signal
+                .attributes
+                .get("http.response.body_size")
+                .map(String::as_str),
+            Some("14")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_over_cap_is_truncated_but_forwards_full_body() {
+        let (mut handler, mut rx, _store) = handler_with_cap(Some(3));
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/v1/thing")
+            .body(Body::from(Bytes::from_static(b"hello")))
+            .expect("request");
+
+        let forwarded = handler.on_request(request).await;
+        let chunks = drain_body(forwarded.into_body()).await;
+        assert_eq!(chunks.concat(), b"hello", "upstream gets the full body");
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get(TRUNCATED_ATTR).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            signal.payload_ref().and_then(|p| p.size_bytes),
+            Some(3),
+            "offloaded prefix equals the cap"
+        );
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(b"hel").as_str())
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get("http.request.body_size")
+                .map(String::as_str),
+            Some("3")
         );
     }
 
