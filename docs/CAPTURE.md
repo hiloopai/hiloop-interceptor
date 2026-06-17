@@ -203,12 +203,15 @@ is recorded with no paired response — absent rather than mis-correlated.
 fallback, unlike requests).
 
 **Blobs are local-only — getting them to the backend is the next step.** `DirBlobStore` writes blobs
-to a local directory and the `Event` carries only the `payload_ref` digest; nothing yet uploads the
-bytes to the telemetry backend, so a digest is currently unresolvable downstream. The cross-repo
-design for that (a separate digest-first uploader behind the `BlobStore` seam, plus the sha256-vs-
-blake3 / one-CAS decision) is in [`PAYLOAD-HANDOFF.md`](PAYLOAD-HANDOFF.md) and the interceptor-side
-reply [`PAYLOAD-HANDOFF-RESPONSE.md`](PAYLOAD-HANDOFF-RESPONSE.md). A configurable max blob size at
-the edge is also still open.
+to a local directory (now blake3-keyed) and the `Event` carries only the `payload_ref` digest;
+nothing yet uploads the bytes to the telemetry backend, so a digest is currently unresolvable
+downstream. The `BlobUploader` seam (`src/blob.rs`) sketches the edge side of the upload — a
+digest-first `find_missing` + `upload` with a `NoopUploader` default — but the hosted uploader and
+the wire protocol are deferred to the private repo. The cross-repo design and the recommended
+ingestion-interface shape are in [`PAYLOAD-HANDOFF.md`](PAYLOAD-HANDOFF.md) and the interceptor-side
+reply [`PAYLOAD-HANDOFF-RESPONSE.md`](PAYLOAD-HANDOFF-RESPONSE.md). Capture size is bounded by
+`--max-capture-bytes` (default unlimited): bodies over the cap are captured up to it, marked
+`http.capture.truncated`, and still forwarded in full to the client.
 
 **Status — OTLP shipped (`--otlp`).** `hiloop_interceptor::otlp` runs an embedded OTLP/HTTP receiver
 bound to an ephemeral localhost port; the supervisor injects the endpoint, registers
