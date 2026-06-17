@@ -13,6 +13,7 @@ repository = "https://github.com/tboser/hiloop-interceptor"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
+blake3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
@@ -29,7 +30,6 @@ proptest = "1"
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.11.0"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

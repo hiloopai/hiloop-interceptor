@@ -622,7 +622,6 @@ mod tests {
     use hiloop_core::event::{AttributeValue, PayloadDigest};
     use hiloop_core::identity::{ForkContext, Hlc};
     use hudsucker::hyper::body::Frame;
-    use sha2::{Digest, Sha256};
 
     fn handler() -> (
         CaptureHandler,
@@ -636,14 +635,7 @@ mod tests {
     }
 
     fn expected_digest(body: &[u8]) -> String {
-        use std::fmt::Write as _;
-        let hex = Sha256::digest(body)
-            .iter()
-            .fold(String::new(), |mut acc, byte| {
-                let _ = write!(acc, "{byte:02x}");
-                acc
-            });
-        format!("sha256:{hex}")
+        format!("blake3:{}", blake3::hash(body).to_hex())
     }
 
     fn proxy_signal(kind: &str, attributes: &[(&str, &str)]) -> RawSignal {

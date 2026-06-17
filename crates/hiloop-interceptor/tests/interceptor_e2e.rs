@@ -441,12 +441,12 @@ async fn proxy_mitm_captures_decrypted_https_request() {
         .as_str()
         .expect("request payload_ref digest");
     assert!(
-        digest.starts_with("sha256:"),
-        "payload digest should be sha256: {digest}"
+        digest.starts_with("blake3:"),
+        "payload digest should be blake3: {digest}"
     );
-    let hex = digest.strip_prefix("sha256:").expect("sha256 prefix");
+    let hex = digest.strip_prefix("blake3:").expect("blake3 prefix");
     assert!(
-        blob_dir.join(format!("sha256-{hex}")).exists(),
+        blob_dir.join(format!("blake3-{hex}")).exists(),
         "the request body blob should exist in the blob dir"
     );
 }
@@ -533,8 +533,8 @@ async fn proxy_correlates_request_and_response_over_chunked_upstream() {
     let digest = response["payload_ref"]["digest"]
         .as_str()
         .expect("response payload_ref digest");
-    let hex = digest.strip_prefix("sha256:").expect("sha256 prefix");
-    let blob = std::fs::read(blob_dir.join(format!("sha256-{hex}"))).expect("read response blob");
+    let hex = digest.strip_prefix("blake3:").expect("blake3 prefix");
+    let blob = std::fs::read(blob_dir.join(format!("blake3-{hex}"))).expect("read response blob");
     assert_eq!(blob, b"chunk-1chunk-2");
 }
 

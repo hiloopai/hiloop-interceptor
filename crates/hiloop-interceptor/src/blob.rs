@@ -2,7 +2,8 @@
 //!
 //! The proxy streams each body frame into a [`BlobWriter`] as it arrives, so only
 //! one frame is in memory at a time. `finish` returns a [`PayloadRef`] keyed by the
-//! sha256 of the content; identical bodies dedup to the same file.
+//! blake3 of the content; identical bodies dedup to the same file. blake3 matches
+//! the snapshot store's CAS (DESIGN §7) and is fast on the proxy hot path.
 
 use std::{
     error::Error as StdError,
@@ -13,8 +14,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+use blake3::Hasher;
 use hiloop_core::event::{PayloadDigest, PayloadRef};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     fs::{self, File},
@@ -39,18 +40,8 @@ pub trait BlobStore: Send + Sync {
 pub trait BlobWriter: Send + Sync {
     fn write<'a>(&'a mut self, chunk: &'a [u8]) -> BlobFuture<'a, Result<(), BlobStoreError>>;
 
-    /// Finalize and return the content-addressed reference (sha256 + size).
+    /// Finalize and return the content-addressed reference (blake3 + size).
     fn finish(self: Box<Self>) -> BlobFuture<'static, Result<PayloadRef, BlobStoreError>>;
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, byte| {
-            let _ = write!(acc, "{byte:02x}");
-            acc
-        })
 }
 
 #[derive(Debug, Error)]
@@ -88,7 +79,7 @@ impl BlobStoreError {
 
 const STORE_NAME: &str = "blob-dir";
 
-/// File-backed content-addressed store: blobs land at `<dir>/sha256-<hex>`.
+/// File-backed content-addressed store: blobs land at `<dir>/blake3-<hex>`.
 #[derive(Debug, Clone)]
 pub struct DirBlobStore {
     dir: PathBuf,
@@ -121,7 +112,7 @@ impl BlobStore for DirBlobStore {
 struct DirBlobWriterOpen {
     temp_path: PathBuf,
     file: File,
-    hasher: Sha256,
+    hasher: Hasher,
     size: u64,
 }
 
@@ -143,7 +134,7 @@ impl DirBlobWriter {
             self.state = Some(DirBlobWriterOpen {
                 temp_path,
                 file,
-                hasher: Sha256::new(),
+                hasher: Hasher::new(),
                 size: 0,
             });
         }
@@ -178,8 +169,8 @@ impl BlobWriter for DirBlobWriter {
             })?;
             drop(open.file);
 
-            let hex = to_hex(&open.hasher.finalize());
-            let target = self.dir.join(format!("sha256-{hex}"));
+            let hex = open.hasher.finalize().to_hex().to_string();
+            let target = self.dir.join(format!("blake3-{hex}"));
 
             // Content-addressed dedup: identical content already at the target
             // makes the rename redundant, so drop the temp instead.
@@ -193,7 +184,7 @@ impl BlobWriter for DirBlobWriter {
                     })?;
             }
 
-            let digest = PayloadDigest::new(format!("sha256:{hex}")).map_err(|error| {
+            let digest = PayloadDigest::new(format!("blake3:{hex}")).map_err(|error| {
                 BlobStoreError::with_source(STORE_NAME, "invalid digest", error)
             })?;
             Ok(PayloadRef::new(digest).with_size_bytes(open.size))
@@ -207,7 +198,6 @@ pub mod testing {
     use super::{BlobFuture, BlobStore, BlobStoreError, BlobWriter};
     use async_trait::async_trait;
     use hiloop_core::event::{PayloadDigest, PayloadRef};
-    use sha2::{Digest, Sha256};
     use std::sync::{Arc, Mutex};
 
     type Recorded = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
@@ -250,13 +240,13 @@ pub mod testing {
 
         fn finish(self: Box<Self>) -> BlobFuture<'static, Result<PayloadRef, BlobStoreError>> {
             Box::pin(async move {
-                let hex = super::to_hex(&Sha256::digest(&self.buffer));
+                let hex = blake3::hash(&self.buffer).to_hex().to_string();
                 let size = self.buffer.len() as u64;
                 self.sink
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push((format!("sha256:{hex}"), self.buffer));
-                let digest = PayloadDigest::new(format!("sha256:{hex}")).map_err(|error| {
+                    .push((format!("blake3:{hex}"), self.buffer));
+                let digest = PayloadDigest::new(format!("blake3:{hex}")).map_err(|error| {
                     BlobStoreError::with_source("memory-blob", "invalid digest", error)
                 })?;
                 Ok(PayloadRef::new(digest).with_size_bytes(size))
@@ -270,7 +260,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn write_in_chunks_yields_stable_sha256() {
+    async fn write_in_chunks_yields_stable_blake3() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = DirBlobStore::create(temp.path())
             .await
@@ -281,15 +271,15 @@ mod tests {
         writer.write(b"world").await.expect("write");
         let payload_ref = writer.finish().await.expect("finish");
 
-        // Reference sha256 of "hello world".
+        // Reference blake3 of "hello world".
         assert_eq!(
             payload_ref.digest.as_str(),
-            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+            "blake3:d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24"
         );
         assert_eq!(payload_ref.size_bytes, Some(11));
         let blob = temp
             .path()
-            .join("sha256-b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+            .join("blake3-d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24");
         assert_eq!(
             tokio::fs::read(&blob).await.expect("read blob"),
             b"hello world"
