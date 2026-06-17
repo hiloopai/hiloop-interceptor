@@ -481,6 +481,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_blob_writer_yields_valid_ref() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+
+        let writer = store.writer();
+        let payload_ref = writer.finish().await.expect("finish empty blob");
+
+        assert_eq!(payload_ref.size_bytes, Some(0));
+        let expected_hash = blake3::hash(b"").to_hex().to_string();
+        assert_eq!(
+            payload_ref.digest.as_str(),
+            format!("blake3:{expected_hash}")
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_blob_store_records_finalized_blobs() {
+        let store = testing::MemoryBlobStore::default();
+
+        let mut writer = store.writer();
+        writer.write(b"chunk-a").await.expect("write");
+        writer.write(b"-chunk-b").await.expect("write");
+        let payload_ref = writer.finish().await.expect("finish");
+
+        let blobs = store.blobs();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].1, b"chunk-a-chunk-b");
+        assert_eq!(payload_ref.size_bytes, Some(15));
+        assert_eq!(payload_ref.digest.as_str(), &blobs[0].0);
+    }
+
+    #[test]
+    fn blob_store_error_other_without_source() {
+        let error = BlobStoreError::other("test-store", "something broke");
+        let display = error.to_string();
+        assert!(display.contains("test-store"));
+        assert!(display.contains("something broke"));
+    }
+
+    #[test]
+    fn blob_store_error_with_source_preserves_chain() {
+        let source = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let error = BlobStoreError::with_source("test-store", "io failed", source);
+        let display = error.to_string();
+        assert!(display.contains("io failed"));
+        assert!(error.source().is_some());
+    }
+
+    #[tokio::test]
+    async fn recording_uploader_with_no_existing_reports_all_missing() {
+        let uploader = testing::RecordingUploader::default();
+        let d = digest("new");
+        let blobs = vec![(d.clone(), b"data".to_vec())];
+        let count = drain_to_uploader(&uploader, &blobs).await.expect("drain");
+
+        assert_eq!(count, 1);
+        assert_eq!(uploader.uploaded().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_to_uploader_with_empty_list_uploads_nothing() {
+        let uploader = testing::RecordingUploader::default();
+        let count = drain_to_uploader(&uploader, &[]).await.expect("drain");
+        assert_eq!(count, 0);
+        assert!(uploader.queried().is_empty());
+        assert!(uploader.uploaded().is_empty());
+    }
+
+    #[tokio::test]
     async fn noop_uploader_uploads_nothing() {
         let blobs = vec![(digest("a"), b"a".to_vec()), (digest("b"), b"b".to_vec())];
         let count = drain_to_uploader(&NoopUploader, &blobs)

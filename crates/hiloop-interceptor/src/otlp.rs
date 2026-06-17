@@ -409,6 +409,255 @@ mod tests {
         assert_eq!(normalizer.supports(&raw), NormalizerSupport::Unsupported);
     }
 
+    // --- convert_any_value coverage ---
+
+    #[test]
+    fn convert_any_value_maps_bool() {
+        let value = AnyValue {
+            value: Some(any_value::Value::BoolValue(true)),
+        };
+        assert_eq!(convert_any_value(&value), Some(AttributeValue::Bool(true)));
+    }
+
+    #[test]
+    fn convert_any_value_maps_double() {
+        let value = AnyValue {
+            value: Some(any_value::Value::DoubleValue(2.5)),
+        };
+        let converted = convert_any_value(&value);
+        assert!(converted.is_some());
+        match converted.expect("should be Some") {
+            AttributeValue::F64(f) => assert!((f.as_f64() - 2.5).abs() < f64::EPSILON),
+            other => panic!("expected F64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_any_value_rejects_nan() {
+        let value = AnyValue {
+            value: Some(any_value::Value::DoubleValue(f64::NAN)),
+        };
+        assert!(convert_any_value(&value).is_none());
+    }
+
+    #[test]
+    fn convert_any_value_rejects_infinity() {
+        let value = AnyValue {
+            value: Some(any_value::Value::DoubleValue(f64::INFINITY)),
+        };
+        assert!(convert_any_value(&value).is_none());
+    }
+
+    #[test]
+    fn convert_any_value_returns_none_for_empty() {
+        let value = AnyValue { value: None };
+        assert!(convert_any_value(&value).is_none());
+    }
+
+    #[test]
+    fn convert_any_value_drops_bytes() {
+        let value = AnyValue {
+            value: Some(any_value::Value::BytesValue(vec![0xff])),
+        };
+        assert!(convert_any_value(&value).is_none());
+    }
+
+    // --- span_name coverage ---
+
+    #[test]
+    fn span_name_falls_back_for_empty_name() {
+        let s = Span {
+            name: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(span_name(&s), "otel.span");
+    }
+
+    #[test]
+    fn span_name_falls_back_for_whitespace_only() {
+        let s = Span {
+            name: "   ".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(span_name(&s), "otel.span");
+    }
+
+    #[test]
+    fn span_name_uses_provided_name() {
+        let s = Span {
+            name: "my.operation".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(span_name(&s), "my.operation");
+    }
+
+    // --- hex helper ---
+
+    #[test]
+    fn hex_encodes_bytes_as_lowercase() {
+        assert_eq!(hex(&[0xab, 0xcd, 0x01, 0xff]), "abcd01ff");
+    }
+
+    #[test]
+    fn hex_of_empty_is_empty() {
+        assert_eq!(hex(&[]), "");
+    }
+
+    // --- span_is_llm coverage ---
+
+    #[test]
+    fn span_is_llm_detects_gen_ai_prefix() {
+        let s = span("op", 1, vec![("gen_ai.system", string_value("openai"))]);
+        assert!(span_is_llm(&s));
+    }
+
+    #[test]
+    fn span_is_llm_detects_llm_prefix() {
+        let s = span("op", 1, vec![("llm.model", string_value("gpt-4"))]);
+        assert!(span_is_llm(&s));
+    }
+
+    #[test]
+    fn span_is_llm_rejects_non_llm_attributes() {
+        let s = span("op", 1, vec![("db.system", string_value("pg"))]);
+        assert!(!span_is_llm(&s));
+    }
+
+    // --- normalizer edge cases ---
+
+    #[tokio::test]
+    async fn normalize_empty_export_produces_no_events() {
+        let body = ExportTraceServiceRequest::default().encode_to_vec();
+        let raw = RawSignal::new(
+            OTLP_SOURCE,
+            OTLP_TRACES_KIND,
+            Hlc {
+                wall_ns: 0,
+                logical: 0,
+            },
+            body,
+        );
+        let context = NormalizationContext::new(ForkContext::new_local_root());
+
+        let outcome = OtlpTraceNormalizer
+            .normalize(&context, raw)
+            .await
+            .expect("normalize empty export");
+
+        assert!(outcome.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn normalize_invalid_protobuf_returns_decode_error() {
+        let raw = RawSignal::new(
+            OTLP_SOURCE,
+            OTLP_TRACES_KIND,
+            Hlc {
+                wall_ns: 0,
+                logical: 0,
+            },
+            Bytes::from_static(b"\xff\xfe\xfd"),
+        );
+        let context = NormalizationContext::new(ForkContext::new_local_root());
+
+        let error = OtlpTraceNormalizer
+            .normalize(&context, raw)
+            .await
+            .expect_err("invalid protobuf");
+
+        assert!(matches!(error, NormalizeError::Decode { .. }));
+    }
+
+    #[tokio::test]
+    async fn normalize_span_with_empty_ids_omits_id_attributes() {
+        let s = Span {
+            name: "no-ids".to_owned(),
+            start_time_unix_nano: 42,
+            trace_id: vec![],
+            span_id: vec![],
+            parent_span_id: vec![],
+            ..Default::default()
+        };
+        let body = request(vec![s]).encode_to_vec();
+        let raw = RawSignal::new(
+            OTLP_SOURCE,
+            OTLP_TRACES_KIND,
+            Hlc {
+                wall_ns: 0,
+                logical: 0,
+            },
+            body,
+        );
+        let context = NormalizationContext::new(ForkContext::new_local_root());
+
+        let outcome = OtlpTraceNormalizer
+            .normalize(&context, raw)
+            .await
+            .expect("normalize");
+        let events = outcome.into_events();
+
+        assert_eq!(events.len(), 1);
+        assert!(
+            !events[0]
+                .attributes
+                .contains_key(&AttributeKey::new("otel.trace_id").expect("key")),
+            "empty trace_id must not produce an attribute"
+        );
+        assert!(
+            !events[0]
+                .attributes
+                .contains_key(&AttributeKey::new("otel.span_id").expect("key"))
+        );
+        assert!(
+            !events[0]
+                .attributes
+                .contains_key(&AttributeKey::new("otel.parent_span_id").expect("key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn normalize_span_with_parent_includes_parent_id() {
+        let s = Span {
+            name: "child-span".to_owned(),
+            start_time_unix_nano: 10,
+            trace_id: vec![0x01; 16],
+            span_id: vec![0x02; 8],
+            parent_span_id: vec![0x03; 8],
+            ..Default::default()
+        };
+        let body = request(vec![s]).encode_to_vec();
+        let raw = RawSignal::new(
+            OTLP_SOURCE,
+            OTLP_TRACES_KIND,
+            Hlc {
+                wall_ns: 0,
+                logical: 0,
+            },
+            body,
+        );
+        let context = NormalizationContext::new(ForkContext::new_local_root());
+
+        let outcome = OtlpTraceNormalizer
+            .normalize(&context, raw)
+            .await
+            .expect("normalize");
+        let events = outcome.into_events();
+
+        assert_eq!(
+            events[0]
+                .attributes
+                .get(&AttributeKey::new("otel.parent_span_id").expect("key")),
+            Some(&AttributeValue::String("0303030303030303".to_owned()))
+        );
+    }
+
+    #[test]
+    fn otlp_normalizer_descriptor_is_stable() {
+        let n = OtlpTraceNormalizer;
+        assert_eq!(n.descriptor().name(), "otlp-trace");
+        assert_eq!(n.descriptor().output_schema_version(), "hiloop.event.v1");
+    }
+
     #[tokio::test]
     async fn receiver_forwards_posted_traces_as_raw_signals() {
         let clock = Arc::new(HlcClock::new());

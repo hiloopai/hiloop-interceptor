@@ -162,6 +162,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_stores_produce_incrementing_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("raw.jsonl");
+        let store = JsonlRawStore::create(&path)
+            .await
+            .expect("create raw store");
+        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let raw = RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::from_static(b"first"),
+        );
+        let raw2 = RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+            Bytes::from_static(b"second"),
+        );
+
+        let ref1 = store.store(&context, &raw).await.expect("store first");
+        let ref2 = store.store(&context, &raw2).await.expect("store second");
+
+        assert_eq!(ref1.id(), "raw-jsonl-1");
+        assert_eq!(ref2.id(), "raw-jsonl-2");
+    }
+
+    #[tokio::test]
+    async fn raw_record_includes_process_context_when_present() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("raw.jsonl");
+        let store = JsonlRawStore::create(&path)
+            .await
+            .expect("create raw store");
+        let context = NormalizationContext::new(ForkContext::new_local_root()).with_process(
+            crate::seams::ProcessContext {
+                pid: Some(42),
+                command: Some(std::path::PathBuf::from("/usr/bin/echo")),
+                argv: vec!["echo".to_owned(), "hello".to_owned()],
+                cwd: Some(std::path::PathBuf::from("/tmp")),
+            },
+        );
+        let raw = RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::from_static(b"hello"),
+        );
+
+        store.store(&context, &raw).await.expect("store");
+        store.flush().await.expect("flush");
+
+        let contents = tokio::fs::read_to_string(path)
+            .await
+            .expect("read raw jsonl");
+        let record = serde_json::from_str::<Value>(contents.lines().next().expect("line"))
+            .expect("raw record");
+        assert_eq!(record["process"]["pid"], 42);
+        assert_eq!(record["process"]["command"], "/usr/bin/echo");
+        assert_eq!(
+            record["process"]["argv"],
+            serde_json::json!(["echo", "hello"])
+        );
+        assert_eq!(record["process"]["cwd"], "/tmp");
+    }
+
+    #[tokio::test]
+    async fn raw_record_process_is_null_when_absent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("raw.jsonl");
+        let store = JsonlRawStore::create(&path)
+            .await
+            .expect("create raw store");
+        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let raw = RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::from_static(b"data"),
+        );
+
+        store.store(&context, &raw).await.expect("store");
+        store.flush().await.expect("flush");
+
+        let contents = tokio::fs::read_to_string(path)
+            .await
+            .expect("read raw jsonl");
+        let record = serde_json::from_str::<Value>(contents.lines().next().expect("line"))
+            .expect("raw record");
+        assert!(record["process"].is_null());
+    }
+
+    #[tokio::test]
+    async fn raw_record_includes_wrapper_provenance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("raw.jsonl");
+        let store = JsonlRawStore::create(&path)
+            .await
+            .expect("create raw store");
+        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let raw = RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::from_static(b"x"),
+        );
+
+        store.store(&context, &raw).await.expect("store");
+        store.flush().await.expect("flush");
+
+        let contents = tokio::fs::read_to_string(path)
+            .await
+            .expect("read raw jsonl");
+        let record = serde_json::from_str::<Value>(contents.lines().next().expect("line"))
+            .expect("raw record");
+        assert!(record["wrapper"]["name"].is_string());
+        assert!(record["wrapper"]["version"].is_string());
+    }
+
+    #[tokio::test]
     async fn jsonl_raw_store_refuses_to_overwrite_existing_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("raw.jsonl");
