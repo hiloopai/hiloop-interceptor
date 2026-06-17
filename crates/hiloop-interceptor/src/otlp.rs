@@ -80,8 +80,12 @@ impl OtlpReceiver {
             tokio::select! {
                 () = &mut shutdown => break,
                 accepted = self.listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else {
-                        continue;
+                    let (stream, _peer) = match accepted {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            eprintln!("hiloop-interceptor: OTLP receiver accept error: {error}");
+                            continue;
+                        }
                     };
                     let io = TokioIo::new(stream);
                     let signal_tx = signal_tx.clone();
@@ -90,9 +94,15 @@ impl OtlpReceiver {
                         let service = service_fn(move |request| {
                             handle_request(request, signal_tx.clone(), Arc::clone(&clock))
                         });
-                        let _ = hyper::server::conn::http1::Builder::new()
+                        if let Err(error) = hyper::server::conn::http1::Builder::new()
                             .serve_connection(io, service)
-                            .await;
+                            .await
+                        {
+                            // Connection-level errors (client disconnect, malformed
+                            // HTTP) are expected under normal operation and not
+                            // fatal; log for diagnostics.
+                            eprintln!("hiloop-interceptor: OTLP connection error: {error}");
+                        }
                     });
                 }
             }
@@ -111,7 +121,10 @@ async fn handle_request(
 
     let body = match request.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => return Ok(empty_response(StatusCode::BAD_REQUEST)),
+        Err(error) => {
+            eprintln!("hiloop-interceptor: OTLP body read error: {error}");
+            return Ok(empty_response(StatusCode::BAD_REQUEST));
+        }
     };
 
     let raw = RawSignal::new(OTLP_SOURCE, OTLP_TRACES_KIND, clock.tick(), body)
