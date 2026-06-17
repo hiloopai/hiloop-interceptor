@@ -94,6 +94,12 @@ struct RunArgs {
     #[arg(long = "proxy")]
     proxy: bool,
 
+    /// Cap how many body bytes the proxy captures (blob + reported size) per
+    /// request/response. Unlimited when omitted; never affects what the client
+    /// or upstream receives.
+    #[arg(long = "max-capture-bytes", env = "HILOOP_MAX_CAPTURE_BYTES")]
+    max_capture_bytes: Option<u64>,
+
     /// Command to wrap. Everything after `--` is passed to the child.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -115,6 +121,7 @@ impl RunArgs {
             self.blob_dir,
             self.otlp,
             self.proxy,
+            self.max_capture_bytes,
         )
     }
 }

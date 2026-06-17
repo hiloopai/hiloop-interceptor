@@ -45,6 +45,7 @@ pub(crate) struct RunOptions {
     blob_dir: Option<PathBuf>,
     otlp: bool,
     proxy: bool,
+    max_capture_bytes: Option<u64>,
 }
 
 impl RunOptions {
@@ -57,6 +58,7 @@ impl RunOptions {
         blob_dir: Option<PathBuf>,
         otlp: bool,
         proxy: bool,
+        max_capture_bytes: Option<u64>,
     ) -> Self {
         Self {
             context,
@@ -66,6 +68,7 @@ impl RunOptions {
             blob_dir,
             otlp,
             proxy,
+            max_capture_bytes,
         }
     }
 }
@@ -317,9 +320,15 @@ where
     let (proxy_shutdown_tx, proxy_server_task) = match (proxy_server, proxy_ca, blob_store) {
         (Some(server), Some(ca), Some(blob_store)) => {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let task = server.serve(ca, signal_tx.clone(), blob_store, async move {
-                let _ = shutdown_rx.await;
-            });
+            let task = server.serve(
+                ca,
+                signal_tx.clone(),
+                blob_store,
+                options.max_capture_bytes,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            );
             (Some(shutdown_tx), Some(task))
         }
         _ => (None, None),
@@ -780,6 +789,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         );
 
         let error = Box::pin(run_captured(&options, &FailingExporter, None))
