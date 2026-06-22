@@ -18,6 +18,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: install rust toolchain
@@ -35,8 +36,13 @@ jobs:
         run: cargo test --workspace --all-targets --all-features --locked
       - name: doctests
         run: cargo test --workspace --doc --all-features --locked
+      - name: install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: cargo deny
+        run: cargo deny check
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: resolve and verify MSRV
