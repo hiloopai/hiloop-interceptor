@@ -48,6 +48,8 @@ write the implementation.
 - Prefer self-documenting code. Good names > comments.
 - Rustdoc (`///`) on public APIs — answer "what contract?" not "what is the field name?".
 - **Never** comment what you changed or why you changed it. That's for the commit/PR.
+- Diff-explaining comments are unacceptable. Remove them immediately during review;
+  never leave them for later cleanup.
 - Inline comments are for unintuitive behaviour, gotchas, and TODOs — nothing else.
 - See `docs/RUST_STYLE.md` § Comments And Rustdoc for full guidance.
 
@@ -56,4 +58,6 @@ write the implementation.
 - **Conventional Commits:** `type(scope): summary`.
 - Pre-commit hooks run automatically on changed files — they are the source of truth
   for lint/format checks.
-- CI actions are pinned to full commit SHAs (tag in comment).
+- CI actions are pinned to full commit SHAs and updated by Dependabot (tag in comment).
+- CI bootstrap tools should be Dependabot-managed where possible; otherwise pin exact
+  versions and justify the exception in the PR.

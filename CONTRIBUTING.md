@@ -22,7 +22,10 @@ Pre-alpha; external contributions aren't being solicited yet. Internal workflow:
 
 ## Security and dependency review
 
-- CI actions are pinned to full commit SHAs with the intended upstream tag left in a comment.
+- CI actions are pinned to full commit SHAs with the intended upstream tag left in a comment;
+  Dependabot owns updates to those pins.
+- CI bootstrap tools should be represented as Dependabot-managed actions/manifests where
+  possible; otherwise pin exact versions and call out the exception in the PR.
 - PRs run GitHub Dependency Review for Cargo and GitHub Actions changes. It fails on new runtime or
   development-scope vulnerabilities at `moderate` severity or higher.
 - `deny.toml` is the local Rust dependency policy for advisories, duplicate crate versions, licenses,

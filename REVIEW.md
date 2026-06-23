@@ -27,10 +27,12 @@ Run three focused passes on every PR:
 ### Always block on
 - Logic bugs, off-by-one, race conditions, unsound `unsafe`.
 - Missing or inadequate error handling (swallowed errors, `.unwrap()` in lib code).
+- Comments that explain the diff instead of the system; remove them before merge.
 - Security: secrets in code, path traversal, injection, unbounded allocations.
 - Breaking public API changes without a migration path.
 - Tests deleted or weakened without justification.
 - `#[allow]` without `#[expect]` + reason string.
+- Unpinned CI actions or CI bootstrap tools that bypass Dependabot-managed manifests.
 - Magic strings/numbers — use constants, enums, or newtypes.
 - New dependencies without trade-off analysis in the PR description.
 
