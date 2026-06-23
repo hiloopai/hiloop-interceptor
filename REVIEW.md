@@ -32,7 +32,8 @@ Run three focused passes on every PR:
 - Breaking public API changes without a migration path.
 - Tests deleted or weakened without justification.
 - `#[allow]` without `#[expect]` + reason string.
-- Unpinned CI actions or CI bootstrap tools that bypass Dependabot-managed manifests.
+- Unpinned CI actions or CI bootstrap tools; prefer Dependabot-managed
+  manifests/actions, otherwise require exact pins and PR justification.
 - Magic strings/numbers — use constants, enums, or newtypes.
 - New dependencies without trade-off analysis in the PR description.
 
