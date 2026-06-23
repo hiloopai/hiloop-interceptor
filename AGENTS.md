@@ -48,6 +48,8 @@ write the implementation.
 - Prefer self-documenting code. Good names > comments.
 - Rustdoc (`///`) on public APIs — answer "what contract?" not "what is the field name?".
 - **Never** comment what you changed or why you changed it. That's for the commit/PR.
+- Diff-explaining comments are unacceptable. Remove them immediately during review instead
+  of leaving them for later cleanup.
 - Inline comments are for unintuitive behaviour, gotchas, and TODOs — nothing else.
 - See `docs/RUST_STYLE.md` § Comments And Rustdoc for full guidance.
 
@@ -57,3 +59,4 @@ write the implementation.
 - Pre-commit hooks run automatically on changed files — they are the source of truth
   for lint/format checks.
 - CI actions are pinned to full commit SHAs (tag in comment).
+- External CI tool bootstraps are pinned to fixed versions or commits.

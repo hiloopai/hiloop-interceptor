@@ -31,8 +31,10 @@ Run three focused passes on every PR:
 - Breaking public API changes without a migration path.
 - Tests deleted or weakened without justification.
 - `#[allow]` without `#[expect]` + reason string.
+- Comments that explain the diff instead of the system. They must be removed before merge.
 - Magic strings/numbers — use constants, enums, or newtypes.
 - New dependencies without trade-off analysis in the PR description.
+- Unpinned CI actions or external CI tool installs.
 
 ### Always flag (may not block)
 - Complexity: if you can't understand it in one read, it's too complex.
