@@ -37,7 +37,7 @@ jobs:
       - name: doctests
         run: cargo test --workspace --doc --all-features --locked
       - name: install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.19.8 --locked
       - name: cargo deny
         run: cargo deny check
   msrv:
