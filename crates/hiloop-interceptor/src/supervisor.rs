@@ -168,8 +168,10 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
     // Capture runs whenever there is somewhere to send events: a JSONL file and/or a gRPC export.
     let has_exporter = options.events_jsonl.is_some() || options.export_grpc.is_some();
 
-    if options.raw_jsonl.is_some() && options.events_jsonl.is_none() {
-        bail!("--raw-jsonl requires --events-jsonl so raw capture and normalization run together");
+    if options.raw_jsonl.is_some() && !has_exporter {
+        bail!(
+            "--raw-jsonl requires an export target (--events-jsonl or --export-grpc) so raw capture and normalization run together"
+        );
     }
 
     if options.otlp && !has_exporter {

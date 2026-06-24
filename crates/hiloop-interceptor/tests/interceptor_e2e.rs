@@ -247,7 +247,7 @@ async fn raw_output_without_event_output_fails_before_starting_child() {
     assert!(
         String::from_utf8(output.stderr)
             .expect("stderr")
-            .contains("--raw-jsonl requires --events-jsonl")
+            .contains("--raw-jsonl requires an export target")
     );
 }
 
