@@ -205,9 +205,8 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
                     &grpc.project_id,
                     grpc.insecure,
                 )
-                .await
                 .with_context(|| {
-                    format!("failed to connect gRPC exporter to `{}`", grpc.endpoint)
+                    format!("failed to build gRPC exporter for `{}`", grpc.endpoint)
                 })?,
             ));
         }

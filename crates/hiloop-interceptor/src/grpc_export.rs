@@ -55,12 +55,15 @@ pub struct GrpcIngestExporter {
 }
 
 impl GrpcIngestExporter {
-    /// Connect to `endpoint` (e.g. `https://telemetry.staging.hiloop.ai:443`). TLS (native trust
-    /// roots) is used unless `insecure` is set (h2c, local dev only). The Bearer token is read from
-    /// `HILOOP_API_TOKEN`; absent/empty means no auth header (an unauthenticated dev gateway).
-    /// Leave `tenant_id` empty against an authenticated gateway (it derives the tenant from the
-    /// token); set it only against a no-auth local gateway. `project_id` selects the project.
-    pub async fn connect(
+    /// Build a lazily-connected exporter for `endpoint` (e.g.
+    /// `https://telemetry.staging.hiloop.ai:443`). The channel connects on first export, not here,
+    /// so a gateway that is briefly unreachable at startup doesn't abort the run (and any local
+    /// JSONL sink keeps capturing). TLS (native trust roots) is used unless `insecure` is set (h2c,
+    /// local dev only). The Bearer token is read from `HILOOP_API_TOKEN`; absent/empty means no auth
+    /// header (an unauthenticated dev gateway). Leave `tenant_id` empty against an authenticated
+    /// gateway (it derives the tenant from the token); set it only against a no-auth local gateway.
+    /// `project_id` selects the project.
+    pub fn connect(
         endpoint: impl Into<String>,
         tenant_id: impl Into<String>,
         project_id: impl Into<String>,
@@ -75,9 +78,7 @@ impl GrpcIngestExporter {
                 .tls_config(ClientTlsConfig::new().with_native_roots())
                 .map_err(|e| ExportError::with_source("grpc", "TLS configuration failed", e))?;
         }
-        let channel = builder.connect().await.map_err(|e| {
-            ExportError::with_source("grpc", format!("connecting to `{endpoint}`"), e)
-        })?;
+        let channel = builder.connect_lazy();
 
         let bearer = match std::env::var(TOKEN_ENV).ok().filter(|t| !t.is_empty()) {
             Some(token) => Some(

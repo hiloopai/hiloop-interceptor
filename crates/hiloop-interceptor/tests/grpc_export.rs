@@ -97,9 +97,8 @@ async fn exports_events_to_the_gateway_with_tenant_and_project() {
     let recorded = Arc::clone(&service.recorded);
     let endpoint = serve(service).await;
 
-    let exporter = GrpcIngestExporter::connect(endpoint, "tenant-x", "proj-y", true)
-        .await
-        .expect("connect");
+    let exporter =
+        GrpcIngestExporter::connect(endpoint, "tenant-x", "proj-y", true).expect("connect");
 
     let events = vec![log_event("one"), log_event("two")];
     exporter.export(&events).await.expect("export");
@@ -120,9 +119,7 @@ async fn empty_batch_is_a_noop() {
     let recorded = Arc::clone(&service.recorded);
     let endpoint = serve(service).await;
 
-    let exporter = GrpcIngestExporter::connect(endpoint, "", "default", true)
-        .await
-        .expect("connect");
+    let exporter = GrpcIngestExporter::connect(endpoint, "", "default", true).expect("connect");
     exporter.export(&[]).await.expect("empty export");
 
     assert_eq!(recorded.lock().expect("lock").events.len(), 0);
@@ -136,9 +133,8 @@ async fn accepted_count_mismatch_is_an_error() {
     };
     let endpoint = serve(service).await;
 
-    let exporter = GrpcIngestExporter::connect(endpoint, "tenant-x", "proj-y", true)
-        .await
-        .expect("connect");
+    let exporter =
+        GrpcIngestExporter::connect(endpoint, "tenant-x", "proj-y", true).expect("connect");
     let error = exporter
         .export(&[log_event("one")])
         .await
