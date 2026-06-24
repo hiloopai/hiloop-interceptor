@@ -100,6 +100,7 @@ fn event_v1_schema_is_locked() {
         keys,
         [
             "attributes",
+            "event_id",
             "fork_node_id",
             "fork_path",
             "name",
@@ -111,6 +112,8 @@ fn event_v1_schema_is_locked() {
         "Event v1 top-level fields changed; this is a contract/migration decision"
     );
     assert!(object["payload_ref"].is_null());
+    // event_id is a minted ULID string and is always present on freshly captured events.
+    assert!(object["event_id"].as_str().is_some_and(|id| !id.is_empty()));
 
     // The timestamp is a hybrid logical clock with a stable two-field shape.
     let mut ts_keys = object["ts"]

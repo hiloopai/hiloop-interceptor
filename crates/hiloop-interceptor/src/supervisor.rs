@@ -5,8 +5,9 @@ use bytes::Bytes;
 use hiloop_core::identity::ForkContext;
 use hiloop_interceptor::{
     blob::DirBlobStore,
-    exporters::JsonlExporter,
+    exporters::{FanOutExporter, JsonlExporter},
     framing::LineFramer,
+    grpc_export::GrpcIngestExporter,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
     pipeline::{Pipeline, PipelineOptions},
     proxy::{ProxyCa, ProxyNormalizer, ProxyServer},
@@ -36,6 +37,20 @@ const OTEL_RUN_ID: &str = "hiloop.run.id";
 const OTEL_FORK_NODE_ID: &str = "hiloop.fork.node_id";
 const OTEL_FORK_PATH: &str = "hiloop.fork.path";
 
+/// gRPC export target for captured events.
+#[derive(Debug, Clone)]
+pub(crate) struct GrpcExportOptions {
+    /// Gateway endpoint, e.g. `https://telemetry.example.com:443`.
+    pub endpoint: String,
+    /// Use cleartext h2c instead of TLS (local dev gateways only).
+    pub insecure: bool,
+    /// Tenant to record under. Empty against an authenticated gateway (it derives the tenant from
+    /// the API token); set only against a no-auth local gateway.
+    pub tenant_id: String,
+    /// Project to record events under.
+    pub project_id: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RunOptions {
     context: ForkContext,
@@ -46,6 +61,7 @@ pub(crate) struct RunOptions {
     otlp: bool,
     proxy: bool,
     max_capture_bytes: Option<u64>,
+    export_grpc: Option<GrpcExportOptions>,
 }
 
 impl RunOptions {
@@ -59,6 +75,7 @@ impl RunOptions {
         otlp: bool,
         proxy: bool,
         max_capture_bytes: Option<u64>,
+        export_grpc: Option<GrpcExportOptions>,
     ) -> Self {
         Self {
             context,
@@ -69,6 +86,7 @@ impl RunOptions {
             otlp,
             proxy,
             max_capture_bytes,
+            export_grpc,
         }
     }
 }
@@ -147,27 +165,54 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
         bail!("no command given; usage: hiloop-interceptor run -- <cmd> [args...]");
     }
 
-    if options.raw_jsonl.is_some() && options.events_jsonl.is_none() {
-        bail!("--raw-jsonl requires --events-jsonl so raw capture and normalization run together");
-    }
+    // Capture runs whenever there is somewhere to send events: a JSONL file and/or a gRPC export.
+    let has_exporter = options.events_jsonl.is_some() || options.export_grpc.is_some();
 
-    if options.otlp && options.events_jsonl.is_none() {
-        bail!("--otlp requires --events-jsonl so received telemetry has an exporter");
-    }
-
-    if options.proxy && (options.events_jsonl.is_none() || options.blob_dir.is_none()) {
+    if options.raw_jsonl.is_some() && !has_exporter {
         bail!(
-            "--proxy requires --events-jsonl and --blob-dir so captured bodies are streamed to the blob store"
+            "--raw-jsonl requires an export target (--events-jsonl or --export-grpc) so raw capture and normalization run together"
         );
     }
 
-    if let Some(path) = &options.events_jsonl {
-        let exporter = JsonlExporter::create(path).await.with_context(|| {
-            format!(
-                "failed to create JSONL event exporter at `{}`",
-                path.display()
-            )
-        })?;
+    if options.otlp && !has_exporter {
+        bail!(
+            "--otlp requires --events-jsonl or --export-grpc so received telemetry has an exporter"
+        );
+    }
+
+    if options.proxy && (!has_exporter || options.blob_dir.is_none()) {
+        bail!(
+            "--proxy requires an export target (--events-jsonl or --export-grpc) and --blob-dir so captured bodies are streamed to the blob store"
+        );
+    }
+
+    if has_exporter {
+        // List durable sinks first (JSONL persists before the fallible network export is tried).
+        let mut exporters: Vec<Box<dyn Exporter>> = Vec::new();
+        if let Some(path) = &options.events_jsonl {
+            exporters.push(Box::new(JsonlExporter::create(path).await.with_context(
+                || {
+                    format!(
+                        "failed to create JSONL event exporter at `{}`",
+                        path.display()
+                    )
+                },
+            )?));
+        }
+        if let Some(grpc) = &options.export_grpc {
+            exporters.push(Box::new(
+                GrpcIngestExporter::connect(
+                    &grpc.endpoint,
+                    &grpc.tenant_id,
+                    &grpc.project_id,
+                    grpc.insecure,
+                )
+                .with_context(|| {
+                    format!("failed to build gRPC exporter for `{}`", grpc.endpoint)
+                })?,
+            ));
+        }
+        let exporter = FanOutExporter::new(exporters);
         if let Some(raw_path) = &options.raw_jsonl {
             let raw_store = JsonlRawStore::create(raw_path).await.with_context(|| {
                 format!(
@@ -789,6 +834,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             None,
         );
 

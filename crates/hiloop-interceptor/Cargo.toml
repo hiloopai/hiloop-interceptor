@@ -36,12 +36,20 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
 
 # Signal forwarding and process-group teardown are Unix-only (the wrapper's
 # PID-1/supervisor product scope). nix is available to the binary and the
 # integration tests.
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+
+[build-dependencies]
+# Generate the TelemetryIngestService gRPC stubs from the vendored proto with a pure-Rust
+# compiler, so the build needs no system protoc.
+protox.workspace = true
+tonic-prost-build.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

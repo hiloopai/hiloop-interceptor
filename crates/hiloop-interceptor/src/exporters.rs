@@ -64,6 +64,38 @@ fn jsonl_error(error: serde_json::Error) -> ExportError {
     ExportError::with_source("jsonl", "failed to encode event as JSON", error)
 }
 
+/// Sends each batch to several exporters in turn, so independent sinks (e.g. a local JSONL
+/// durability log plus a remote gRPC export) run from one capture pipeline. Order is preserved:
+/// list durable sinks first so they persist before a fallible network export is attempted; the
+/// first failure short-circuits and is returned.
+pub struct FanOutExporter {
+    exporters: Vec<Box<dyn Exporter>>,
+}
+
+impl FanOutExporter {
+    #[must_use]
+    pub fn new(exporters: Vec<Box<dyn Exporter>>) -> Self {
+        Self { exporters }
+    }
+}
+
+#[async_trait]
+impl Exporter for FanOutExporter {
+    async fn export(&self, events: &[Event]) -> Result<(), ExportError> {
+        for exporter in &self.exporters {
+            exporter.export(events).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), ExportError> {
+        for exporter in &self.exporters {
+            exporter.flush().await?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use hiloop_core::{

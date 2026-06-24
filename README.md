@@ -54,6 +54,24 @@ regardless of harness cooperation.
 cargo run -p hiloop-interceptor -- run --proxy --events-jsonl ./events.jsonl --blob-dir ./blobs -- <harness command>
 ```
 
+Add `--export-grpc <URL>` to stream captured events to a hiloop telemetry gateway over gRPC. It
+composes with `--events-jsonl` (list both to keep a local JSONL durability log alongside the remote
+export). The API token is read from the `HILOOP_API_TOKEN` environment variable — never a flag, so
+it stays out of `process.argv`. An authenticated gateway derives the tenant from that token, so leave
+`--tenant-id` empty there; `--project-id` selects the project to record under. Use `--insecure-grpc`
+for a cleartext local gateway (and `--tenant-id` to assert tenancy when it has no auth).
+
+```sh
+# Hosted, authenticated:
+HILOOP_API_TOKEN=hil_… cargo run -p hiloop-interceptor -- \
+  run --export-grpc https://telemetry.example.com:443 --project-id my-project -- <harness command>
+
+# Local dev gateway (no auth, cleartext):
+cargo run -p hiloop-interceptor -- \
+  run --export-grpc http://127.0.0.1:50051 --insecure-grpc --tenant-id dev --project-id local \
+  --events-jsonl ./events.jsonl -- <harness command>
+```
+
 Inspect a captured events file — counts grouped by fork-tree node, or how two branches diverged:
 
 ```sh

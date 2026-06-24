@@ -3,6 +3,7 @@
 pub mod blob;
 pub mod exporters;
 pub mod framing;
+pub mod grpc_export;
 pub mod inspect;
 pub mod otlp;
 pub mod pipeline;

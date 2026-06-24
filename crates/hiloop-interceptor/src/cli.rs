@@ -1,6 +1,6 @@
 //! Command-line interface for `hiloop-interceptor`.
 
-use crate::supervisor::{RunOptions, run};
+use crate::supervisor::{GrpcExportOptions, RunOptions, run};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hiloop_core::identity::{ForkContext, ForkNodeId, ForkPath, RunId};
@@ -36,6 +36,10 @@ impl Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap flattens each variant's Args struct into the subcommand; the size spread between run and inspect is inherent and not worth boxing through clap's derive"
+)]
 enum Command {
     /// Run a command under the interceptor supervisor.
     Run(RunArgs),
@@ -100,6 +104,29 @@ struct RunArgs {
     #[arg(long = "max-capture-bytes", env = "HILOOP_MAX_CAPTURE_BYTES")]
     max_capture_bytes: Option<u64>,
 
+    /// Stream captured events to a telemetry gateway over gRPC, e.g.
+    /// `https://telemetry.example.com:443`. Composes with `--events-jsonl`. The API token is read
+    /// from the `HILOOP_API_TOKEN` environment variable (never a flag, to keep it out of argv).
+    #[arg(long = "export-grpc", env = "HILOOP_TELEMETRY_ENDPOINT")]
+    export_grpc: Option<String>,
+
+    /// Use cleartext h2c instead of TLS for `--export-grpc` (local dev gateways only).
+    #[arg(long = "insecure-grpc")]
+    insecure_grpc: bool,
+
+    /// Project to record events under when exporting over gRPC.
+    #[arg(
+        long = "project-id",
+        env = "HILOOP_PROJECT_ID",
+        default_value = "default"
+    )]
+    project_id: String,
+
+    /// Tenant to record under when exporting over gRPC. Leave empty against an authenticated
+    /// gateway (it derives the tenant from the API token); set only for a no-auth local gateway.
+    #[arg(long = "tenant-id", env = "HILOOP_TENANT_ID", default_value = "")]
+    tenant_id: String,
+
     /// Command to wrap. Everything after `--` is passed to the child.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -113,6 +140,13 @@ impl RunArgs {
             self.fork_path.unwrap_or_default(),
         );
 
+        let export_grpc = self.export_grpc.map(|endpoint| GrpcExportOptions {
+            endpoint,
+            insecure: self.insecure_grpc,
+            tenant_id: self.tenant_id,
+            project_id: self.project_id,
+        });
+
         RunOptions::new(
             context,
             self.command,
@@ -122,6 +156,7 @@ impl RunArgs {
             self.otlp,
             self.proxy,
             self.max_capture_bytes,
+            export_grpc,
         )
     }
 }

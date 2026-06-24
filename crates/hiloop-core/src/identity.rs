@@ -79,6 +79,54 @@ impl FromStr for RunId {
     }
 }
 
+/// Stable identity for a single telemetry event, minted at capture time.
+///
+/// Lets the ingest path dedup idempotently: the backend uses this when present and otherwise
+/// derives a deterministic fallback, so re-delivering an event maps to the same row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(Ulid);
+
+impl EventId {
+    /// Mint a locally unique event id.
+    pub fn new() -> Self {
+        Self(Ulid::new())
+    }
+
+    pub fn from_ulid(value: Ulid) -> Self {
+        Self(value)
+    }
+
+    pub fn as_ulid(self) -> Ulid {
+        self.0
+    }
+}
+
+impl Default for EventId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl FromStr for EventId {
+    type Err = IdentityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ulid::from_string(value)
+            .map(Self)
+            .map_err(|_| IdentityError::InvalidUlid {
+                field: "event_id",
+                value: value.to_owned(),
+            })
+    }
+}
+
 /// Opaque identifier for one fork-tree node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
