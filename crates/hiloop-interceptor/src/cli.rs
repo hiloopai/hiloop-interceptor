@@ -36,9 +36,10 @@ impl Cli {
 }
 
 #[derive(Debug, Subcommand)]
-// clap flattens each variant's Args struct into the subcommand; the size spread between `run`
-// (many flags) and `inspect` is inherent and not worth boxing through clap's derive.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "clap flattens each variant's Args struct into the subcommand; the size spread between run and inspect is inherent and not worth boxing through clap's derive"
+)]
 enum Command {
     /// Run a command under the interceptor supervisor.
     Run(RunArgs),
