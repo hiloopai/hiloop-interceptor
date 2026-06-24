@@ -4,7 +4,7 @@
 //! prompts, responses, and HTTP bodies are referenced by content hash instead of
 //! embedded in the row.
 
-use crate::identity::{ForkContext, ForkNodeId, ForkPath, Hlc, RunId};
+use crate::identity::{EventId, ForkContext, ForkNodeId, ForkPath, Hlc, RunId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
@@ -277,6 +277,10 @@ impl PayloadRef {
 /// A single normalized, fork-stamped telemetry event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
+    /// Stable per-event identity. Defaults when absent (older records) so deserialization stays
+    /// backward-compatible; freshly captured events always carry a minted id from [`Event::new`].
+    #[serde(default)]
+    pub event_id: EventId,
     pub ts: Hlc,
     pub run_id: RunId,
     pub fork_node_id: ForkNodeId,
@@ -288,9 +292,10 @@ pub struct Event {
 }
 
 impl Event {
-    /// Creates an event stamped with the resolved fork context.
+    /// Creates an event stamped with the resolved fork context and a freshly minted event id.
     pub fn new(context: &ForkContext, ts: Hlc, signal: SignalType, name: EventName) -> Self {
         Self {
+            event_id: EventId::new(),
             ts,
             run_id: context.run_id,
             fork_node_id: context.fork_node_id,
