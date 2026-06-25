@@ -86,7 +86,10 @@ impl RunOptions {
     /// `blob_dir`), `max_capture_bytes` caps proxy body capture, and `export_grpc`
     /// streams events to a telemetry gateway. Invariants between these are validated
     /// by [`run`], not here.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public, embeddable run config; the flat constructor mirrors the CLI's RunArgs 1:1 — a builder is deferred while there is a single in-tree caller"
+    )]
     pub fn new(
         context: ForkContext,
         command: Vec<String>,
