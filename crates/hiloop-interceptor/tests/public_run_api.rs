@@ -40,7 +40,7 @@ async fn grpc_export_options_are_part_of_the_public_surface() {
     let export = GrpcExportOptions {
         endpoint: "http://127.0.0.1:50051".to_owned(),
         insecure: true,
-        tenant_id: "dev".to_owned(),
+        tenant_id: Some("dev".to_owned()),
         project_id: "local".to_owned(),
     };
     let options = options_for(vec!["true".to_owned()], Some(export));
