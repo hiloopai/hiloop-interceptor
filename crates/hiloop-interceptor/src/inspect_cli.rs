@@ -15,8 +15,8 @@ pub(crate) fn run(events_jsonl: &Path, diff: Option<(&str, &str)>) -> Result<Exi
 
     let mut out = String::new();
     match diff {
-        Some((path_a, path_b)) => render_diff(&mut out, &summary, path_a, path_b),
-        None => render_summary(&mut out, &summary),
+        Some((path_a, path_b)) => render_diff(&mut out, &summary, path_a, path_b)?,
+        None => render_summary(&mut out, &summary)?,
     }
     print!("{out}");
 
@@ -39,52 +39,63 @@ fn read_events(path: &Path) -> Result<Vec<Event>> {
     Ok(events)
 }
 
-fn render_summary(out: &mut String, summary: &InspectSummary) {
+fn render_summary(out: &mut String, summary: &InspectSummary) -> Result<()> {
     use std::fmt::Write as _;
 
-    let _ = writeln!(
+    writeln!(
         out,
         "{} events across {} fork path(s)",
         summary.total_events,
         summary.paths.len()
-    );
+    )
+    .context("failed to format summary header")?;
     for path in &summary.paths {
-        let _ = writeln!(
+        writeln!(
             out,
-            "\n  {} — {} event(s)",
+            "\n  {} \u{2014} {} event(s)",
             display_path(&path.fork_path),
             path.events
-        );
+        )
+        .context("failed to format path summary")?;
         let signals = path
             .by_signal
             .iter()
             .map(|(label, count)| format!("{label}={count}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let _ = writeln!(out, "    signals: {signals}");
+        writeln!(out, "    signals: {signals}").context("failed to format signals")?;
         for (name, count) in &path.by_name {
-            let _ = writeln!(out, "    {name}: {count}");
+            writeln!(out, "    {name}: {count}").context("failed to format event name")?;
         }
     }
+    Ok(())
 }
 
-fn render_diff(out: &mut String, summary: &InspectSummary, path_a: &str, path_b: &str) {
+fn render_diff(
+    out: &mut String,
+    summary: &InspectSummary,
+    path_a: &str,
+    path_b: &str,
+) -> Result<()> {
     use std::fmt::Write as _;
 
     let deltas = diff_event_names(summary, path_a, path_b);
-    let _ = writeln!(
+    writeln!(
         out,
         "event-name divergence: {} (a) vs {} (b)",
         display_path(path_a),
         display_path(path_b)
-    );
+    )
+    .context("failed to format diff header")?;
     if deltas.is_empty() {
-        let _ = writeln!(out, "  (no divergence)");
-        return;
+        writeln!(out, "  (no divergence)").context("failed to format diff")?;
+        return Ok(());
     }
     for delta in deltas {
-        let _ = writeln!(out, "  {}: a={} b={}", delta.name, delta.a, delta.b);
+        writeln!(out, "  {}: a={} b={}", delta.name, delta.a, delta.b)
+            .context("failed to format diff delta")?;
     }
+    Ok(())
 }
 
 fn display_path(fork_path: &str) -> &str {

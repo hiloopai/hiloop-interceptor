@@ -266,9 +266,14 @@ impl CaptureHandler {
         // an inline body so the capture is never lost. The forwarded request keeps
         // the buffered bytes either way.
         let payload_ref =
-            offload_bytes(self.blob_store.as_ref(), &captured, content_type.as_deref())
-                .await
-                .ok();
+            match offload_bytes(self.blob_store.as_ref(), &captured, content_type.as_deref()).await
+            {
+                Ok(payload_ref) => Some(payload_ref),
+                Err(error) => {
+                    eprintln!("hiloop-interceptor: proxy request blob offload failed: {error}");
+                    None
+                }
+            };
         let raw = build_raw(
             &self.clock,
             REQUEST_KIND,
@@ -406,7 +411,8 @@ impl TeeState {
             // On write failure the writer is dropped; the streamed frames aren't
             // buffered, so the response signal degrades to metadata only (no
             // payload_ref). Unlike the request path, there is no inline fallback.
-            if writer.write(data).await.is_err() {
+            if let Err(error) = writer.write(data).await {
+                eprintln!("hiloop-interceptor: proxy response blob write failed: {error}");
                 self.writer = None;
             } else {
                 self.size += data.len() as u64;
@@ -480,11 +486,13 @@ async fn finalize_tee(
     truncated: bool,
 ) -> RawSignal {
     let payload_ref = match writer {
-        Some(writer) => writer
-            .finish()
-            .await
-            .ok()
-            .map(|payload_ref| apply_media_type(payload_ref, media_type.as_deref())),
+        Some(writer) => match writer.finish().await {
+            Ok(payload_ref) => Some(apply_media_type(payload_ref, media_type.as_deref())),
+            Err(error) => {
+                eprintln!("hiloop-interceptor: proxy blob finalize failed: {error}");
+                None
+            }
+        },
         None => None,
     };
     let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), Bytes::new())
@@ -556,7 +564,10 @@ async fn offload_bytes(
 async fn collect_body(body: Body) -> (Bytes, bool) {
     match body.collect().await {
         Ok(collected) => (collected.to_bytes(), false),
-        Err(_) => (Bytes::new(), true),
+        Err(error) => {
+            eprintln!("hiloop-interceptor: proxy request body read error: {error}");
+            (Bytes::new(), true)
+        }
     }
 }
 
