@@ -1098,8 +1098,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn normalizer_rejects_unsupported_source() {
+    #[test]
+    fn normalizer_rejects_unsupported_source() {
         let raw = RawSignal::new(
             "stdio",
             "stdout",
@@ -1115,8 +1115,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn normalizer_accepts_response_kind() {
+    #[test]
+    fn normalizer_accepts_response_kind() {
         let raw = proxy_signal(RESPONSE_KIND, &[("http.status_code", "200")]);
         assert_eq!(ProxyNormalizer.supports(&raw), NormalizerSupport::Exact);
     }

@@ -1048,8 +1048,6 @@ mod tests {
         assert!(collected.len() >= 3);
     }
 
-    // --- NormalizationOutcome ---
-
     #[test]
     fn normalization_outcome_defaults() {
         let outcome = NormalizationOutcome::default();
@@ -1096,8 +1094,6 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 
-    // --- RawObservationRef ---
-
     #[test]
     fn raw_observation_ref_rejects_blank_id() {
         assert!(RawObservationRef::new("").is_err());
@@ -1110,8 +1106,6 @@ mod tests {
         assert_eq!(r.id(), "raw-1");
     }
 
-    // --- NormalizerSupport ---
-
     #[test]
     fn normalizer_support_ordering() {
         assert!(NormalizerSupport::Exact > NormalizerSupport::Fallback);
@@ -1121,7 +1115,11 @@ mod tests {
         assert!(NormalizerSupport::Exact.is_supported());
     }
 
-    // --- RawSignal builder ---
+    #[test]
+    fn sink_send_is_open() {
+        assert!(SinkSend::Delivered.is_open());
+        assert!(!SinkSend::Closed.is_open());
+    }
 
     #[test]
     fn raw_signal_with_attribute_is_additive() {
@@ -1132,8 +1130,6 @@ mod tests {
         assert_eq!(raw.attributes["key1"], "val1");
         assert_eq!(raw.attributes["key2"], "val2");
     }
-
-    // --- Error types ---
 
     #[test]
     fn export_error_other_format() {
@@ -1196,7 +1192,20 @@ mod tests {
         assert!(bp.to_string().contains("42"));
     }
 
-    // --- NormalizationContext ---
+    #[test]
+    fn normalizer_descriptor_accessors() {
+        let d = NormalizerDescriptor::new("name", "1.0", "schema.v1");
+        assert_eq!(d.name(), "name");
+        assert_eq!(d.version(), "1.0");
+        assert_eq!(d.output_schema_version(), "schema.v1");
+    }
+
+    #[test]
+    fn wrapper_context_current_is_populated() {
+        let w = WrapperContext::current();
+        assert!(!w.name.is_empty());
+        assert!(!w.version.is_empty());
+    }
 
     #[test]
     fn normalization_context_from_fork() {
@@ -1206,7 +1215,14 @@ mod tests {
         assert!(context.process.is_none());
     }
 
-    // --- NormalizerRouter select_all ---
+    #[test]
+    fn raw_retention_policy_as_str() {
+        assert_eq!(RawRetentionPolicy::Preserve.as_str(), "preserve");
+        assert_eq!(
+            RawRetentionPolicy::DiscardAfterNormalize.as_str(),
+            "discard_after_normalize"
+        );
+    }
 
     #[test]
     fn normalizer_router_select_all_returns_multiple_matches() {

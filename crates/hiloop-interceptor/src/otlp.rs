@@ -409,8 +409,6 @@ mod tests {
         assert_eq!(normalizer.supports(&raw), NormalizerSupport::Unsupported);
     }
 
-    // --- convert_any_value coverage ---
-
     #[test]
     fn convert_any_value_maps_bool() {
         let value = AnyValue {
@@ -462,8 +460,6 @@ mod tests {
         assert!(convert_any_value(&value).is_none());
     }
 
-    // --- span_name coverage ---
-
     #[test]
     fn span_name_falls_back_for_empty_name() {
         let s = Span {
@@ -491,8 +487,6 @@ mod tests {
         assert_eq!(span_name(&s), "my.operation");
     }
 
-    // --- hex helper ---
-
     #[test]
     fn hex_encodes_bytes_as_lowercase() {
         assert_eq!(hex(&[0xab, 0xcd, 0x01, 0xff]), "abcd01ff");
@@ -502,8 +496,6 @@ mod tests {
     fn hex_of_empty_is_empty() {
         assert_eq!(hex(&[]), "");
     }
-
-    // --- span_is_llm coverage ---
 
     #[test]
     fn span_is_llm_detects_gen_ai_prefix() {
@@ -522,8 +514,6 @@ mod tests {
         let s = span("op", 1, vec![("db.system", string_value("pg"))]);
         assert!(!span_is_llm(&s));
     }
-
-    // --- normalizer edge cases ---
 
     #[tokio::test]
     async fn normalize_empty_export_produces_no_events() {
