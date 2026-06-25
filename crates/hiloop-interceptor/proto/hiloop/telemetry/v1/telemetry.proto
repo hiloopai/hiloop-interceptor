@@ -49,9 +49,9 @@ message Event {
   string event_id = 9;
 }
 
-// tenant_id and project_id are request-level: the server assigns them from the authenticated
-// request context and stamps every event in the batch. They are deliberately absent from Event so
-// the untrusted per-event payload can never set its own tenancy.
+// tenant_id and project_id are request-level: the backend assigns them from the authenticated
+// request context (api_key -> tenant) and stamps every event in the batch. They are deliberately
+// absent from Event so the untrusted per-event payload can never set its own tenancy.
 message IngestRequest {
   repeated Event events = 1;
   string tenant_id = 2;
