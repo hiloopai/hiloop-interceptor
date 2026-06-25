@@ -1048,6 +1048,213 @@ mod tests {
         assert!(collected.len() >= 3);
     }
 
+    #[test]
+    fn normalization_outcome_defaults() {
+        let outcome = NormalizationOutcome::default();
+        assert!(outcome.events().is_empty());
+        assert!(outcome.diagnostics().is_empty());
+        assert_eq!(
+            outcome.raw_retention_policy(),
+            RawRetentionPolicy::DiscardAfterNormalize
+        );
+    }
+
+    #[test]
+    fn normalization_outcome_with_raw_retention_override() {
+        let outcome =
+            NormalizationOutcome::default().with_raw_retention(RawRetentionPolicy::Preserve);
+        assert_eq!(outcome.raw_retention_policy(), RawRetentionPolicy::Preserve);
+    }
+
+    #[test]
+    fn normalization_outcome_with_diagnostic() {
+        let outcome = NormalizationOutcome::default().with_diagnostic(NormalizationDiagnostic {
+            severity: DiagnosticSeverity::Warn,
+            message: "something fishy".to_owned(),
+        });
+        assert_eq!(outcome.diagnostics().len(), 1);
+        assert_eq!(outcome.diagnostics()[0].severity, DiagnosticSeverity::Warn);
+        assert_eq!(outcome.diagnostics()[0].message, "something fishy");
+    }
+
+    #[test]
+    fn normalization_outcome_into_events() {
+        let event = hiloop_core::event::Event::new(
+            &ForkContext::new_local_root(),
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            hiloop_core::event::SignalType::Log,
+            hiloop_core::event::EventName::new("test.event").expect("event name"),
+        );
+        let outcome = NormalizationOutcome::from_events(vec![event]);
+        assert_eq!(outcome.events().len(), 1);
+        let events = outcome.into_events();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn raw_observation_ref_rejects_blank_id() {
+        assert!(RawObservationRef::new("").is_err());
+        assert!(RawObservationRef::new("   ").is_err());
+    }
+
+    #[test]
+    fn raw_observation_ref_accepts_valid_id() {
+        let r = RawObservationRef::new("raw-1").expect("valid id");
+        assert_eq!(r.id(), "raw-1");
+    }
+
+    #[test]
+    fn normalizer_support_ordering() {
+        assert!(NormalizerSupport::Exact > NormalizerSupport::Fallback);
+        assert!(NormalizerSupport::Fallback > NormalizerSupport::Unsupported);
+        assert!(!NormalizerSupport::Unsupported.is_supported());
+        assert!(NormalizerSupport::Fallback.is_supported());
+        assert!(NormalizerSupport::Exact.is_supported());
+    }
+
+    #[test]
+    fn sink_send_is_open() {
+        assert!(SinkSend::Delivered.is_open());
+        assert!(!SinkSend::Closed.is_open());
+    }
+
+    #[test]
+    fn raw_signal_with_attribute_is_additive() {
+        let raw = sample_raw(b"data")
+            .with_attribute("key1", "val1")
+            .with_attribute("key2", "val2");
+        assert_eq!(raw.attributes.len(), 2);
+        assert_eq!(raw.attributes["key1"], "val1");
+        assert_eq!(raw.attributes["key2"], "val2");
+    }
+
+    #[test]
+    fn export_error_other_format() {
+        let error = ExportError::other("test-exporter", "connection lost");
+        let display = error.to_string();
+        assert!(display.contains("test-exporter"));
+        assert!(display.contains("connection lost"));
+    }
+
+    #[test]
+    fn export_error_with_source_preserves_chain() {
+        let source = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broke");
+        let error = ExportError::with_source("test-exporter", "write failed", source);
+        assert!(error.to_string().contains("write failed"));
+    }
+
+    #[test]
+    fn raw_store_error_other_format() {
+        let error = RawStoreError::other("test-store", "disk full");
+        let display = error.to_string();
+        assert!(display.contains("test-store"));
+        assert!(display.contains("disk full"));
+    }
+
+    #[test]
+    fn raw_store_error_blank_id_format() {
+        let error = RawStoreError::BlankId;
+        assert!(error.to_string().contains("blank"));
+    }
+
+    #[test]
+    fn normalize_error_display_variants() {
+        let unsupported = NormalizeError::Unsupported {
+            normalizer: "test",
+            source_name: "stdio".to_owned(),
+            kind: "stdout".to_owned(),
+        };
+        assert!(unsupported.to_string().contains("does not support"));
+
+        let decode = NormalizeError::Decode {
+            source_name: "otlp".to_owned(),
+            kind: "traces".to_owned(),
+            message: "bad proto".to_owned(),
+        };
+        assert!(decode.to_string().contains("bad proto"));
+    }
+
+    #[test]
+    fn source_error_display_variants() {
+        let stopped = SourceError::Stopped {
+            source_name: "stdio".to_owned(),
+            reason: "eof".to_owned(),
+        };
+        assert!(stopped.to_string().contains("stopped"));
+
+        let bp = SourceError::Backpressure {
+            source_name: "proxy".to_owned(),
+            dropped: 42,
+        };
+        assert!(bp.to_string().contains("42"));
+    }
+
+    #[test]
+    fn normalizer_descriptor_accessors() {
+        let d = NormalizerDescriptor::new("name", "1.0", "schema.v1");
+        assert_eq!(d.name(), "name");
+        assert_eq!(d.version(), "1.0");
+        assert_eq!(d.output_schema_version(), "schema.v1");
+    }
+
+    #[test]
+    fn wrapper_context_current_is_populated() {
+        let w = WrapperContext::current();
+        assert!(!w.name.is_empty());
+        assert!(!w.version.is_empty());
+    }
+
+    #[test]
+    fn normalization_context_from_fork() {
+        let fork = ForkContext::new_local_root();
+        let context: NormalizationContext = fork.clone().into();
+        assert_eq!(context.fork_context(), &fork);
+        assert!(context.process.is_none());
+    }
+
+    #[test]
+    fn raw_retention_policy_as_str() {
+        assert_eq!(RawRetentionPolicy::Preserve.as_str(), "preserve");
+        assert_eq!(
+            RawRetentionPolicy::DiscardAfterNormalize.as_str(),
+            "discard_after_normalize"
+        );
+    }
+
+    #[test]
+    fn normalizer_router_select_all_returns_multiple_matches() {
+        let fallback = StubNormalizer {
+            descriptor: NormalizerDescriptor::new("fallback", "1", "event.v1"),
+            support: NormalizerSupport::Fallback,
+        };
+        let exact = StubNormalizer {
+            descriptor: NormalizerDescriptor::new("exact", "1", "event.v1"),
+            support: NormalizerSupport::Exact,
+        };
+        let normalizers: [&dyn Normalizer; 2] = [&fallback, &exact];
+        let router = NormalizerRouter::new(normalizers).expect("router");
+        let raw = sample_raw(b"x");
+
+        let all = router.select_all(&raw);
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn normalizer_router_select_returns_none_for_all_unsupported() {
+        let unsupported = StubNormalizer {
+            descriptor: NormalizerDescriptor::new("u", "1", "event.v1"),
+            support: NormalizerSupport::Unsupported,
+        };
+        let normalizers: [&dyn Normalizer; 1] = [&unsupported];
+        let router = NormalizerRouter::new(normalizers).expect("router");
+        let raw = sample_raw(b"x");
+
+        assert!(router.select(&raw).is_none());
+    }
+
     #[tokio::test]
     async fn raw_signal_sink_reports_closed_when_receiver_drops() {
         let (tx, rx) = tokio::sync::mpsc::channel(1);

@@ -1099,6 +1099,111 @@ mod tests {
     }
 
     #[test]
+    fn normalizer_rejects_unsupported_source() {
+        let raw = RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::from_static(b"hello"),
+        );
+        assert_eq!(
+            ProxyNormalizer.supports(&raw),
+            NormalizerSupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn normalizer_accepts_response_kind() {
+        let raw = proxy_signal(RESPONSE_KIND, &[("http.status_code", "200")]);
+        assert_eq!(ProxyNormalizer.supports(&raw), NormalizerSupport::Exact);
+    }
+
+    #[tokio::test]
+    async fn normalizer_carries_all_raw_attributes() {
+        let raw = proxy_signal(
+            REQUEST_KIND,
+            &[
+                ("http.method", "GET"),
+                ("http.target", "/api"),
+                ("custom.attr", "value"),
+            ],
+        );
+        let context = NormalizationContext::new(ForkContext::new_local_root());
+
+        let outcome = ProxyNormalizer
+            .normalize(&context, raw)
+            .await
+            .expect("normalize");
+        let events = outcome.into_events();
+
+        assert_eq!(
+            events[0]
+                .attributes
+                .get(&AttributeKey::new("custom.attr").expect("key")),
+            Some(&AttributeValue::String("value".to_owned()))
+        );
+    }
+
+    #[test]
+    fn proxy_normalizer_descriptor_is_stable() {
+        let n = ProxyNormalizer;
+        assert_eq!(n.descriptor().name(), "proxy-http");
+        assert_eq!(n.descriptor().output_schema_version(), "hiloop.event.v1");
+    }
+
+    #[tokio::test]
+    async fn request_with_content_type_records_it() {
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/api")
+            .header("content-type", "application/json")
+            .body(Body::from(Bytes::from_static(b"{}")))
+            .expect("request");
+
+        let forwarded = handler.on_request(request).await;
+        drain_body(forwarded.into_body()).await;
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal
+                .attributes
+                .get("http.request.content_type")
+                .map(String::as_str),
+            Some("application/json")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_host_falls_back_to_header() {
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("GET")
+            .uri("/path-only")
+            .header("host", "fallback.example.com")
+            .body(Body::empty())
+            .expect("request");
+
+        let forwarded = handler.on_request(request).await;
+        drain_body(forwarded.into_body()).await;
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get("http.host").map(String::as_str),
+            Some("fallback.example.com")
+        );
+    }
+
+    #[test]
+    fn is_llm_host_rejects_partial_prefix_match() {
+        assert!(!is_llm_host("notapi.anthropic.com"));
+        assert!(!is_llm_host("api.anthropic.com.evil.com"));
+    }
+
+    #[test]
     fn exchange_ids_are_unique() {
         let first = next_exchange_id();
         let second = next_exchange_id();
