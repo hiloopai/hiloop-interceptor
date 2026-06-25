@@ -187,8 +187,126 @@ const fn signal_str(signal: SignalType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hiloop_core::event::{AttributeKey, EventName, FiniteF64, PayloadDigest};
-    use hiloop_core::identity::{ForkContext, Hlc};
+    use hiloop_core::event::{AttributeKey, EventName, FiniteF64, MediaType, PayloadDigest};
+    use hiloop_core::identity::{EventId, ForkContext, ForkNodeId, ForkPath, Hlc, RunId};
+    use std::str::FromStr;
+
+    /// Golden fixture: a `hiloop_core::Event` with EVERY field populated to a distinct,
+    /// deterministic, non-default value — including each `AttributeValue` variant and a fully
+    /// populated `PayloadRef`. The companion test asserts the proto `Event` mirrors every field,
+    /// so adding a field to either side without wiring the conversion fails the build. The
+    /// `PayloadRef` carries `digest`, `media_type`, and `size_bytes` so all three wire fields are
+    /// exercised.
+    fn golden_event() -> Event {
+        let run_id = RunId::from_str("00000000000000000000000001").expect("run ulid");
+        let fork_node_id = ForkNodeId::from_str("00000000000000000000000002").expect("node ulid");
+        let event_id = EventId::from_str("00000000000000000000000003").expect("event ulid");
+        let fork_path = ForkPath::from_str("/0/3/1").expect("fork path");
+
+        let mut event = Event::new(
+            &ForkContext::new(run_id, fork_node_id, fork_path),
+            Hlc {
+                wall_ns: 1_700_000_000_000_000_000,
+                logical: 11,
+            },
+            SignalType::Llm,
+            EventName::new("gen_ai.request").expect("name"),
+        )
+        .with_attribute(AttributeKey::new("model").expect("key"), "claude-opus")
+        .with_attribute(AttributeKey::new("input_tokens").expect("key"), 128_i64)
+        .with_attribute(
+            AttributeKey::new("temperature").expect("key"),
+            FiniteF64::new(0.5).expect("finite"),
+        )
+        .with_attribute(AttributeKey::new("stream").expect("key"), true)
+        .with_payload_ref(
+            PayloadRef::new(PayloadDigest::new("blake3:deadbeef").expect("digest"))
+                .with_media_type(MediaType::new("application/json").expect("media type"))
+                .with_size_bytes(4096),
+        );
+        // The minted event_id is overwritten with a fixed value so the fixture is fully golden.
+        event.event_id = event_id;
+        event
+    }
+
+    #[test]
+    fn golden_fixture_maps_every_field_to_proto() {
+        use proto::attribute_value::Value;
+
+        let event = golden_event();
+        let proto = to_proto_event(&event);
+
+        // Spine identity.
+        assert_eq!(proto.event_id, "00000000000000000000000003");
+        assert_eq!(proto.run_id, "00000000000000000000000001");
+        assert_eq!(proto.fork_node_id, "00000000000000000000000002");
+        assert_eq!(proto.fork_path, "/0/3/1");
+
+        // Timestamp.
+        assert_eq!(
+            proto.ts,
+            Some(proto::Hlc {
+                wall_ns: 1_700_000_000_000_000_000,
+                logical: 11,
+            })
+        );
+
+        // Signal + name.
+        assert_eq!(proto.signal, "llm");
+        assert_eq!(proto.name, "gen_ai.request");
+
+        // Every AttributeValue variant, one per key.
+        assert_eq!(proto.attributes.len(), 4);
+        assert_eq!(
+            proto.attributes["model"].value,
+            Some(Value::StringValue("claude-opus".to_owned()))
+        );
+        assert_eq!(
+            proto.attributes["input_tokens"].value,
+            Some(Value::IntValue(128))
+        );
+        assert_eq!(
+            proto.attributes["temperature"].value,
+            Some(Value::DoubleValue(0.5))
+        );
+        assert_eq!(
+            proto.attributes["stream"].value,
+            Some(Value::BoolValue(true))
+        );
+
+        // Fully populated payload reference (all three fields set).
+        let payload = proto.payload_ref.as_ref().expect("payload ref");
+        assert_eq!(payload.digest, "blake3:deadbeef");
+        assert_eq!(payload.media_type.as_deref(), Some("application/json"));
+        assert_eq!(payload.size_bytes, Some(4096));
+
+        // Lockstep guard: a field added to either `proto::Event` or `hiloop_core::Event` without
+        // updating the conversion makes this exhaustive reconstruction fail to compile, surfacing
+        // the drift. `..` is deliberately NOT used.
+        let expected = proto::Event {
+            ts: proto.ts,
+            run_id: proto.run_id.clone(),
+            fork_node_id: proto.fork_node_id.clone(),
+            fork_path: proto.fork_path.clone(),
+            signal: proto.signal.clone(),
+            name: proto.name.clone(),
+            attributes: proto.attributes.clone(),
+            payload_ref: proto.payload_ref.clone(),
+            event_id: proto.event_id.clone(),
+        };
+        let Event {
+            event_id: _,
+            ts: _,
+            run_id: _,
+            fork_node_id: _,
+            fork_path: _,
+            signal: _,
+            name: _,
+            attributes: _,
+            payload_ref: _,
+        } = event;
+        assert_eq!(proto, expected);
+    }
 
     fn sample_event() -> Event {
         Event::new(
