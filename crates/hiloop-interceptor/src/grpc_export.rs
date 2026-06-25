@@ -24,9 +24,9 @@ pub mod proto {
 
 use proto::telemetry_ingest_service_client::TelemetryIngestServiceClient;
 
-/// Env var holding the API token. Sourced from the environment only — never a CLI argument, so it
+/// Env var holding the API key. Sourced from the environment only — never a CLI argument, so it
 /// stays out of process provenance (`process.argv`).
-pub const TOKEN_ENV: &str = "HILOOP_API_TOKEN";
+pub const TOKEN_ENV: &str = "HILOOP_API_KEY";
 
 /// Attaches `authorization: Bearer <token>` to every request when a token is configured.
 #[derive(Clone)]
@@ -59,7 +59,7 @@ impl GrpcIngestExporter {
     /// `https://telemetry.staging.hiloop.ai:443`). The channel connects on first export, not here,
     /// so a gateway that is briefly unreachable at startup doesn't abort the run (and any local
     /// JSONL sink keeps capturing). TLS (native trust roots) is used unless `insecure` is set (h2c,
-    /// local dev only). The Bearer token is read from `HILOOP_API_TOKEN`; absent/empty means no auth
+    /// local dev only). The Bearer token is read from `HILOOP_API_KEY`; absent/empty means no auth
     /// header (an unauthenticated dev gateway). Leave `tenant_id` empty against an authenticated
     /// gateway (it derives the tenant from the token); set it only against a no-auth local gateway.
     /// `project_id` selects the project.

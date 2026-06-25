@@ -1,9 +1,10 @@
 //! Process supervision for wrapped harness commands.
+//!
+//! This is the embeddable entrypoint: build a [`RunOptions`] and call [`run`] to
+//! supervise a child command, capturing its telemetry into the configured sinks.
+//! The product CLI embeds this crate to provide `hiloop run -- <agent>` (ADR 0033).
 
-use anyhow::{Context, Result, bail};
-use bytes::Bytes;
-use hiloop_core::identity::ForkContext;
-use hiloop_interceptor::{
+use crate::{
     blob::DirBlobStore,
     exporters::{FanOutExporter, JsonlExporter},
     framing::LineFramer,
@@ -18,6 +19,9 @@ use hiloop_interceptor::{
     },
     stdio::StdioLogNormalizer,
 };
+use anyhow::{Context, Result, bail};
+use bytes::Bytes;
+use hiloop_core::identity::ForkContext;
 use std::{
     ffi::OsString,
     io::Write as _,
@@ -39,7 +43,7 @@ const OTEL_FORK_PATH: &str = "hiloop.fork.path";
 
 /// gRPC export target for captured events.
 #[derive(Debug, Clone)]
-pub(crate) struct GrpcExportOptions {
+pub struct GrpcExportOptions {
     /// Gateway endpoint, e.g. `https://telemetry.example.com:443`.
     pub endpoint: String,
     /// Use cleartext h2c instead of TLS (local dev gateways only).
@@ -51,8 +55,15 @@ pub(crate) struct GrpcExportOptions {
     pub project_id: String,
 }
 
+/// Configuration for a single supervised run.
+///
+/// Construct with [`RunOptions::new`] and pass to [`run`]. The supervisor captures
+/// the child's telemetry into whichever sinks are configured: a JSONL events file
+/// ([`events_jsonl`](RunOptions::new)), a raw observation log, a content-addressed
+/// blob store, an embedded OTLP receiver, an embedded MITM proxy, and/or a gRPC
+/// export to a telemetry gateway. With no sink configured the child runs uncaptured.
 #[derive(Debug, Clone)]
-pub(crate) struct RunOptions {
+pub struct RunOptions {
     context: ForkContext,
     command: Vec<String>,
     events_jsonl: Option<PathBuf>,
@@ -65,8 +76,21 @@ pub(crate) struct RunOptions {
 }
 
 impl RunOptions {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    /// Build run options for `command` (argv, where `command[0]` is the executable)
+    /// stamped with the fork `context`.
+    ///
+    /// Each sink is optional and composes with the others: `events_jsonl` writes a
+    /// newline-delimited JSON event log, `raw_jsonl` a raw observation log (requires
+    /// an export target), `blob_dir` the proxy's blob store, `otlp` an embedded OTLP
+    /// receiver, `proxy` an embedded MITM proxy (requires an export target and
+    /// `blob_dir`), `max_capture_bytes` caps proxy body capture, and `export_grpc`
+    /// streams events to a telemetry gateway. Invariants between these are validated
+    /// by [`run`], not here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public, embeddable run config; the flat constructor mirrors the CLI's RunArgs 1:1 — a builder is deferred while there is a single in-tree caller"
+    )]
+    pub fn new(
         context: ForkContext,
         command: Vec<String>,
         events_jsonl: Option<PathBuf>,
@@ -160,7 +184,15 @@ impl ChildEnv {
     }
 }
 
-pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
+/// Supervise the child command described by `options`, returning its exit code.
+///
+/// Validates the sink invariants (e.g. `--proxy` needs a blob dir and an export
+/// target), wires up the configured capture sinks, spawns the child in its own
+/// process group with the fork context stamped into its environment, forwards
+/// terminating signals, and drains telemetry until the child exits. Telemetry
+/// export is best effort and never kills the child; a missing/failed-to-spawn
+/// child or a misconfiguration returns `Err`.
+pub async fn run(options: &RunOptions) -> Result<ExitCode> {
     if options.command.is_empty() {
         bail!("no command given; usage: hiloop-interceptor run -- <cmd> [args...]");
     }
@@ -645,8 +677,8 @@ mod tests {
         async fn export(
             &self,
             _events: &[hiloop_core::event::Event],
-        ) -> std::result::Result<(), hiloop_interceptor::seams::ExportError> {
-            Err(hiloop_interceptor::seams::ExportError::other(
+        ) -> std::result::Result<(), crate::seams::ExportError> {
+            Err(crate::seams::ExportError::other(
                 "failing",
                 "intentional test failure",
             ))

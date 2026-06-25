@@ -11,3 +11,6 @@ pub mod proxy;
 pub mod raw;
 pub mod seams;
 pub mod stdio;
+pub mod supervisor;
+
+pub use supervisor::{GrpcExportOptions, RunOptions, run};
