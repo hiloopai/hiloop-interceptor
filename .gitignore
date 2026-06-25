@@ -5,3 +5,9 @@
 
 # Local agent worktrees and session state
 /.claude/
+
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key

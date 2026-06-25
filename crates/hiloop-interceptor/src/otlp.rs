@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -42,6 +42,7 @@ use crate::seams::{
 const OTLP_SOURCE: &str = "otlp";
 const OTLP_TRACES_KIND: &str = "traces";
 const TRACES_PATH: &str = "/v1/traces";
+const MAX_OTLP_BODY_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 const DESCRIPTOR: NormalizerDescriptor =
     NormalizerDescriptor::new("otlp-trace", env!("CARGO_PKG_VERSION"), "hiloop.event.v1");
 
@@ -119,9 +120,17 @@ async fn handle_request(
         return Ok(empty_response(StatusCode::NOT_FOUND));
     }
 
-    let body = match request.into_body().collect().await {
+    let body = match Limited::new(request.into_body(), MAX_OTLP_BODY_BYTES as usize)
+        .collect()
+        .await
+    {
         Ok(collected) => collected.to_bytes(),
         Err(error) => {
+            // A body exceeding the cap surfaces as `LengthLimitError`; report it
+            // as 413 so the caller can distinguish it from a malformed request.
+            if error.downcast_ref::<LengthLimitError>().is_some() {
+                return Ok(empty_response(StatusCode::PAYLOAD_TOO_LARGE));
+            }
             eprintln!("hiloop-interceptor: OTLP body read error: {error}");
             return Ok(empty_response(StatusCode::BAD_REQUEST));
         }
@@ -683,6 +692,60 @@ mod tests {
         assert_eq!(signal.source, OTLP_SOURCE);
         assert_eq!(signal.kind, OTLP_TRACES_KIND);
         assert_eq!(signal.body.as_ref(), body.as_slice());
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn rejects_body_exceeding_cap_with_413() {
+        let clock = Arc::new(HlcClock::new());
+        let receiver = OtlpReceiver::bind(Arc::clone(&clock)).await.expect("bind");
+        let addr = receiver.local_addr().expect("addr");
+        let (tx, mut rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(receiver.serve(tx, async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        // One byte past the cap is enough to trip `Limited`.
+        let oversize = MAX_OTLP_BODY_BYTES as usize + 1;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let head = format!(
+            "POST /v1/traces HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\nContent-Length: {oversize}\r\nConnection: close\r\n\r\n",
+        );
+        stream.write_all(head.as_bytes()).await.expect("write head");
+        // Stream the oversize body in chunks of arbitrary bytes; the receiver
+        // must cut us off and answer 413 before draining the whole thing.
+        let chunk = vec![0u8; 64 * 1024];
+        let mut sent = 0usize;
+        while sent < oversize {
+            let remaining = oversize - sent;
+            let n = remaining.min(chunk.len());
+            // A short write here means the peer closed after responding — the
+            // body cap is doing its job, so treat it as success.
+            if stream.write_all(&chunk[..n]).await.is_err() {
+                break;
+            }
+            sent += n;
+        }
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 413"),
+            "expected 413 Payload Too Large, got: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        // No raw signal must be forwarded for a rejected oversize body.
+        assert!(
+            rx.try_recv().is_err(),
+            "oversize body must not produce a raw signal"
+        );
 
         let _ = shutdown_tx.send(());
         let _ = server.await;
