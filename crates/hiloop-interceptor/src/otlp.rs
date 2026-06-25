@@ -42,9 +42,7 @@ use crate::seams::{
 const OTLP_SOURCE: &str = "otlp";
 const OTLP_TRACES_KIND: &str = "traces";
 const TRACES_PATH: &str = "/v1/traces";
-/// Cap on OTLP request body size (16 MiB). Prevents a misbehaving child
-/// from exhausting wrapper memory via unbounded trace exports.
-const MAX_OTLP_BODY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_OTLP_BODY_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 const DESCRIPTOR: NormalizerDescriptor =
     NormalizerDescriptor::new("otlp-trace", env!("CARGO_PKG_VERSION"), "hiloop.event.v1");
 

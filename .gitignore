@@ -6,9 +6,8 @@
 # Local agent worktrees and session state
 /.claude/
 
-# Secrets and credentials — never commit these
+# Secrets and credentials
 .env
 .env.*
 *.pem
 *.key
-!rust-toolchain.toml
