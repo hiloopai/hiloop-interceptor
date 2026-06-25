@@ -1,6 +1,5 @@
 mod cli;
 mod inspect_cli;
-mod supervisor;
 
 use std::process::ExitCode;
 

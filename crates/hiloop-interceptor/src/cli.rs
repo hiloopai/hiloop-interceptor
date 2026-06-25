@@ -1,9 +1,9 @@
 //! Command-line interface for `hiloop-interceptor`.
 
-use crate::supervisor::{GrpcExportOptions, RunOptions, run};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hiloop_core::identity::{ForkContext, ForkNodeId, ForkPath, RunId};
+use hiloop_interceptor::{GrpcExportOptions, RunOptions, run};
 use std::{path::PathBuf, process::ExitCode};
 
 pub(crate) async fn run_from_args() -> Result<ExitCode> {
@@ -106,7 +106,7 @@ struct RunArgs {
 
     /// Stream captured events to a telemetry gateway over gRPC, e.g.
     /// `https://telemetry.example.com:443`. Composes with `--events-jsonl`. The API token is read
-    /// from the `HILOOP_API_TOKEN` environment variable (never a flag, to keep it out of argv).
+    /// from the `HILOOP_API_KEY` environment variable (never a flag, to keep it out of argv).
     #[arg(long = "export-grpc", env = "HILOOP_TELEMETRY_ENDPOINT")]
     export_grpc: Option<String>,
 
