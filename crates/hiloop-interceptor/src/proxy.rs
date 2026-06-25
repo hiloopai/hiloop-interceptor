@@ -465,7 +465,10 @@ impl Drop for TeeState {
 /// Finalize a teed body's blob and build its offloaded (or fallback) signal.
 /// `size` is the byte count tracked across frames, so the size attribute is
 /// correct even when the blob finalize fails and no `payload_ref` is produced.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the per-frame tee capture state (clock/kind/attrs/writer/size/media_type/truncated) needed to finalize one body; grouping into a struct is deferred"
+)]
 async fn finalize_tee(
     clock: &HlcClock,
     kind: &'static str,

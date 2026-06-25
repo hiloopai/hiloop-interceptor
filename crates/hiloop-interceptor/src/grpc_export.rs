@@ -16,7 +16,8 @@ use tonic::{Request, Status};
     clippy::all,
     clippy::pedantic,
     clippy::nursery,
-    reason = "tonic-prost-build generated code is not ours to lint"
+    clippy::allow_attributes_without_reason,
+    reason = "tonic-prost-build generated code is not ours to lint (incl. its own bare #[allow]s)"
 )]
 pub mod proto {
     tonic::include_proto!("hiloop.telemetry.v1");

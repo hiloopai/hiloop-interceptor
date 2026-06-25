@@ -59,6 +59,9 @@ too_many_lines = "allow"
 used_underscore_binding = "allow"
 dbg_macro = "warn"
 unwrap_used = "warn"
+# Every lint suppression must say why: forces `#[allow(lint, reason = "…")]` / `#[expect(lint,
+# reason = "…")]`. CI runs clippy with `-D warnings`, so a bare `#[allow(lint)]` fails the build.
+allow_attributes_without_reason = "warn"
 
 [profile.release]
 strip = true
