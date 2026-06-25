@@ -1,6 +1,6 @@
 //! Native gRPC exporter: streams normalized events to a hiloop telemetry gateway's
 //! `TelemetryIngestService` over tonic. An authenticated gateway derives the tenant from the
-//! request's Bearer token, so the client leaves `tenant_id` empty there; `project_id` selects the
+//! request's Bearer token, so the client omits `tenant_id` (`None`) there; `project_id` selects the
 //! project to record under. Against an unauthenticated local gateway, set `tenant_id` explicitly.
 
 use crate::seams::{ExportError, Exporter};
@@ -51,7 +51,7 @@ type AuthedClient = TelemetryIngestServiceClient<InterceptedService<Channel, Aut
 /// Ships events to the telemetry gateway over gRPC.
 pub struct GrpcIngestExporter {
     client: AuthedClient,
-    tenant_id: String,
+    tenant_id: Option<String>,
     project_id: String,
 }
 
@@ -61,12 +61,12 @@ impl GrpcIngestExporter {
     /// so a gateway that is briefly unreachable at startup doesn't abort the run (and any local
     /// JSONL sink keeps capturing). TLS (native trust roots) is used unless `insecure` is set (h2c,
     /// local dev only). The Bearer token is read from `HILOOP_API_KEY`; absent/empty means no auth
-    /// header (an unauthenticated dev gateway). Leave `tenant_id` empty against an authenticated
-    /// gateway (it derives the tenant from the token); set it only against a no-auth local gateway.
-    /// `project_id` selects the project.
+    /// header (an unauthenticated dev gateway). Pass `None` for `tenant_id` against an authenticated
+    /// gateway (it derives the tenant from the token); pass `Some(tenant)` only against a no-auth
+    /// local gateway. `project_id` selects the project.
     pub fn connect(
         endpoint: impl Into<String>,
-        tenant_id: impl Into<String>,
+        tenant_id: Option<String>,
         project_id: impl Into<String>,
         insecure: bool,
     ) -> Result<Self, ExportError> {
@@ -93,7 +93,7 @@ impl GrpcIngestExporter {
             TelemetryIngestServiceClient::with_interceptor(channel, AuthInterceptor { bearer });
         Ok(Self {
             client,
-            tenant_id: tenant_id.into(),
+            tenant_id,
             project_id: project_id.into(),
         })
     }
@@ -111,7 +111,10 @@ impl Exporter for GrpcIngestExporter {
         let accepted = client
             .ingest(Request::new(proto::IngestRequest {
                 events: proto_events,
-                tenant_id: self.tenant_id.clone(),
+                // proto3 has no optional scalar here: the empty string is the wire form of
+                // "absent", which is exactly what an authenticated gateway expects (it derives
+                // the tenant from the Bearer token).
+                tenant_id: self.tenant_id.clone().unwrap_or_default(),
                 project_id: self.project_id.clone(),
             }))
             .await

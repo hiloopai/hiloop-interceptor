@@ -48,9 +48,9 @@ pub struct GrpcExportOptions {
     pub endpoint: String,
     /// Use cleartext h2c instead of TLS (local dev gateways only).
     pub insecure: bool,
-    /// Tenant to record under. Empty against an authenticated gateway (it derives the tenant from
-    /// the API token); set only against a no-auth local gateway.
-    pub tenant_id: String,
+    /// Tenant to record under, or `None` against an authenticated gateway (it derives the tenant
+    /// from the API token). Set only against a no-auth local gateway.
+    pub tenant_id: Option<String>,
     /// Project to record events under.
     pub project_id: String,
 }
@@ -235,7 +235,7 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
             exporters.push(Box::new(
                 GrpcIngestExporter::connect(
                     &grpc.endpoint,
-                    &grpc.tenant_id,
+                    grpc.tenant_id.clone(),
                     &grpc.project_id,
                     grpc.insecure,
                 )

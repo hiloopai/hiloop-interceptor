@@ -122,10 +122,10 @@ struct RunArgs {
     )]
     project_id: String,
 
-    /// Tenant to record under when exporting over gRPC. Leave empty against an authenticated
-    /// gateway (it derives the tenant from the API token); set only for a no-auth local gateway.
-    #[arg(long = "tenant-id", env = "HILOOP_TENANT_ID", default_value = "")]
-    tenant_id: String,
+    /// Tenant to record under when exporting over gRPC. Omit against an authenticated gateway
+    /// (it derives the tenant from the API token); set only for a no-auth local gateway.
+    #[arg(long = "tenant-id", env = "HILOOP_TENANT_ID")]
+    tenant_id: Option<String>,
 
     /// Command to wrap. Everything after `--` is passed to the child.
     #[arg(last = true, required = true)]
@@ -143,7 +143,7 @@ impl RunArgs {
         let export_grpc = self.export_grpc.map(|endpoint| GrpcExportOptions {
             endpoint,
             insecure: self.insecure_grpc,
-            tenant_id: self.tenant_id,
+            tenant_id: self.tenant_id.filter(|t| !t.is_empty()),
             project_id: self.project_id,
         });
 

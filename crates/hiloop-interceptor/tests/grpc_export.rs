@@ -98,7 +98,8 @@ async fn exports_events_to_the_gateway_with_tenant_and_project() {
     let endpoint = serve(service).await;
 
     let exporter =
-        GrpcIngestExporter::connect(endpoint, "tenant-x", "proj-y", true).expect("connect");
+        GrpcIngestExporter::connect(endpoint, Some("tenant-x".to_owned()), "proj-y", true)
+            .expect("connect");
 
     let events = vec![log_event("one"), log_event("two")];
     exporter.export(&events).await.expect("export");
@@ -119,10 +120,25 @@ async fn empty_batch_is_a_noop() {
     let recorded = Arc::clone(&service.recorded);
     let endpoint = serve(service).await;
 
-    let exporter = GrpcIngestExporter::connect(endpoint, "", "default", true).expect("connect");
+    let exporter = GrpcIngestExporter::connect(endpoint, None, "default", true).expect("connect");
     exporter.export(&[]).await.expect("empty export");
 
     assert_eq!(recorded.lock().expect("lock").events.len(), 0);
+}
+
+#[tokio::test]
+async fn omitted_tenant_is_empty_on_the_wire() {
+    let service = RecordingService::default();
+    let recorded = Arc::clone(&service.recorded);
+    let endpoint = serve(service).await;
+
+    // `None` tenant (the authenticated-gateway path) collapses to proto3's empty-string "absent".
+    let exporter = GrpcIngestExporter::connect(endpoint, None, "proj-y", true).expect("connect");
+    exporter.export(&[log_event("one")]).await.expect("export");
+
+    let rec = recorded.lock().expect("lock");
+    assert_eq!(rec.tenant_id, "");
+    assert_eq!(rec.project_id, "proj-y");
 }
 
 #[tokio::test]
@@ -134,7 +150,8 @@ async fn accepted_count_mismatch_is_an_error() {
     let endpoint = serve(service).await;
 
     let exporter =
-        GrpcIngestExporter::connect(endpoint, "tenant-x", "proj-y", true).expect("connect");
+        GrpcIngestExporter::connect(endpoint, Some("tenant-x".to_owned()), "proj-y", true)
+            .expect("connect");
     let error = exporter
         .export(&[log_event("one")])
         .await
