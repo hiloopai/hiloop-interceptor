@@ -165,7 +165,7 @@ where
     }
 }
 
-/// Normalizes captured stdout/stderr lines as log events.
+/// Normalizes captured stdin/stdout/stderr lines as log events.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StdioLogNormalizer;
 
@@ -176,7 +176,7 @@ impl Normalizer for StdioLogNormalizer {
     }
 
     fn supports(&self, raw: &RawSignal) -> NormalizerSupport {
-        if raw.source == "stdio" && matches!(raw.kind.as_str(), "stdout" | "stderr") {
+        if raw.source == "stdio" && matches!(raw.kind.as_str(), "stdin" | "stdout" | "stderr") {
             NormalizerSupport::Exact
         } else {
             NormalizerSupport::Unsupported
@@ -189,6 +189,7 @@ impl Normalizer for StdioLogNormalizer {
         raw: RawSignal,
     ) -> Result<NormalizationOutcome, NormalizeError> {
         let event_name = match raw.kind.as_str() {
+            "stdin" => EventName::new("process.stdin"),
             "stdout" => EventName::new("process.stdout"),
             "stderr" => EventName::new("process.stderr"),
             _ => {
@@ -284,7 +285,7 @@ mod tests {
     async fn rejects_unknown_stdio_kind() {
         let raw = RawSignal::new(
             "stdio",
-            "stdin",
+            "stdaux",
             Hlc {
                 wall_ns: 1,
                 logical: 0,

@@ -329,6 +329,7 @@ where
     let mut child = Command::new(&options.command[0]);
     child
         .args(&options.command[1..])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -353,6 +354,10 @@ where
         .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
     let child_pid = child.id();
     let process = child_process_context(options, child_pid);
+    let child_stdin = child
+        .stdin
+        .take()
+        .context("child stdin was not available for capture")?;
     let stdout = child
         .stdout
         .take()
@@ -383,6 +388,27 @@ where
         signal_tx.clone(),
         Arc::clone(&clock),
     );
+    // stdin: pump the parent's stdin into the child while capturing it as `process.stdin` events.
+    // Unlike stdout/stderr (which EOF when the child exits), the parent's stdin may never close (an
+    // interactive TTY), so a child-exit shutdown signal cancels the pump instead of blocking teardown.
+    // When the pump ends — parent EOF or shutdown — `child_stdin` drops, closing the child's stdin.
+    let (stdin_shutdown_tx, stdin_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let stdin_capture = {
+        let signal_tx = signal_tx.clone();
+        let clock = Arc::clone(&clock);
+        async move {
+            tokio::select! {
+                result = capture_stream(
+                    tokio::io::stdin(),
+                    child_stdin,
+                    "stdin",
+                    signal_tx,
+                    clock,
+                ) => result,
+                _ = stdin_shutdown_rx => Ok(()),
+            }
+        }
+    };
 
     let (otlp_shutdown_tx, otlp_server) = match otlp_receiver {
         Some(receiver) => {
@@ -440,6 +466,9 @@ where
         let status = with_signal_forwarding(child_pid, child.wait())
             .await
             .with_context(|| format!("failed to wait for child command `{}`", options.command[0]));
+        // Stop the stdin pump (its source may never EOF) and the capture servers; dropping their
+        // senders lets the pipeline drain and finish.
+        let _ = stdin_shutdown_tx.send(());
         for shutdown_tx in [otlp_shutdown_tx, proxy_shutdown_tx].into_iter().flatten() {
             let _ = shutdown_tx.send(());
         }
@@ -459,20 +488,23 @@ where
         }
     };
 
-    let (status_result, stdout_result, stderr_result, (), (), pipeline_result) = Box::pin(async {
-        tokio::join!(
-            child_and_shutdown,
-            stdout_capture,
-            stderr_capture,
-            otlp_task,
-            proxy_task,
-            async { pipeline.await.context("stdio event pipeline failed") },
-        )
-    })
-    .await;
+    let (status_result, stdin_result, stdout_result, stderr_result, (), (), pipeline_result) =
+        Box::pin(async {
+            tokio::join!(
+                child_and_shutdown,
+                stdin_capture,
+                stdout_capture,
+                stderr_capture,
+                otlp_task,
+                proxy_task,
+                async { pipeline.await.context("stdio event pipeline failed") },
+            )
+        })
+        .await;
 
     let status = status_result?;
     pipeline_result?;
+    stdin_result.context("failed to capture child stdin")?;
     stdout_result.context("failed to capture child stdout")?;
     stderr_result.context("failed to capture child stderr")?;
 

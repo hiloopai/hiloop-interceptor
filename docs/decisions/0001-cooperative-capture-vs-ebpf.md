@@ -34,10 +34,11 @@ outbound telemetry (e.g. its Datadog export — kept on purpose; it's signal), a
 
 Reachable extensions, in rough priority:
 
-1. **stdin** — the operator's prompts into the harness. Symmetric with the existing stdout/stderr
-   capture; a worthwhile near-term add (does not need eBPF).
+1. **stdin** — the operator's prompts into the harness. **Done:** the supervisor pumps the parent's
+   stdin to the child while capturing it as `process.stdin` log events (cancelled on child exit so an
+   interactive TTY can't hang teardown). No eBPF needed.
 2. **child process tree / exec** — tools the harness shells out to. Partially visible via the proxy
    (their network) and the harness's own spans; full syscall-level coverage needs ptrace/eBPF.
 3. **file I/O** — reads/writes the harness performs. Needs eBPF/`fanotify`; sandbox-era.
 
-Items 2–3 are the eBPF case and stay deferred to the sandbox. Item 1 is a fast follow here.
+Items 2–3 are the eBPF case and stay deferred to the sandbox.

@@ -94,7 +94,7 @@ From one `claude -p "…"` (`inspect` output):
   net  http.request  mcp.slack.com / mcp.notion.com / mcp.linear.app   # MCP tool traffic
   net  http.request  http-intake.…datadoghq.com                        # the harness's own telemetry
   net  http.response …                                                 # paired responses
-  log  process.stdout / process.stderr                                 # the harness's console output
+  log  process.stdin / process.stdout / process.stderr                 # the operator's input + console output
 ```
 
 Each `llm`/`net` event carries the decrypted request/response body by `payload_ref` into the blob

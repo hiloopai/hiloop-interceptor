@@ -113,6 +113,59 @@ async fn capture_tees_mixed_stdio_and_links_raw_observations() {
 }
 
 #[tokio::test]
+async fn captures_and_tees_stdin_to_the_child() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let mut command = interceptor_command();
+    command.arg("--events-jsonl").arg(&events_path);
+    // `cat` echoes its stdin to its stdout, so a successful tee shows up on the child's stdout.
+    command
+        .arg("--")
+        .arg("cat")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = command.spawn().expect("spawn interceptor");
+    {
+        let mut stdin = child.stdin.take().expect("interceptor stdin");
+        stdin
+            .write_all(b"hello from stdin\n")
+            .await
+            .expect("write stdin");
+        // Dropping the handle closes the interceptor's stdin → EOF → the pump closes the child's
+        // stdin → `cat` exits.
+    }
+    let output = tokio::time::timeout(E2E_TIMEOUT, child.wait_with_output())
+        .await
+        .expect("interceptor stdin scenario timed out")
+        .expect("run interceptor");
+
+    assert!(output.status.success(), "child exited non-zero: {output:?}");
+    // The input was teed through the interceptor → cat → back out: child stdout echoes it verbatim.
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        "hello from stdin\n"
+    );
+
+    // …and it was captured as a fork-stamped process.stdin log event.
+    let events = read_jsonl(&events_path);
+    let stdin_events = events
+        .iter()
+        .filter(|event| event["name"] == "process.stdin")
+        .collect::<Vec<_>>();
+    assert_eq!(stdin_events.len(), 1, "exactly one stdin line captured");
+    let event = stdin_events[0];
+    assert_eq!(event["signal"], "log");
+    assert_eq!(event["attributes"]["stream"], "stdin");
+    assert_eq!(event["attributes"]["source"], "stdio");
+    assert_eq!(event["attributes"]["message"], "hello from stdin");
+    assert_eq!(event["run_id"], RUN_ID);
+}
+
+#[tokio::test]
 async fn capture_is_lossless_and_ordered_per_stream_under_load() {
     const LINE_COUNT: usize = 512;
 
