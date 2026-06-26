@@ -64,6 +64,45 @@ fn jsonl_error(error: serde_json::Error) -> ExportError {
     ExportError::with_source("jsonl", "failed to encode event as JSON", error)
 }
 
+/// Fans every batch out to several exporters (e.g. local JSONL + the telemetry gateway), so one wrap
+/// can both keep a local trail and stream to the backend. Every exporter is attempted on each call;
+/// the first error is returned afterward so a failing sink (e.g. a gateway outage) is surfaced without
+/// preventing the others from receiving the batch.
+pub struct FanoutExporter {
+    exporters: Vec<Box<dyn Exporter>>,
+}
+
+impl FanoutExporter {
+    /// Builds a fanout over `exporters`.
+    #[must_use]
+    pub fn new(exporters: Vec<Box<dyn Exporter>>) -> Self {
+        Self { exporters }
+    }
+}
+
+#[async_trait]
+impl Exporter for FanoutExporter {
+    async fn export(&self, events: &[Event]) -> Result<(), ExportError> {
+        let mut first_error = None;
+        for exporter in &self.exporters {
+            if let Err(error) = exporter.export(events).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn flush(&self) -> Result<(), ExportError> {
+        let mut first_error = None;
+        for exporter in &self.exporters {
+            if let Err(error) = exporter.flush().await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use hiloop_core::{

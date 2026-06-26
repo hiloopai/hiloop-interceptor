@@ -34,6 +34,14 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
+# gRPC client for the telemetry-gateway Ingest exporter (HIL-82). TLS via rustls/ring with bundled
+# webpki roots so the binary connects to the public TLS endpoint without a system trust dependency.
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+# Bundles a protoc binary so the build needs no system protobuf install (keeps the OSS build /
+# `cargo install` self-contained).
+protoc-bin-vendored = "3"
 ulid = { version = "1", features = ["serde"] }
 
 [workspace.lints.rust]

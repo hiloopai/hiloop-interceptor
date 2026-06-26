@@ -36,6 +36,16 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+# gRPC client for the telemetry-gateway Ingest exporter (HIL-82). tonic-prost carries the prost
+# message integration for the codegen the build script emits from proto/.
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+# Generates the TelemetryIngestService client from the vendored ingest proto (the public wire
+# contract; see proto/hiloop/telemetry/v1/telemetry.proto).
+tonic-prost-build.workspace = true
+protoc-bin-vendored.workspace = true
 
 # Signal forwarding and process-group teardown are Unix-only (the wrapper's
 # PID-1/supervisor product scope). nix is available to the binary and the

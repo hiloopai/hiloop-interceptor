@@ -5,8 +5,9 @@ use bytes::Bytes;
 use hiloop_core::identity::ForkContext;
 use hiloop_interceptor::{
     blob::DirBlobStore,
-    exporters::JsonlExporter,
+    exporters::{FanoutExporter, JsonlExporter},
     framing::LineFramer,
+    grpc_export::GrpcExporter,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
     pipeline::{Pipeline, PipelineOptions},
     proxy::{ProxyCa, ProxyNormalizer, ProxyServer},
@@ -46,6 +47,23 @@ pub(crate) struct RunOptions {
     otlp: bool,
     proxy: bool,
     max_capture_bytes: Option<u64>,
+    telemetry: TelemetryOptions,
+}
+
+/// Where to stream captured events over gRPC. All three fields move together (an endpoint is
+/// useless without a token + project), so they validate as a unit in [`RunOptions::telemetry_target`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TelemetryOptions {
+    pub endpoint: Option<String>,
+    pub token: Option<String>,
+    pub project: Option<String>,
+}
+
+/// A fully-specified telemetry export target.
+pub(crate) struct TelemetryTarget<'a> {
+    pub endpoint: &'a str,
+    pub token: &'a str,
+    pub project: String,
 }
 
 impl RunOptions {
@@ -59,6 +77,7 @@ impl RunOptions {
         otlp: bool,
         proxy: bool,
         max_capture_bytes: Option<u64>,
+        telemetry: TelemetryOptions,
     ) -> Self {
         Self {
             context,
@@ -69,6 +88,28 @@ impl RunOptions {
             otlp,
             proxy,
             max_capture_bytes,
+            telemetry,
+        }
+    }
+
+    /// The validated telemetry target, or `None` when no telemetry flags were given. Errors if the
+    /// trio is given partially (e.g. an endpoint without a token or project).
+    fn telemetry_target(&self) -> Result<Option<TelemetryTarget<'_>>> {
+        let t = &self.telemetry;
+        match (
+            t.endpoint.as_deref(),
+            t.token.as_deref(),
+            t.project.as_deref(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(endpoint), Some(token), Some(project)) => Ok(Some(TelemetryTarget {
+                endpoint,
+                token,
+                project: project.to_owned(),
+            })),
+            _ => bail!(
+                "--telemetry-endpoint, --telemetry-token, and --telemetry-project must be given together"
+            ),
         }
     }
 }
@@ -151,23 +192,44 @@ pub(crate) async fn run(options: &RunOptions) -> Result<ExitCode> {
         bail!("--raw-jsonl requires --events-jsonl so raw capture and normalization run together");
     }
 
-    if options.otlp && options.events_jsonl.is_none() {
-        bail!("--otlp requires --events-jsonl so received telemetry has an exporter");
+    // Build the sink set: local JSONL and/or the telemetry gateway. Both can run together, so a
+    // single wrap keeps a local trail AND streams to the backend.
+    let telemetry = options.telemetry_target()?;
+    let mut sinks: Vec<Box<dyn Exporter>> = Vec::new();
+    if let Some(path) = &options.events_jsonl {
+        sinks.push(Box::new(JsonlExporter::create(path).await.with_context(
+            || {
+                format!(
+                    "failed to create JSONL event exporter at `{}`",
+                    path.display()
+                )
+            },
+        )?));
+    }
+    if let Some(target) = &telemetry {
+        sinks.push(Box::new(
+            GrpcExporter::connect(target.endpoint, target.token, target.project.clone())
+                .with_context(|| {
+                    format!(
+                        "failed to connect telemetry exporter to `{}`",
+                        target.endpoint
+                    )
+                })?,
+        ));
     }
 
-    if options.proxy && (options.events_jsonl.is_none() || options.blob_dir.is_none()) {
+    if options.otlp && sinks.is_empty() {
+        bail!("--otlp requires an exporter: --events-jsonl and/or --telemetry-endpoint");
+    }
+
+    if options.proxy && (sinks.is_empty() || options.blob_dir.is_none()) {
         bail!(
-            "--proxy requires --events-jsonl and --blob-dir so captured bodies are streamed to the blob store"
+            "--proxy requires --blob-dir and an exporter (--events-jsonl and/or --telemetry-endpoint) so captured bodies are streamed and events have a sink"
         );
     }
 
-    if let Some(path) = &options.events_jsonl {
-        let exporter = JsonlExporter::create(path).await.with_context(|| {
-            format!(
-                "failed to create JSONL event exporter at `{}`",
-                path.display()
-            )
-        })?;
+    if !sinks.is_empty() {
+        let exporter = FanoutExporter::new(sinks);
         if let Some(raw_path) = &options.raw_jsonl {
             let raw_store = JsonlRawStore::create(raw_path).await.with_context(|| {
                 format!(
@@ -790,6 +852,7 @@ mod tests {
             false,
             false,
             None,
+            TelemetryOptions::default(),
         );
 
         let error = Box::pin(run_captured(&options, &FailingExporter, None))
