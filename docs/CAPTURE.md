@@ -109,9 +109,12 @@ reshape happen under lower complexity, before the proxy's TLS + large-body conce
 2. Smallest security surface to ship first.
 3. It de-risks the `Source` trait redesign (lifecycle + config) under a simple server before the
    proxy adds TLS and large-body offload.
-4. The proxy remains the eventual differentiator for universal, cooperation-free coverage — built
-   second, on a `Source` API that has already settled, and with the per-provider `llm.*` semantic
-   enrichers the proxy needs anyway.
+4. The proxy is the broader-coverage tier — it captures any client that honors proxy env + the
+   injected CA (not just OTEL-emitting ones), built second on a `Source` API that has already settled,
+   with the per-provider `llm.*` semantic enrichers it needs anyway. Note it is still **cooperative**
+   (env injection), not cooperation-free; client-agnostic capture (pinned/mTLS clients) is the
+   sandbox-only eBPF tier — see
+   [`decisions/0001-cooperative-capture-vs-ebpf.md`](./decisions/0001-cooperative-capture-vs-ebpf.md).
 
 Counter-argument worth weighing: if the harnesses we actually want to dogfood **don't** emit OTEL,
 OTLP-first captures nothing useful and the proxy is the only path to value — in which case build the
