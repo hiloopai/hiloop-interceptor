@@ -47,12 +47,21 @@ Add `--proxy` (with `--events-jsonl` and `--blob-dir`) to run an embedded MITM p
 mints an ephemeral CA, injects `HTTPS_PROXY` plus a child-scoped CA bundle, decrypts the harness's
 HTTPS traffic, and emits fork-stamped `net` events (`llm` for known LLM API hosts). Bodies are
 streamed frame-by-frame into a content-addressed blob store (`--blob-dir`), so events carry only a
-`payload_ref` and memory stays bounded even for streaming/SSE responses. This captures traffic
-regardless of harness cooperation.
+`payload_ref` and memory stays bounded even for streaming/SSE responses.
 
 ```sh
 cargo run -p hiloop-interceptor -- run --proxy --events-jsonl ./events.jsonl --blob-dir ./blobs -- <harness command>
 ```
+
+> **Cooperative capture, not transparent interception.** The proxy injects proxy + CA-trust env vars
+> (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`) into
+> the wrapped child only — it never touches the machine root trust store. So it decrypts HTTPS for
+> clients that honor the proxy env and trust the injected CA (Node, Python `requests`, `curl`, and most
+> SDKs — Claude Code, for one, is captured fully). It does **not** capture certificate-pinned clients,
+> mTLS, clients with a hardcoded trust store, or clients that ignore the proxy env. Guaranteed,
+> client-agnostic capture needs kernel-level interception (eBPF) and belongs to the sandbox runtime,
+> not this laptop-side wrapper — see
+> [`docs/decisions/0001-cooperative-capture-vs-ebpf.md`](./docs/decisions/0001-cooperative-capture-vs-ebpf.md).
 
 Add `--export-grpc <URL>` to stream captured events to a hiloop telemetry gateway over gRPC. It
 composes with `--events-jsonl` (list both to keep a local JSONL durability log alongside the remote
@@ -72,6 +81,26 @@ cargo run -p hiloop-interceptor -- \
   --events-jsonl ./events.jsonl -- <harness command>
 ```
 
+## What it captures
+
+Wrapping a real Claude Code turn with `--proxy --otlp` captures the whole footprint of the harness —
+its LLM calls, every tool/MCP request, its own telemetry export, and its stdio — all fork-stamped.
+From one `claude -p "…"` (`inspect` output):
+
+```
+57 events across 1 fork path(s)
+  signals: llm=13 log=2 net=42
+  llm  http.request  api.anthropic.com          # the model calls (request/response bodies → blob store)
+  net  http.request  mcp.slack.com / mcp.notion.com / mcp.linear.app   # MCP tool traffic
+  net  http.request  http-intake.…datadoghq.com                        # the harness's own telemetry
+  net  http.response …                                                 # paired responses
+  log  process.stdout / process.stderr                                 # the harness's console output
+```
+
+Each `llm`/`net` event carries the decrypted request/response body by `payload_ref` into the blob
+store (content-addressed, so identical bodies dedupe and memory stays bounded for SSE). Capturing the
+harness's *own* telemetry (the Datadog export above) is intentional — it's signal, not noise.
+
 Inspect a captured events file — counts grouped by fork-tree node, or how two branches diverged:
 
 ```sh
@@ -80,10 +109,11 @@ cargo run -p hiloop-interceptor -- inspect ./events.jsonl --diff /0 /1
 ```
 
 The integration tests wrap a real command and assert child output is teed while fork-stamped stdio
-events are flushed to JSONL, and that an OTLP trace export from the child is captured as fork-stamped
-events. That proves the supervisor, env stamping, OTLP ingest, local normalization, and exporter
-seam wiring. It does not yet prove HTTPS proxy capture, ClickHouse export, or harness-aware semantic
-normalization; those are still planned behind the existing seams.
+events are flushed to JSONL, that an OTLP trace export from the child is captured, and that the MITM
+proxy captures decrypted HTTPS and correlates request/response over chunked upstreams. That proves
+the supervisor, env stamping, OTLP ingest, proxy capture, local normalization, and exporter seam
+wiring. ClickHouse export and harness-aware semantic normalization are still planned behind the
+existing seams.
 
 ## Workspace
 
