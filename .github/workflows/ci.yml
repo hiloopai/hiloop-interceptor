@@ -61,5 +61,4 @@ jobs:
       - name: check MSRV
         run: cargo +"${{ steps.msrv.outputs.version }}" check --workspace --all-targets --all-features --locked
   # TODO: add a `bench` job that records (does NOT gate) criterion + iai-callgrind
-  # results to Bencher Self-Hosted — "record-don't-gate" until SLOs are real (R18).
-  # TODO: add release packaging (cargo-dist) once we pick install channels.
+  # results to Bencher Self-Hosted — "record-don't-gate" until SLOs are real.

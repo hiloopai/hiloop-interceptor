@@ -7,7 +7,7 @@ edition = "2024"
 rust-version = "1.96.0"
 license = "MIT OR Apache-2.0"
 authors = ["hiloop"]
-repository = "https://github.com/tboser/hiloop-interceptor"
+repository = "https://github.com/hiloopai/hiloop-interceptor"
 
 [workspace.dependencies]
 anyhow = "1"

@@ -2,15 +2,13 @@ syntax = "proto3";
 
 package hiloop.telemetry.v1;
 
-// CANONICAL SOURCE: this file is a TRACKED COPY of the monorepo's
-// proto/hiloop/telemetry/v1/telemetry.proto (hiloopai/hiloop, ADR 0033 §3). Edit the canonical
-// copy there first, then re-vendor here; do not diverge. The golden-fixture coverage test in
-// crates/hiloop-interceptor/src/grpc_export.rs guards that this proto's Event and
-// hiloop_core::event::Event stay field-for-field in lockstep through the wire conversion.
+// Vendored copy of the canonical telemetry-gateway contract that consumes the interceptor's
+// fork-stamped events. Keep it in lockstep with hiloop_core::event::Event: the golden-fixture
+// coverage test in crates/hiloop-interceptor/src/grpc_export.rs guards that this proto's Event and
+// hiloop_core::event::Event stay field-for-field aligned through the wire conversion.
 //
 // The wire form of the interceptor's fork-stamped telemetry event (Event v1). The in-process
-// logical contract is hiloop_core::event::Event; this proto owns the network boundary. See
-// docs/technical/telemetry-store.md.
+// logical contract is hiloop_core::event::Event; this proto owns the network boundary.
 
 // Hybrid logical clock: causal event time.
 message Hlc {

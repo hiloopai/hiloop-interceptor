@@ -57,7 +57,7 @@ pub struct GrpcIngestExporter {
 
 impl GrpcIngestExporter {
     /// Build a lazily-connected exporter for `endpoint` (e.g.
-    /// `https://telemetry.staging.hiloop.ai:443`). The channel connects on first export, not here,
+    /// `https://telemetry.example.com:443`). The channel connects on first export, not here,
     /// so a gateway that is briefly unreachable at startup doesn't abort the run (and any local
     /// JSONL sink keeps capturing). TLS (native trust roots) is used unless `insecure` is set (h2c,
     /// local dev only). The Bearer token is read from `HILOOP_API_KEY`; absent/empty means no auth

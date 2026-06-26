@@ -1,15 +1,13 @@
-# Capture Surfaces — Design & Decision (WS-B)
+# Capture Surfaces — Design & Decision
 
-**Status:** decision doc, nothing implemented yet. This compares the two candidate first
-network-capture surfaces so we can pick one deliberately. It refines, and defers to,
-`../agent-harness-infra/design/DESIGN.md` §2 (interception wrapper) and the seam contracts in
-[`INTERFACES.md`](INTERFACES.md).
+**Status:** decision doc. This compares the two candidate first network-capture surfaces so we
+can pick one deliberately. It builds on the seam contracts in [`INTERFACES.md`](INTERFACES.md).
 
 ## Why this decision matters
 
 Today the only real capture surface is stdout/stderr line capture. That proves the
 spine/pipeline/exporter plumbing but not the product thesis: an agent harness's *interesting*
-behavior — LLM calls, tool calls — happens over HTTPS, not on stdout. WS-B adds the first surface
+behavior — LLM calls, tool calls — happens over HTTPS, not on stdout. This work adds the first surface
 that captures that. Two candidates, very different cost/risk/coverage profiles. Both are **Tier-1
 cooperative** mechanisms (env injection); the sandbox-only transparent-redirect and eBPF tiers
 (DESIGN.md §2) stay deferred behind the same `Source` seam.
@@ -124,7 +122,7 @@ first dogfooding harness emit OpenTelemetry?**
 ## Dependency selection — OTLP receiver (verified 2026-06)
 
 Versions were web-checked against crates.io for the newest viable releases, not pinned to whatever
-was already in cache. Recorded so the next person can re-evaluate, and so the proxy (WS-B2) follows
+was already in cache. Recorded so the next person can re-evaluate, and so the proxy follows
 the same discipline.
 
 | Crate | Version | Why |
@@ -210,9 +208,7 @@ to a local directory (now blake3-keyed) and the `Event` carries only the `payloa
 nothing yet uploads the bytes to the telemetry backend, so a digest is currently unresolvable
 downstream. The `BlobUploader` seam (`src/blob.rs`) sketches the edge side of the upload — a
 digest-first `find_missing` + `upload` with a `NoopUploader` default — but the hosted uploader and
-the wire protocol are deferred to the private repo. The cross-repo design and the recommended
-ingestion-interface shape are in [`PAYLOAD-HANDOFF.md`](PAYLOAD-HANDOFF.md) and the interceptor-side
-reply [`PAYLOAD-HANDOFF-RESPONSE.md`](PAYLOAD-HANDOFF-RESPONSE.md). Capture size is bounded by
+the wire protocol are out of scope for this repository. Capture size is bounded by
 `--max-capture-bytes` (default unlimited): bodies over the cap are captured up to it, marked
 `http.capture.truncated`, and still forwarded in full to the client.
 

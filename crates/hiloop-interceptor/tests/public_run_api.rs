@@ -1,4 +1,4 @@
-//! The embeddable `run` library surface (HIL-98a, ADR 0033 §4): a downstream crate
+//! The embeddable `run` library surface: a downstream crate
 //! like the product CLI builds a `ForkContext`, optional `GrpcExportOptions`, and a
 //! `RunOptions`, then awaits `hiloop_interceptor::run`. These tests pin that surface
 //! through the crate-root re-exports and assert the child's exit code passes through.

@@ -2,7 +2,7 @@
 //!
 //! This is the embeddable entrypoint: build a [`RunOptions`] and call [`run`] to
 //! supervise a child command, capturing its telemetry into the configured sinks.
-//! The product CLI embeds this crate to provide `hiloop run -- <agent>` (ADR 0033).
+//! A downstream CLI can embed this crate to provide a `run -- <agent>` command.
 
 use crate::{
     blob::DirBlobStore,

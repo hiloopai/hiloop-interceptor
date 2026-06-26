@@ -1,6 +1,8 @@
 # Contributing
 
-Pre-alpha; external contributions aren't being solicited yet. Internal workflow:
+Early alpha — APIs and the event schema are still moving, so please open an issue to discuss
+anything substantial before sending a large change. Bug reports, small fixes, and focused PRs
+are welcome. The workflow:
 
 - Follow [`docs/RUST_STYLE.md`](./docs/RUST_STYLE.md) for Rust code style, docs, and test shape.
 - `cargo fmt --all --check` must pass.
@@ -14,7 +16,7 @@ Pre-alpha; external contributions aren't being solicited yet. Internal workflow:
   compiled-binary mock-harness scenarios directly.
 - If `cargo-deny` is installed, `cargo deny check` must pass before dependency changes merge.
 - Each wrapper seam (`Source`, `Normalizer`, `Exporter`, …) ships with a **conformance suite**
-  run against every implementation incl. a mock. See [`HANDOFF.md`](./HANDOFF.md) for sequencing.
+  run against every implementation incl. a mock — see [`docs/TESTING.md`](./docs/TESTING.md).
 - Performance: we **record, not gate** (criterion + iai-callgrind → Bencher) until SLOs
   come from real workloads.
 - Follow [`docs/TESTING.md`](./docs/TESTING.md) for the behavior contract, test ladder, and rules

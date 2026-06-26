@@ -1,6 +1,8 @@
 # hiloop-interceptor
 
-> ⚠️ Pre-alpha scaffold. APIs, layout, and behavior will change. Not yet usable.
+> ⚠️ Early alpha. It works today — it wraps a real agent harness and captures its
+> LLM calls, network traffic, telemetry, and stdio end-to-end — but APIs, flags, and the
+> event schema will still change. Pin a commit if you depend on it.
 
 The **interception wrapper** for agent harnesses. It runs anywhere — your laptop or
 inside a sandbox — wraps your harness command, and captures its telemetry (OpenTelemetry,
@@ -14,10 +16,13 @@ private monorepo.
 
 ## Status
 
-Phase 0 — scaffolding. See [`HANDOFF.md`](./HANDOFF.md) for the plan, the design context,
-and the remaining structural questions.
+Early alpha. The core capture path — fork-tree identity stamping, stdio/OTLP/HTTPS-proxy
+capture, JSONL and gRPC export — works end-to-end and is covered by the integration suite.
+What's still evolving: the event schema, harness-aware semantic normalization, and
+additional export sinks. See [`docs/INTERFACES.md`](./docs/INTERFACES.md) for the architecture
+and seam design, and [`docs/TESTING.md`](./docs/TESTING.md) for the behavior contract.
 
-## Quick start (scaffold)
+## Quick start
 
 ```sh
 cargo run -p hiloop-interceptor -- run -- echo hello
@@ -157,11 +162,21 @@ cargo test -p hiloop-interceptor --test interceptor_e2e --all-features --locked
 dependency, license, or lockfile changes. GitHub Dependency Review runs on PRs, and GitHub CodeQL
 default setup should be enabled in repository security settings.
 
-## Install (eventually)
+## Install
 
-Planned channels (none live yet): `cargo install hiloop-interceptor`, prebuilt binaries via
-GitHub Releases (cargo-dist), Homebrew tap, a `curl | sh` installer, and a container image.
-See HANDOFF.
+Prebuilt binaries for Linux (x86_64, arm64), macOS (Intel, Apple Silicon), and Windows (x86_64)
+are attached to every [GitHub Release](https://github.com/hiloopai/hiloop-interceptor/releases).
+Download the archive for your platform, verify it against the published `.sha256`, extract
+`hiloop-interceptor`, and put it on your `PATH`.
+
+Prefer to build from source:
+
+```sh
+cargo install --git https://github.com/hiloopai/hiloop-interceptor hiloop-interceptor
+```
+
+GitHub Releases is the only distribution channel; this tool is intentionally **not** published to
+crates.io.
 
 ## License
 
