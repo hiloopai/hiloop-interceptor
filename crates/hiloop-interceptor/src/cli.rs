@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hiloop_core::identity::{ForkContext, ForkNodeId, ForkPath, RunId};
-use hiloop_interceptor::pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL};
+use hiloop_interceptor::pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL_MS};
 use hiloop_interceptor::{GrpcExportOptions, RunOptions, run};
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
@@ -144,7 +144,7 @@ struct RunArgs {
     #[arg(
         long = "export-flush-interval-ms",
         env = "HILOOP_EXPORT_FLUSH_INTERVAL_MS",
-        default_value_t = DEFAULT_EXPORT_FLUSH_INTERVAL.as_millis() as u64,
+        default_value_t = DEFAULT_EXPORT_FLUSH_INTERVAL_MS,
     )]
     export_flush_interval_ms: u64,
 
@@ -168,7 +168,6 @@ impl RunArgs {
             project_id: self.project_id,
         });
 
-        // 0ms is the documented off switch; any positive value becomes the age trigger.
         let export_flush_interval = (self.export_flush_interval_ms > 0)
             .then(|| Duration::from_millis(self.export_flush_interval_ms));
 

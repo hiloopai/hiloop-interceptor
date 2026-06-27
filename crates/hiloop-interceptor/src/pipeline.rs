@@ -14,12 +14,16 @@ use tokio::sync::mpsc;
 /// Default export batch size: the partial batch is shipped once this many events accumulate.
 pub const DEFAULT_EXPORT_BATCH_SIZE: usize = 128;
 
+/// [`DEFAULT_EXPORT_FLUSH_INTERVAL`] in milliseconds — the form a CLI exposes as an integer flag.
+pub const DEFAULT_EXPORT_FLUSH_INTERVAL_MS: u64 = 1000;
+
 /// Default age trigger: a partial batch that has been waiting this long is shipped even if it has
 /// not reached [`DEFAULT_EXPORT_BATCH_SIZE`]. This bounds how long any one event sits in the buffer
 /// before it reaches the exporter (and therefore a live tail), trading a little batching efficiency
 /// for interactive latency. One second sits in the 1–2s low-latency window general batch-exporter
 /// guidance recommends; intervals below ~500ms tend to produce many tiny exports for little gain.
-pub const DEFAULT_EXPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+pub const DEFAULT_EXPORT_FLUSH_INTERVAL: Duration =
+    Duration::from_millis(DEFAULT_EXPORT_FLUSH_INTERVAL_MS);
 
 /// Bounded queue and batching settings for one pipeline run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,8 +431,8 @@ where
                     None => break,
                 },
                 () = age_trigger => {
-                    // The oldest buffered event has waited a full interval: ship the partial batch
-                    // so it reaches the exporter (and any live tail) without waiting for EOF.
+                    // Only armed while a partial batch waits, so this is reached with events
+                    // buffered; the guard stays defensive against a spurious wake.
                     if !batch.is_empty() {
                         exporter.export(&batch).await?;
                         batch.clear();
