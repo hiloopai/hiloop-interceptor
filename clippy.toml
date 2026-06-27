@@ -1,0 +1,13 @@
+doc-valid-idents = [
+  "API",
+  "CAS",
+  "HLC",
+  "HTTP",
+  "HTTPS",
+  "LLM",
+  "OTEL",
+  "OTLP",
+  "PID",
+  "ULID",
+  "..",
+]

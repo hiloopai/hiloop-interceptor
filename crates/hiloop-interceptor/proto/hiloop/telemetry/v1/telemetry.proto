@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+package hiloop.telemetry.v1;
+
+// Vendored copy of the canonical telemetry-gateway contract that consumes the interceptor's
+// fork-stamped events. Keep it in lockstep with hiloop_core::event::Event: the golden-fixture
+// coverage test in crates/hiloop-interceptor/src/grpc_export.rs guards that this proto's Event and
+// hiloop_core::event::Event stay field-for-field aligned through the wire conversion.
+//
+// The wire form of the interceptor's fork-stamped telemetry event (Event v1). The in-process
+// logical contract is hiloop_core::event::Event; this proto owns the network boundary.
+
+// Hybrid logical clock: causal event time.
+message Hlc {
+  uint64 wall_ns = 1;
+  uint32 logical = 2;
+}
+
+// A typed scalar attribute value (mirrors the Event v1 narrow value model).
+message AttributeValue {
+  oneof value {
+    string string_value = 1;
+    int64 int_value = 2;
+    double double_value = 3;
+    bool bool_value = 4;
+  }
+}
+
+// Reference to a large payload offloaded to the content-addressed blob store.
+message PayloadRef {
+  string digest = 1;
+  optional string media_type = 2;
+  optional uint64 size_bytes = 3;
+}
+
+message Event {
+  Hlc ts = 1;
+  string run_id = 2;
+  string fork_node_id = 3;
+  string fork_path = 4;
+  string signal = 5;
+  string name = 6;
+  map<string, AttributeValue> attributes = 7;
+  optional PayloadRef payload_ref = 8;
+  // Interceptor-minted stable identity (ULID) for idempotent ingest. Empty until the interceptor
+  // stamps it; the backend then derives a deterministic blake3 fallback so dedup stays correct.
+  string event_id = 9;
+}
+
+// tenant_id and project_id are request-level: the backend assigns them from the authenticated
+// request context (api_key -> tenant) and stamps every event in the batch. They are deliberately
+// absent from Event so the untrusted per-event payload can never set its own tenancy.
+message IngestRequest {
+  repeated Event events = 1;
+  string tenant_id = 2;
+  string project_id = 3;
+}
+
+message IngestResponse {
+  uint64 accepted = 1;
+}
+
+message IngestStreamRequest {
+  repeated Event events = 1;
+  string tenant_id = 2;
+  string project_id = 3;
+}
+
+message IngestStreamResponse {
+  uint64 accepted = 1;
+}
+
+service TelemetryIngestService {
+  rpc Ingest(IngestRequest) returns (IngestResponse);
+  // Streamed: many batches over one long-lived connection.
+  rpc IngestStream(stream IngestStreamRequest) returns (IngestStreamResponse);
+}

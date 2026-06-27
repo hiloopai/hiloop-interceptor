@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: install rust toolchain
+        run: rustup toolchain install --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: check
+        run: cargo check --workspace --all-targets --all-features --locked
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+      - name: tests including mock harness e2e
+        run: cargo test --workspace --all-targets --all-features --locked
+      - name: doctests
+        run: cargo test --workspace --doc --all-features --locked
+      - name: install cargo-deny
+        run: cargo install cargo-deny --version 0.19.8 --locked
+      - name: cargo deny
+        run: cargo deny check
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: resolve and verify MSRV
+        id: msrv
+        run: |
+          cargo_version="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          toolchain_version="$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)"
+          if [ "$cargo_version" != "$toolchain_version" ]; then
+            echo "::error::Cargo.toml rust-version ($cargo_version) must match rust-toolchain.toml channel ($toolchain_version)"
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+      - name: install MSRV toolchain
+        run: rustup toolchain install "${{ steps.msrv.outputs.version }}" --profile minimal
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: check MSRV
+        run: cargo +"${{ steps.msrv.outputs.version }}" check --workspace --all-targets --all-features --locked
+  # TODO: add a `bench` job that records (does NOT gate) criterion + iai-callgrind
+  # results to Bencher Self-Hosted — "record-don't-gate" until SLOs are real.

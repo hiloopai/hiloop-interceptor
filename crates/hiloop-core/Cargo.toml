@@ -1,0 +1,22 @@
+[package]
+name = "hiloop-core"
+version = "0.0.0"
+description = "Shared contract types for hiloop: fork-tree identity (the spine) and telemetry event schema."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+# Not published to crates.io; built and distributed from this repository.
+publish = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

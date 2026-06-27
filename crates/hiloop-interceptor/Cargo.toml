@@ -1,0 +1,64 @@
+[package]
+name = "hiloop-interceptor"
+version = "0.0.0"
+description = "Interception wrapper for agent harnesses: captures OTEL/logs/network telemetry and tags it with fork-tree identity."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+repository.workspace = true
+# Not published to crates.io; built and distributed from this repository.
+publish = false
+
+[[bin]]
+name = "hiloop-interceptor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+hiloop-core.workspace = true
+http-body-util.workspace = true
+hudsucker.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+opentelemetry-proto.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+# Signal forwarding and process-group teardown are Unix-only (the wrapper's
+# PID-1/supervisor product scope). nix is available to the binary and the
+# integration tests.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[build-dependencies]
+# Generate the TelemetryIngestService gRPC stubs from the vendored proto with a pure-Rust
+# compiler, so the build needs no system protoc.
+protox.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "stdio_path"
+harness = false
+
+[features]
+test-support = []
+
+[lints]
+workspace = true

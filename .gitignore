@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# Local agent worktrees and session state
+/.claude/
+
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
