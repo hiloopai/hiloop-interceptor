@@ -10,7 +10,9 @@ use crate::{
     framing::LineFramer,
     grpc_export::GrpcIngestExporter,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
-    pipeline::{Pipeline, PipelineOptions},
+    pipeline::{
+        DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL, Pipeline, PipelineOptions,
+    },
     proxy::{ProxyCa, ProxyNormalizer, ProxyServer},
     raw::JsonlRawStore,
     seams::{
@@ -29,6 +31,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ExitCode, ExitStatus, Stdio},
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -73,6 +76,8 @@ pub struct RunOptions {
     proxy: bool,
     max_capture_bytes: Option<u64>,
     export_grpc: Option<GrpcExportOptions>,
+    export_batch_size: usize,
+    export_flush_interval: Option<Duration>,
 }
 
 impl RunOptions {
@@ -111,7 +116,26 @@ impl RunOptions {
             proxy,
             max_capture_bytes,
             export_grpc,
+            export_batch_size: DEFAULT_EXPORT_BATCH_SIZE,
+            export_flush_interval: Some(DEFAULT_EXPORT_FLUSH_INTERVAL),
         }
+    }
+
+    /// Override the export batch size: a partial batch is shipped once this many events accumulate.
+    /// Values below 1 are clamped to 1.
+    #[must_use]
+    pub fn with_export_batch_size(mut self, size: usize) -> Self {
+        self.export_batch_size = size.max(1);
+        self
+    }
+
+    /// Override the export age trigger: a partial batch waiting this long is shipped even before it
+    /// reaches the batch size, so a live tail sees events progressively rather than only at run end.
+    /// `None` (or a zero duration) disables the timer, restoring size-or-EOF-only flushing.
+    #[must_use]
+    pub fn with_export_flush_interval(mut self, interval: Option<Duration>) -> Self {
+        self.export_flush_interval = interval.filter(|d| !d.is_zero());
+        self
     }
 }
 
@@ -367,7 +391,9 @@ where
         .take()
         .context("child stderr was not available for capture")?;
 
-    let mut options_pipeline = PipelineOptions::default();
+    let mut options_pipeline = PipelineOptions::default()
+        .with_export_batch_size(options.export_batch_size)
+        .with_export_flush_interval(options.export_flush_interval);
     if raw_store.is_some() {
         options_pipeline =
             options_pipeline.with_raw_retention_override(RawRetentionPolicy::Preserve);

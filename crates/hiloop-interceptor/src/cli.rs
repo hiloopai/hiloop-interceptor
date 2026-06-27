@@ -3,8 +3,9 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hiloop_core::identity::{ForkContext, ForkNodeId, ForkPath, RunId};
+use hiloop_interceptor::pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL_MS};
 use hiloop_interceptor::{GrpcExportOptions, RunOptions, run};
-use std::{path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 pub(crate) async fn run_from_args() -> Result<ExitCode> {
     Box::pin(Cli::parse().execute()).await
@@ -127,6 +128,26 @@ struct RunArgs {
     #[arg(long = "tenant-id", env = "HILOOP_TENANT_ID")]
     tenant_id: Option<String>,
 
+    /// Ship a partial batch once this many captured events accumulate (the size trigger).
+    #[arg(
+        long = "export-batch-size",
+        env = "HILOOP_EXPORT_BATCH_SIZE",
+        default_value_t = DEFAULT_EXPORT_BATCH_SIZE,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+    )]
+    export_batch_size: usize,
+
+    /// Ship a partial batch after it has waited this many milliseconds, even before it reaches
+    /// `--export-batch-size` (the age trigger). This bounds how long an event waits before it
+    /// reaches the exporter, so a live tail sees a long-running command's events progressively
+    /// rather than all at once when it exits. Set to 0 to disable and flush only on size or exit.
+    #[arg(
+        long = "export-flush-interval-ms",
+        env = "HILOOP_EXPORT_FLUSH_INTERVAL_MS",
+        default_value_t = DEFAULT_EXPORT_FLUSH_INTERVAL_MS,
+    )]
+    export_flush_interval_ms: u64,
+
     /// Command to wrap. Everything after `--` is passed to the child.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -147,6 +168,9 @@ impl RunArgs {
             project_id: self.project_id,
         });
 
+        let export_flush_interval = (self.export_flush_interval_ms > 0)
+            .then(|| Duration::from_millis(self.export_flush_interval_ms));
+
         RunOptions::new(
             context,
             self.command,
@@ -158,5 +182,7 @@ impl RunArgs {
             self.max_capture_bytes,
             export_grpc,
         )
+        .with_export_batch_size(self.export_batch_size)
+        .with_export_flush_interval(export_flush_interval)
     }
 }

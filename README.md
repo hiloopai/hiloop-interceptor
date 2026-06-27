@@ -86,6 +86,12 @@ cargo run -p hiloop-interceptor -- \
   --events-jsonl ./events.jsonl -- <harness command>
 ```
 
+Captured events are shipped in batches. A batch ships as soon as it reaches `--export-batch-size`
+(default 128 events) **or** once the oldest buffered event has waited `--export-flush-interval-ms`
+(default 1000 ms), whichever comes first — so a long-running harness's events reach the gateway (and
+any live tail) progressively rather than only when it exits. Lower the interval for a snappier tail,
+or set `--export-flush-interval-ms 0` to disable the timer and flush only on a full batch or at exit.
+
 ## What it captures
 
 Wrapping a real Claude Code turn with `--proxy --otlp` captures the whole footprint of the harness —

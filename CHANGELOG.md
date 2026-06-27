@@ -8,6 +8,15 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ## [Unreleased]
 
+### Added
+
+- gRPC export now flushes on a size **or** age trigger, whichever comes first: a partial batch ships
+  once it has waited `--export-flush-interval-ms` (default 1000 ms; `0` disables the timer) even
+  before it reaches `--export-batch-size` (default 128). This bounds export latency so a long-running
+  harness's events reach the gateway — and any live tail — progressively rather than only at exit.
+  Both knobs are also configurable via `HILOOP_EXPORT_FLUSH_INTERVAL_MS` / `HILOOP_EXPORT_BATCH_SIZE`
+  and on the embeddable `RunOptions` builder.
+
 ## [0.1.0] - 2026-06-26
 
 First public release. Early alpha — it captures real agent harnesses end-to-end, but APIs, flags,
