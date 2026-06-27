@@ -1,6 +1,6 @@
 [package]
 name = "hiloop-core"
-version = "0.0.0"
+version = "0.1.0"
 description = "Shared contract types for hiloop: fork-tree identity (the spine) and telemetry event schema."
 edition.workspace = true
 license.workspace = true

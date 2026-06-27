@@ -1,6 +1,6 @@
 [package]
 name = "hiloop-interceptor"
-version = "0.0.0"
+version = "0.1.0"
 description = "Interception wrapper for agent harnesses: captures OTEL/logs/network telemetry and tags it with fork-tree identity."
 edition.workspace = true
 license.workspace = true

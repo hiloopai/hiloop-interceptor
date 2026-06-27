@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive", "env"] }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 futures-core = "0.3"
 futures-util = "0.3"
-hiloop-core = { version = "0.0.0", path = "crates/hiloop-core" }
+hiloop-core = { version = "0.1.0", path = "crates/hiloop-core" }
 hudsucker = { version = "0.24", features = ["http2"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
