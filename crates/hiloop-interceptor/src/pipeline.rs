@@ -7,8 +7,19 @@ use crate::seams::{
 };
 use futures_util::{FutureExt, StreamExt};
 use hiloop_core::event::{AttributeKey, Event};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+/// Default export batch size: the partial batch is shipped once this many events accumulate.
+pub const DEFAULT_EXPORT_BATCH_SIZE: usize = 128;
+
+/// Default age trigger: a partial batch that has been waiting this long is shipped even if it has
+/// not reached [`DEFAULT_EXPORT_BATCH_SIZE`]. This bounds how long any one event sits in the buffer
+/// before it reaches the exporter (and therefore a live tail), trading a little batching efficiency
+/// for interactive latency. One second sits in the 1–2s low-latency window general batch-exporter
+/// guidance recommends; intervals below ~500ms tend to produce many tiny exports for little gain.
+pub const DEFAULT_EXPORT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Bounded queue and batching settings for one pipeline run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +27,7 @@ pub struct PipelineOptions {
     raw_queue_capacity: usize,
     event_queue_capacity: usize,
     export_batch_size: usize,
+    export_flush_interval: Option<Duration>,
     raw_retention_override: Option<RawRetentionPolicy>,
 }
 
@@ -46,6 +58,7 @@ impl PipelineOptions {
             raw_queue_capacity,
             event_queue_capacity,
             export_batch_size,
+            export_flush_interval: Some(DEFAULT_EXPORT_FLUSH_INTERVAL),
             raw_retention_override: None,
         })
     }
@@ -60,6 +73,29 @@ impl PipelineOptions {
 
     pub fn export_batch_size(self) -> usize {
         self.export_batch_size
+    }
+
+    /// The age trigger: ship a partial batch once it has waited this long, or `None` to disable the
+    /// timer so the batch only ships when it reaches [`export_batch_size`](Self::export_batch_size)
+    /// or the stream ends.
+    pub fn export_flush_interval(self) -> Option<Duration> {
+        self.export_flush_interval
+    }
+
+    /// Override the size trigger: the partial batch ships once it holds this many events. Values
+    /// below 1 are clamped to 1 (a zero batch size would never flush on size).
+    #[must_use]
+    pub fn with_export_batch_size(mut self, size: usize) -> Self {
+        self.export_batch_size = size.max(1);
+        self
+    }
+
+    /// Override the age trigger. `None` (or a zero duration) disables it, restoring size-or-EOF-only
+    /// flushing.
+    #[must_use]
+    pub fn with_export_flush_interval(mut self, interval: Option<Duration>) -> Self {
+        self.export_flush_interval = interval.filter(|d| !d.is_zero());
+        self
     }
 
     #[must_use]
@@ -78,7 +114,8 @@ impl Default for PipelineOptions {
         Self {
             raw_queue_capacity: 1024,
             event_queue_capacity: 1024,
-            export_batch_size: 128,
+            export_batch_size: DEFAULT_EXPORT_BATCH_SIZE,
+            export_flush_interval: Some(DEFAULT_EXPORT_FLUSH_INTERVAL),
             raw_retention_override: None,
         }
     }
@@ -356,13 +393,49 @@ where
     let export_stage = async {
         let mut batches = 0;
         let mut batch = Vec::with_capacity(options.export_batch_size());
+        let flush_interval = options.export_flush_interval();
+        // Absolute deadline for the partial batch's age trigger. Armed when the first event lands in
+        // an empty batch, cleared on every flush, so an idle pipeline parks on `recv()` alone (the
+        // timer branch resolves to `pending()` and never fires an empty export).
+        let mut deadline: Option<tokio::time::Instant> = None;
 
-        while let Some(event) = event_rx.recv().await {
-            batch.push(event);
-            if batch.len() >= options.export_batch_size() {
-                exporter.export(&batch).await?;
-                batch.clear();
-                batches += 1;
+        loop {
+            let age_trigger = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+
+            tokio::select! {
+                // Prefer draining ready events over an age flush so batches stay as full as the
+                // size trigger allows; under load the size trigger does the flushing.
+                biased;
+                maybe_event = event_rx.recv() => match maybe_event {
+                    Some(event) => {
+                        if batch.is_empty() {
+                            deadline = flush_interval.map(|d| tokio::time::Instant::now() + d);
+                        }
+                        batch.push(event);
+                        if batch.len() >= options.export_batch_size() {
+                            exporter.export(&batch).await?;
+                            batch.clear();
+                            deadline = None;
+                            batches += 1;
+                        }
+                    }
+                    None => break,
+                },
+                () = age_trigger => {
+                    // The oldest buffered event has waited a full interval: ship the partial batch
+                    // so it reaches the exporter (and any live tail) without waiting for EOF.
+                    if !batch.is_empty() {
+                        exporter.export(&batch).await?;
+                        batch.clear();
+                        batches += 1;
+                    }
+                    deadline = None;
+                }
             }
         }
 
@@ -886,6 +959,133 @@ mod tests {
         assert!(PipelineOptions::new(0, 1, 1).is_err());
         assert!(PipelineOptions::new(1, 0, 1).is_err());
         assert!(PipelineOptions::new(1, 1, 0).is_err());
+    }
+
+    #[test]
+    fn zero_or_none_disables_the_age_trigger() {
+        use std::time::Duration;
+
+        assert_eq!(
+            PipelineOptions::default().export_flush_interval(),
+            Some(DEFAULT_EXPORT_FLUSH_INTERVAL),
+        );
+        assert_eq!(
+            PipelineOptions::default()
+                .with_export_flush_interval(None)
+                .export_flush_interval(),
+            None,
+        );
+        // A zero interval is the off switch, matching the CLI's `--export-flush-interval-ms 0`.
+        assert_eq!(
+            PipelineOptions::default()
+                .with_export_flush_interval(Some(Duration::ZERO))
+                .export_flush_interval(),
+            None,
+        );
+        assert_eq!(
+            PipelineOptions::default()
+                .with_export_flush_interval(Some(Duration::from_millis(250)))
+                .export_flush_interval(),
+            Some(Duration::from_millis(250)),
+        );
+    }
+
+    fn stdout_raw(message: &[u8]) -> RawSignal {
+        RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::copy_from_slice(message),
+        )
+    }
+
+    #[tokio::test]
+    async fn age_trigger_flushes_partial_batch_before_stream_ends() {
+        use std::time::Duration;
+
+        let context = ForkContext::new_local_root();
+        let normalizer = StdioLogNormalizer;
+        let exporter = RecordingExporter::default();
+
+        // A channel-backed stream we keep open, so the only way these events reach the exporter
+        // before EOF is the age trigger firing on the partial (below-batch-size) buffer.
+        let (tx, rx) = mpsc::channel(8);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+        let options = PipelineOptions::new(8, 8, 8)
+            .expect("pipeline options")
+            .with_export_flush_interval(Some(Duration::from_millis(50)));
+        let pipeline = Pipeline::new(context, &normalizer, &exporter)
+            .options(options)
+            .run(stream);
+        tokio::pin!(pipeline);
+
+        tx.send(Ok(stdout_raw(b"one"))).await.expect("send raw");
+        tx.send(Ok(stdout_raw(b"two"))).await.expect("send raw");
+
+        // Drive the pipeline and wait for the age trigger to ship the partial batch while the
+        // stream is still open. A real short timer is used deliberately: `start_paused` would not
+        // advance while the pipeline parks on the channel.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut pipeline => panic!("pipeline ended before the age flush: {result:?}"),
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if exporter.events().len() >= 2 {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("age trigger should flush the partial batch before EOF");
+
+        drop(tx);
+        let report = pipeline.await.expect("pipeline should finish");
+        assert_eq!(report.events, 2);
+        assert!(report.export_batches >= 1);
+        assert!(exporter.flushed());
+    }
+
+    #[tokio::test]
+    async fn disabled_age_trigger_waits_for_eof_below_batch_size() {
+        use std::time::Duration;
+
+        let context = ForkContext::new_local_root();
+        let normalizer = StdioLogNormalizer;
+        let exporter = RecordingExporter::default();
+
+        let (tx, rx) = mpsc::channel(8);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+        let options = PipelineOptions::new(8, 8, 8)
+            .expect("pipeline options")
+            .with_export_flush_interval(None);
+        let pipeline = Pipeline::new(context, &normalizer, &exporter)
+            .options(options)
+            .run(stream);
+        tokio::pin!(pipeline);
+
+        tx.send(Ok(stdout_raw(b"one"))).await.expect("send raw");
+
+        // With the age trigger disabled and the buffer below batch size, nothing exports while the
+        // stream stays open: driving the pipeline must time out with an empty exporter.
+        let still_running = tokio::time::timeout(Duration::from_millis(200), &mut pipeline).await;
+        assert!(still_running.is_err(), "pipeline should still be running");
+        assert!(
+            exporter.events().is_empty(),
+            "no flush should happen before the size trigger or EOF",
+        );
+
+        drop(tx);
+        let report = pipeline.await.expect("pipeline should finish");
+        assert_eq!(report.events, 1);
+        assert_eq!(exporter.events().len(), 1);
     }
 
     #[tokio::test]
