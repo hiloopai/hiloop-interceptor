@@ -15,6 +15,7 @@ use crate::{
     },
     proxy::{ProxyCa, ProxyNormalizer, ProxyServer},
     raw::JsonlRawStore,
+    redact::RedactionPolicy,
     seams::{
         Exporter, NormalizationContext, Normalizer, NormalizerRouter, ProcessContext,
         RawRetentionPolicy, RawSignal, RawStore, SourceError,
@@ -78,6 +79,7 @@ pub struct RunOptions {
     export_grpc: Option<GrpcExportOptions>,
     export_batch_size: usize,
     export_flush_interval: Option<Duration>,
+    redaction: RedactionPolicy,
 }
 
 impl RunOptions {
@@ -88,9 +90,12 @@ impl RunOptions {
     /// newline-delimited JSON event log, `raw_jsonl` a raw observation log (requires
     /// an export target), `blob_dir` the proxy's blob store, `otlp` an embedded OTLP
     /// receiver, `proxy` an embedded MITM proxy (requires an export target and
-    /// `blob_dir`), `max_capture_bytes` caps proxy body capture, and `export_grpc`
-    /// streams events to a telemetry gateway. Invariants between these are validated
-    /// by [`run`], not here.
+    /// `blob_dir`), `max_capture_bytes` caps the captured copy of proxy bodies in
+    /// memory (`Some(n)` bounds it to `n` bytes; `None` is unlimited — prefer a finite
+    /// cap such as [`crate::proxy::DEFAULT_MAX_CAPTURE_BYTES`] so a large body can't OOM
+    /// the wrapper; forwarding to the origin is never capped), and `export_grpc` streams
+    /// events to a telemetry gateway. Invariants between these are validated by [`run`],
+    /// not here.
     #[expect(
         clippy::too_many_arguments,
         reason = "public, embeddable run config; the flat constructor mirrors the CLI's RunArgs 1:1 — a builder is deferred while there is a single in-tree caller"
@@ -118,7 +123,16 @@ impl RunOptions {
             export_grpc,
             export_batch_size: DEFAULT_EXPORT_BATCH_SIZE,
             export_flush_interval: Some(DEFAULT_EXPORT_FLUSH_INTERVAL),
+            redaction: RedactionPolicy::default(),
         }
+    }
+
+    /// Override capture-side secret redaction. On by default; pass
+    /// [`RedactionPolicy::disabled`] to persist captured bodies verbatim.
+    #[must_use]
+    pub fn with_redaction(mut self, redaction: RedactionPolicy) -> Self {
+        self.redaction = redaction;
+        self
     }
 
     /// Override the export batch size: a partial batch is shipped once this many events accumulate.
@@ -454,6 +468,7 @@ where
                 signal_tx.clone(),
                 blob_store,
                 options.max_capture_bytes,
+                options.redaction,
                 async move {
                     let _ = shutdown_rx.await;
                 },
