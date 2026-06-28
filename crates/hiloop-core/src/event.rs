@@ -239,6 +239,8 @@ pub enum SignalType {
     Exec,
     /// LLM request, response, or tool-call event.
     Llm,
+    /// Human- or agent-authored annotation attached to the fork tree.
+    Annotation,
 }
 
 /// Reference to a large payload stored out-of-row.
@@ -359,6 +361,18 @@ mod tests {
             json!("application/json")
         );
         assert_eq!(value["payload_ref"]["size_bytes"], json!(12));
+    }
+
+    #[test]
+    fn signal_type_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(SignalType::Annotation).expect("serialize"),
+            json!("annotation")
+        );
+        assert_eq!(
+            serde_json::from_value::<SignalType>(json!("annotation")).expect("deserialize"),
+            SignalType::Annotation
+        );
     }
 
     #[test]

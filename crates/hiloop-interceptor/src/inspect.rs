@@ -115,6 +115,7 @@ const fn signal_label(signal: SignalType) -> &'static str {
         SignalType::Net => "net",
         SignalType::Exec => "exec",
         SignalType::Llm => "llm",
+        SignalType::Annotation => "annotation",
     }
 }
 
