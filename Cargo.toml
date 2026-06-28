@@ -28,6 +28,9 @@ nix = { version = "0.31", default-features = false, features = ["signal", "proce
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 proptest = "1"
 prost = "0.14"
+# Capture-side secret redaction; already in the dependency graph transitively, so a
+# direct dep adds no new build weight.
+regex = "1"
 protox = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

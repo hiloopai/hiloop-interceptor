@@ -4,7 +4,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hiloop_core::identity::{ForkContext, ForkNodeId, ForkPath, RunId};
 use hiloop_interceptor::pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL_MS};
-use hiloop_interceptor::{GrpcExportOptions, RunOptions, run};
+use hiloop_interceptor::proxy::DEFAULT_MAX_CAPTURE_BYTES;
+use hiloop_interceptor::{GrpcExportOptions, RedactionPolicy, RunOptions, run};
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 pub(crate) async fn run_from_args() -> Result<ExitCode> {
@@ -100,10 +101,17 @@ struct RunArgs {
     proxy: bool,
 
     /// Cap how many body bytes the proxy captures (blob + reported size) per
-    /// request/response. Unlimited when omitted; never affects what the client
-    /// or upstream receives.
+    /// request/response. Defaults to 8 MiB when omitted (the captured copy is buffered
+    /// in memory, so a finite cap bounds interceptor memory). Set to `0` for unlimited.
+    /// Never affects what the client or upstream receives.
     #[arg(long = "max-capture-bytes", env = "HILOOP_MAX_CAPTURE_BYTES")]
     max_capture_bytes: Option<u64>,
+
+    /// Persist captured request/response bodies verbatim, without scrubbing
+    /// credentials. Redaction is on by default and only affects the captured copy,
+    /// never the traffic forwarded to the origin.
+    #[arg(long = "no-redact", env = "HILOOP_NO_REDACT")]
+    no_redact: bool,
 
     /// Stream captured events to a telemetry gateway over gRPC, e.g.
     /// `https://telemetry.example.com:443`. Composes with `--events-jsonl`. The API token is read
@@ -171,6 +179,14 @@ impl RunArgs {
         let export_flush_interval = (self.export_flush_interval_ms > 0)
             .then(|| Duration::from_millis(self.export_flush_interval_ms));
 
+        let redaction = if self.no_redact {
+            RedactionPolicy::disabled()
+        } else {
+            RedactionPolicy::enabled()
+        };
+
+        let max_capture_bytes = resolve_max_capture_bytes(self.max_capture_bytes);
+
         RunOptions::new(
             context,
             self.command,
@@ -179,10 +195,76 @@ impl RunArgs {
             self.blob_dir,
             self.otlp,
             self.proxy,
-            self.max_capture_bytes,
+            max_capture_bytes,
             export_grpc,
         )
         .with_export_batch_size(self.export_batch_size)
         .with_export_flush_interval(export_flush_interval)
+        .with_redaction(redaction)
+    }
+}
+
+/// Map the `--max-capture-bytes` CLI surface onto the internal representation, where
+/// `None` means unlimited: omitted → the finite default (bounds interceptor memory),
+/// `0` → unlimited, `N` → exactly `N`.
+fn resolve_max_capture_bytes(flag: Option<u64>) -> Option<u64> {
+    match flag {
+        None => Some(DEFAULT_MAX_CAPTURE_BYTES),
+        Some(0) => None,
+        Some(n) => Some(n),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_cap_uses_finite_default() {
+        assert_eq!(
+            resolve_max_capture_bytes(None),
+            Some(DEFAULT_MAX_CAPTURE_BYTES)
+        );
+    }
+
+    #[test]
+    fn zero_cap_means_unlimited() {
+        assert_eq!(resolve_max_capture_bytes(Some(0)), None);
+    }
+
+    #[test]
+    fn explicit_cap_is_passed_through() {
+        assert_eq!(resolve_max_capture_bytes(Some(4096)), Some(4096));
+    }
+
+    #[test]
+    fn parsed_run_args_apply_the_default_cap_when_omitted() {
+        let cli = Cli::try_parse_from(["hiloop-interceptor", "run", "--", "echo", "hi"])
+            .expect("parse run args");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run subcommand");
+        };
+        assert_eq!(
+            resolve_max_capture_bytes(args.max_capture_bytes),
+            Some(DEFAULT_MAX_CAPTURE_BYTES)
+        );
+    }
+
+    #[test]
+    fn parsed_zero_flag_maps_to_unlimited() {
+        let cli = Cli::try_parse_from([
+            "hiloop-interceptor",
+            "run",
+            "--max-capture-bytes",
+            "0",
+            "--",
+            "echo",
+            "hi",
+        ])
+        .expect("parse run args");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run subcommand");
+        };
+        assert_eq!(resolve_max_capture_bytes(args.max_capture_bytes), None);
     }
 }

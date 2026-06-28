@@ -182,13 +182,25 @@ attempt) and a plain-HTTP e2e against a chunked upstream (request/response corre
 capture + blob offload).
 
 **Streaming passthrough + content-addressed offload (shipped).** *Response* bodies are forwarded as a
-streaming tee: each frame is passed downstream the instant it arrives and simultaneously streamed
-into the content-addressed blob store (`crate::blob`, sha256-keyed, `--blob-dir`) — so memory is
-bounded to one frame, SSE/chunked responses are not blocked on buffering, and the event carries only
-a `payload_ref` (empty inline `body`). On client disconnect a `Drop` finalizes the partial blob on a
-detached task and emits a `http.capture.truncated` signal. *Request* bodies are buffered eagerly
-(the small side of an exchange; buffering guarantees a request signal even when the upstream fails
-before draining the body) then offloaded too, with an inline-body fallback if the blob write fails.
+streaming tee: each frame is passed downstream the instant it arrives (SSE/chunked responses are not
+blocked on buffering) while the *captured copy* is accumulated separately, bounded by the capture cap
+(8 MiB by default, `--max-capture-bytes` to override, `0` for unlimited — the finite default bounds
+interceptor memory so a large body can't OOM the wrapper). When the stream ends the captured copy is redacted once (so a secret split
+across frames is still caught — see redaction below) and offloaded to the content-addressed blob
+store (`crate::blob`, blake3-keyed, `--blob-dir`), and the event carries only a `payload_ref` (empty
+inline `body`). On client disconnect a `Drop` finalizes the partial blob on a detached task and emits
+a `http.capture.truncated` signal. *Request* bodies are buffered eagerly (the small side of an
+exchange; buffering guarantees a request signal even when the upstream fails before draining the body)
+then redacted and offloaded too, with an inline-body fallback if the blob write fails. Capturing the
+response copy in a buffer (rather than streaming it frame-by-frame into the blob) is the deliberate
+cost of correct cross-frame redaction; the cap bounds the buffer, and forwarding to the origin still
+streams a frame at a time.
+
+**Capture-side redaction (shipped, on by default).** Before a captured request/response body is
+persisted (events or blob store), credential patterns — bearer tokens, `sk-…` / `hil_…` keys, AWS
+access-key ids — are replaced with `[REDACTED]` (`crate::redact`). Redaction rewrites only the
+captured copy, never the bytes forwarded to the origin, and is best-effort (only known patterns;
+bytes beyond the capture cap are never captured or scanned). Disable per run with `--no-redact`.
 
 **Request/response correlation (shipped).** Each non-`CONNECT` exchange gets a monotonic
 `http.exchange_id` (process-global counter) stamped on both its request and response events.
@@ -199,9 +211,10 @@ each multiplexed request still gets its own clone and `proxy()` future. Limit: w
 errors before a response, hudsucker calls `handle_error` (not `handle_response`), so a request event
 is recorded with no paired response — absent rather than mis-correlated.
 
-**Remaining gaps (tracked in TESTING.md):** request bodies are still buffered whole before offload
-(responses stream); on a blob-write failure a streamed response degrades to metadata only (no inline
-fallback, unlike requests).
+**Remaining gaps (tracked in TESTING.md):** both request and response captured copies are buffered
+whole (within the capture cap) before offload; on a blob-write failure either degrades to metadata
+only (no inline fallback). The capture cap bounds memory by default (8 MiB); setting it to `0` opts
+into unlimited capture, where a very large body buffers its captured copy in full.
 
 **Blobs are local-only — getting them to the backend is the next step.** `DirBlobStore` writes blobs
 to a local directory (now blake3-keyed) and the `Event` carries only the `payload_ref` digest;
@@ -209,8 +222,8 @@ nothing yet uploads the bytes to the telemetry backend, so a digest is currently
 downstream. The `BlobUploader` seam (`src/blob.rs`) sketches the edge side of the upload — a
 digest-first `find_missing` + `upload` with a `NoopUploader` default — but the hosted uploader and
 the wire protocol are out of scope for this repository. Capture size is bounded by
-`--max-capture-bytes` (default unlimited): bodies over the cap are captured up to it, marked
-`http.capture.truncated`, and still forwarded in full to the client.
+`--max-capture-bytes` (default 8 MiB, `0` for unlimited): bodies over the cap are captured up to it,
+marked `http.capture.truncated`, and still forwarded in full to the client.
 
 **Status — OTLP shipped (`--otlp`).** `hiloop_interceptor::otlp` runs an embedded OTLP/HTTP receiver
 bound to an ephemeral localhost port; the supervisor injects the endpoint, registers

@@ -11,13 +11,17 @@
 //!
 //! Response bodies are forwarded as a streaming tee: each frame is passed
 //! downstream the moment it arrives (so SSE/chunked responses are not blocked on
-//! full-body buffering) and simultaneously written to the blob store, bounding
-//! memory to one frame; the `RawSignal` (empty `body` + `payload_ref`) is emitted
-//! when the body stream ends. Request bodies are buffered eagerly so a request
-//! signal is recorded even when the upstream never consumes the body, then
-//! offloaded to the store too. Request and response events are linked by an
-//! `http.exchange_id` attribute — see the `CaptureHandler` docs for the
-//! correlation mechanism and its reliability limits.
+//! full-body buffering) while the *captured copy* is accumulated separately, bounded
+//! by the capture cap ([`DEFAULT_MAX_CAPTURE_BYTES`] by default, `--max-capture-bytes`
+//! to override; this finite default bounds interceptor memory). When the stream ends
+//! the captured copy is redacted once (see [`crate::redact`] — so a secret straddling
+//! two frames is still caught) and offloaded to the blob store, and the `RawSignal`
+//! (empty `body` + `payload_ref`) is emitted. Request bodies are buffered eagerly so
+//! a request signal is recorded even when the upstream never consumes the body, then
+//! capped to the same limit, redacted, and offloaded. The cap bounds only the captured
+//! copy; the bytes forwarded to the origin are always complete and never capped.
+//! Request and response events are linked by an `http.exchange_id` attribute — see the
+//! `CaptureHandler` docs for the correlation mechanism and its reliability limits.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,11 +47,19 @@ use hiloop_core::event::{AttributeKey, Event, EventName, MediaType, PayloadRef, 
 use hiloop_core::identity::HlcClock;
 use thiserror::Error;
 
-use crate::blob::{BlobStore, BlobWriter};
+use crate::blob::BlobStore;
+use crate::redact::RedactionPolicy;
 use crate::seams::{
     NormalizationContext, NormalizationOutcome, NormalizeError, Normalizer, NormalizerDescriptor,
     NormalizerSupport, RawSignal, SourceError,
 };
+
+/// Default cap on captured body bytes per request/response, applied when the cap is
+/// left unspecified. Capture is buffered in memory before redaction/offload, so a
+/// finite default bounds interceptor memory; 8 MiB captures essentially all real API
+/// bodies in full. Only the *captured copy* is bounded — the bytes forwarded to the
+/// client/upstream are never capped. A cap of `0` at the CLI means unlimited.
+pub const DEFAULT_MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
 
 const PROXY_SOURCE: &str = "proxy";
 const REQUEST_KIND: &str = "http.request";
@@ -152,12 +164,19 @@ impl ProxyServer {
         signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
         blob_store: Arc<dyn BlobStore>,
         max_capture_bytes: Option<u64>,
+        redaction: RedactionPolicy,
         shutdown: F,
     ) -> Result<(), ProxyError>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let handler = CaptureHandler::new(signal_tx, self.clock, blob_store, max_capture_bytes);
+        let handler = CaptureHandler::new(
+            signal_tx,
+            self.clock,
+            blob_store,
+            max_capture_bytes,
+            redaction,
+        );
         let proxy = Proxy::builder()
             .with_listener(self.listener)
             .with_ca(ca.authority)
@@ -202,6 +221,9 @@ struct CaptureHandler {
     /// Cap on captured body bytes (blob + reported size); `None` is unlimited.
     /// Never bounds what is forwarded to the client/upstream.
     max_capture_bytes: Option<u64>,
+    /// Scrubs secrets from the captured copy before it is persisted; never the
+    /// bytes forwarded to the client/upstream.
+    redaction: RedactionPolicy,
     /// Exchange id for the request currently being handled by this clone,
     /// minted in `on_request` and read back in `on_response`.
     exchange_id: Option<String>,
@@ -213,12 +235,14 @@ impl CaptureHandler {
         clock: Arc<HlcClock>,
         blob_store: Arc<dyn BlobStore>,
         max_capture_bytes: Option<u64>,
+        redaction: RedactionPolicy,
     ) -> Self {
         Self {
             signal_tx,
             clock,
             blob_store,
             max_capture_bytes,
+            redaction,
             exchange_id: None,
         }
     }
@@ -248,6 +272,8 @@ impl CaptureHandler {
             }
             _ => bytes.clone(),
         };
+        // Only the captured copy is redacted; the forwarded `bytes` are never touched.
+        let captured = self.redaction.redact_body(captured);
 
         let content_type = header_str(&parts.headers, &CONTENT_TYPE);
         let mut attributes = vec![
@@ -311,8 +337,9 @@ impl CaptureHandler {
     }
 
     /// Build a forwarded [`Body`] that streams each frame downstream as it arrives
-    /// while writing the same bytes to the blob store; the `RawSignal` (empty body
-    /// plus a `payload_ref`) is emitted once the upstream body ends.
+    /// while buffering the captured copy; once the upstream body ends the buffer is
+    /// redacted, offloaded to the blob store, and the `RawSignal` (empty body plus a
+    /// `payload_ref`) is emitted.
     fn tee_body(
         &self,
         kind: &'static str,
@@ -323,9 +350,11 @@ impl CaptureHandler {
     ) -> Body {
         let state = TeeState {
             upstream: Some(BodyStream::new(body)),
-            writer: Some(self.blob_store.writer()),
-            size: 0,
+            blob_store: Arc::clone(&self.blob_store),
+            captured: Vec::new(),
             max_capture_bytes: self.max_capture_bytes,
+            truncated: false,
+            redaction: self.redaction,
             capped: false,
             media_type,
             attributes,
@@ -336,15 +365,17 @@ impl CaptureHandler {
             emitted: false,
         };
 
-        // Streaming tee: forward each frame as it arrives and write it to the blob
-        // store; never collect() the whole body. Mid-stream client disconnect is
-        // handled by TeeState's Drop.
+        // Streaming tee: forward each frame downstream as it arrives while buffering
+        // the captured copy; never block forwarding on capture. The buffer is redacted
+        // once at finalize (so a secret split across frames is still caught) before it
+        // is written to the blob store. Mid-stream client disconnect is handled by
+        // TeeState's Drop.
         let teed = futures_util::stream::unfold(state, |mut state| async move {
             let upstream = state.upstream.as_mut()?;
             match upstream.next().await {
                 Some(Ok(frame)) => {
                     if let Some(data) = frame.data_ref() {
-                        state.write(data).await;
+                        state.capture(data);
                     }
                     Some((Ok(frame), state))
                 }
@@ -365,15 +396,24 @@ impl CaptureHandler {
     }
 }
 
-/// State for one streaming body tee. `Drop` finalizes a partial (truncated) blob
-/// and emits its signal if the client disconnects before the body ends.
+/// State for one streaming body tee. The captured copy is buffered (bounded by
+/// `max_capture_bytes`) and redacted as a whole at finalize, so a secret straddling
+/// two DATA frames is still caught. `Drop` finalizes a partial blob and emits its
+/// signal if the client disconnects before the body ends.
 struct TeeState {
     upstream: Option<BodyStream<Body>>,
-    writer: Option<Box<dyn BlobWriter>>,
-    size: u64,
+    blob_store: Arc<dyn BlobStore>,
+    /// Captured response bytes, bounded by `max_capture_bytes`. Redacted once at
+    /// finalize; never the bytes forwarded downstream.
+    captured: Vec<u8>,
     /// Cap on captured bytes; `None` is unlimited. Forwarding is unaffected.
     max_capture_bytes: Option<u64>,
-    /// Set once the cap is hit and further frames stop being captured.
+    /// Set when capture was cut short (cap hit or upstream error).
+    truncated: bool,
+    /// Scrubs secrets from the buffered capture before it reaches the blob; the
+    /// bytes forwarded downstream are never touched.
+    redaction: RedactionPolicy,
+    /// Set once the cap is hit and further bytes stop being captured.
     capped: bool,
     media_type: Option<String>,
     attributes: Vec<(&'static str, String)>,
@@ -385,15 +425,13 @@ struct TeeState {
 }
 
 impl TeeState {
-    async fn write(&mut self, data: &[u8]) {
+    fn capture(&mut self, data: &[u8]) {
         if self.capped {
             return;
         }
-        // Capture only up to the cap; the writer is kept (not dropped) so the
-        // capped prefix still finalizes into a blob. Forwarding is untouched.
         let data = match self.max_capture_bytes {
             Some(cap) => {
-                let remaining = cap.saturating_sub(self.size);
+                let remaining = cap.saturating_sub(self.captured.len() as u64);
                 let take = usize::try_from(remaining)
                     .unwrap_or(usize::MAX)
                     .min(data.len());
@@ -404,20 +442,7 @@ impl TeeState {
             }
             None => data,
         };
-        if data.is_empty() {
-            return;
-        }
-        if let Some(writer) = self.writer.as_mut() {
-            // On write failure the writer is dropped; the streamed frames aren't
-            // buffered, so the response signal degrades to metadata only (no
-            // payload_ref). Unlike the request path, there is no inline fallback.
-            if let Err(error) = writer.write(data).await {
-                eprintln!("hiloop-interceptor: proxy response blob write failed: {error}");
-                self.writer = None;
-            } else {
-                self.size += data.len() as u64;
-            }
-        }
+        self.captured.extend_from_slice(data);
     }
 
     /// Idempotent so the end-of-stream emit and the Drop fallback can't double-send.
@@ -426,16 +451,17 @@ impl TeeState {
             return;
         }
         self.emitted = true;
-        let raw = finalize_tee(
-            &self.clock,
-            self.kind,
-            self.size_attr,
-            std::mem::take(&mut self.attributes),
-            self.writer.take(),
-            self.size,
-            self.media_type.take(),
-            truncated || self.capped,
-        )
+        let raw = finalize_tee(FinalizeTee {
+            clock: &self.clock,
+            kind: self.kind,
+            size_attr: self.size_attr,
+            attributes: std::mem::take(&mut self.attributes),
+            blob_store: self.blob_store.as_ref(),
+            captured: std::mem::take(&mut self.captured),
+            redaction: self.redaction,
+            media_type: self.media_type.take(),
+            truncated: truncated || self.truncated || self.capped,
+        })
         .await;
         let _ = self.signal_tx.send(Ok(raw)).await;
     }
@@ -454,47 +480,69 @@ impl Drop for TeeState {
         let kind = self.kind;
         let size_attr = self.size_attr;
         let attributes = std::mem::take(&mut self.attributes);
-        let writer = self.writer.take();
-        let size = self.size;
+        let blob_store = Arc::clone(&self.blob_store);
+        let captured = std::mem::take(&mut self.captured);
+        let redaction = self.redaction;
         let media_type = self.media_type.take();
         let signal_tx = self.signal_tx.clone();
         tokio::spawn(async move {
-            let raw = finalize_tee(
-                &clock, kind, size_attr, attributes, writer, size, media_type, true,
-            )
+            let raw = finalize_tee(FinalizeTee {
+                clock: &clock,
+                kind,
+                size_attr,
+                attributes,
+                blob_store: blob_store.as_ref(),
+                captured,
+                redaction,
+                media_type,
+                truncated: true,
+            })
             .await;
             let _ = signal_tx.send(Ok(raw)).await;
         });
     }
 }
 
-/// Finalize a teed body's blob and build its offloaded (or fallback) signal.
-/// `size` is the byte count tracked across frames, so the size attribute is
-/// correct even when the blob finalize fails and no `payload_ref` is produced.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "threads the per-frame tee capture state (clock/kind/attrs/writer/size/media_type/truncated) needed to finalize one body; grouping into a struct is deferred"
-)]
-async fn finalize_tee(
-    clock: &HlcClock,
+/// Inputs to [`finalize_tee`]: the buffered capture plus the metadata needed to
+/// redact, offload, and stamp one response body's signal.
+struct FinalizeTee<'a> {
+    clock: &'a HlcClock,
     kind: &'static str,
     size_attr: &'static str,
     attributes: Vec<(&'static str, String)>,
-    writer: Option<Box<dyn BlobWriter>>,
-    size: u64,
+    blob_store: &'a dyn BlobStore,
+    captured: Vec<u8>,
+    redaction: RedactionPolicy,
     media_type: Option<String>,
     truncated: bool,
-) -> RawSignal {
-    let payload_ref = match writer {
-        Some(writer) => match writer.finish().await {
-            Ok(payload_ref) => Some(apply_media_type(payload_ref, media_type.as_deref())),
-            Err(error) => {
-                eprintln!("hiloop-interceptor: proxy blob finalize failed: {error}");
-                None
-            }
-        },
-        None => None,
+}
+
+/// Redact the buffered capture once, offload it to the blob store, and build the
+/// offloaded (or metadata-only) signal. The size attribute reports the stored
+/// (post-redaction) byte count, consistent with the truncation path.
+async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
+    let FinalizeTee {
+        clock,
+        kind,
+        size_attr,
+        attributes,
+        blob_store,
+        captured,
+        redaction,
+        media_type,
+        truncated,
+    } = args;
+
+    let stored = redaction.redact_body(Bytes::from(captured));
+    let size = stored.len() as u64;
+    let payload_ref = match offload_bytes(blob_store, &stored, media_type.as_deref()).await {
+        Ok(payload_ref) => Some(payload_ref),
+        Err(error) => {
+            eprintln!("hiloop-interceptor: proxy response blob offload failed: {error}");
+            None
+        }
     };
+
     let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), Bytes::new())
         .with_attribute(size_attr, size.to_string());
     if truncated {
@@ -695,6 +743,17 @@ mod tests {
         mpsc::Receiver<Result<RawSignal, SourceError>>,
         Arc<MemoryBlobStore>,
     ) {
+        handler_with(max_capture_bytes, RedactionPolicy::default())
+    }
+
+    fn handler_with(
+        max_capture_bytes: Option<u64>,
+        redaction: RedactionPolicy,
+    ) -> (
+        CaptureHandler,
+        mpsc::Receiver<Result<RawSignal, SourceError>>,
+        Arc<MemoryBlobStore>,
+    ) {
         let (tx, rx) = mpsc::channel(4);
         let store = Arc::new(MemoryBlobStore::default());
         let handler = CaptureHandler::new(
@@ -702,6 +761,7 @@ mod tests {
             Arc::new(HlcClock::new()),
             store.clone(),
             max_capture_bytes,
+            redaction,
         );
         (handler, rx, store)
     }
@@ -1208,5 +1268,144 @@ mod tests {
         let first = next_exchange_id();
         let second = next_exchange_id();
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn request_body_secret_is_redacted_in_capture_but_forwarded_intact() {
+        let (mut handler, mut rx, store) = handler_with(None, RedactionPolicy::enabled());
+        let secret = b"Authorization: Bearer supersecret";
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/v1/thing")
+            .body(Body::from(Bytes::from_static(secret)))
+            .expect("request");
+
+        // The forwarded request must still carry the real credential upstream.
+        let forwarded = handler.on_request(request).await;
+        let chunks = drain_body(forwarded.into_body()).await;
+        assert_eq!(
+            chunks.concat(),
+            secret,
+            "forwarded body must be byte-for-byte intact"
+        );
+
+        // The persisted blob (the captured copy) must be scrubbed.
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        let scrubbed = b"Authorization: [REDACTED]";
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(scrubbed).as_str())
+        );
+        let blobs = store.blobs();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].1, scrubbed);
+    }
+
+    #[tokio::test]
+    async fn request_body_secret_is_persisted_verbatim_when_redaction_disabled() {
+        let (mut handler, mut rx, store) = handler_with(None, RedactionPolicy::disabled());
+        let secret = b"Bearer supersecret";
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/v1/thing")
+            .body(Body::from(Bytes::from_static(secret)))
+            .expect("request");
+
+        drain_body(handler.on_request(request).await.into_body()).await;
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(secret).as_str())
+        );
+        assert_eq!(store.blobs()[0].1, secret);
+    }
+
+    #[tokio::test]
+    async fn response_body_secret_is_redacted_in_capture_but_forwarded_intact() {
+        let (handler, mut rx, store) = handler_with(None, RedactionPolicy::enabled());
+        let teed = handler.tee_body(
+            RESPONSE_KIND,
+            "http.response.body_size",
+            vec![("http.status_code", "200".to_owned())],
+            None,
+            streaming_body(&[b"token=sk-abc123 ", b"and AKIA0123456789ABCDEF"]),
+        );
+
+        // The client still receives the original, unredacted bytes.
+        let chunks = drain_body(teed).await;
+        assert_eq!(chunks.concat(), b"token=sk-abc123 and AKIA0123456789ABCDEF");
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        let scrubbed = b"token=[REDACTED] and [REDACTED]";
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(scrubbed).as_str())
+        );
+        assert_eq!(store.blobs()[0].1, scrubbed);
+    }
+
+    #[tokio::test]
+    async fn response_secret_split_across_frames_is_redacted_in_capture() {
+        // Regression: per-frame redaction leaked a secret straddling two DATA frames.
+        // The capture is buffered and redacted once at finalize, so the split token is
+        // still caught; the forwarded frames stay byte-for-byte intact.
+        let (handler, mut rx, store) = handler_with(None, RedactionPolicy::enabled());
+        let teed = handler.tee_body(
+            RESPONSE_KIND,
+            "http.response.body_size",
+            vec![("http.status_code", "200".to_owned())],
+            None,
+            streaming_body(&[b"Bearer super", b"secret-token-here"]),
+        );
+
+        let chunks = drain_body(teed).await;
+        assert_eq!(
+            chunks.concat(),
+            b"Bearer supersecret-token-here",
+            "forwarded frames must be untouched"
+        );
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(b"[REDACTED]").as_str())
+        );
+        assert_eq!(store.blobs()[0].1, b"[REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn response_disabled_redaction_does_not_buffer_copy_for_forwarding() {
+        // The disabled path still captures verbatim and forwards untouched; this guards
+        // the zero-extra-copy disabled branch behaviorally.
+        let (handler, mut rx, store) = handler_with(None, RedactionPolicy::disabled());
+        let teed = handler.tee_body(
+            RESPONSE_KIND,
+            "http.response.body_size",
+            vec![("http.status_code", "200".to_owned())],
+            None,
+            streaming_body(&[b"Bearer super", b"secret"]),
+        );
+        let chunks = drain_body(teed).await;
+        assert_eq!(chunks.concat(), b"Bearer supersecret");
+
+        let _signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(store.blobs()[0].1, b"Bearer supersecret");
+    }
+
+    #[tokio::test]
+    async fn response_body_is_persisted_verbatim_when_redaction_disabled() {
+        let (handler, mut rx, store) = handler_with(None, RedactionPolicy::disabled());
+        let teed = handler.tee_body(
+            RESPONSE_KIND,
+            "http.response.body_size",
+            vec![("http.status_code", "200".to_owned())],
+            None,
+            streaming_body(&[b"Bearer supersecret"]),
+        );
+        drain_body(teed).await;
+
+        let _signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(store.blobs()[0].1, b"Bearer supersecret");
     }
 }
