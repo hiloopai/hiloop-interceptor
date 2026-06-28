@@ -185,6 +185,7 @@ const fn signal_str(signal: SignalType) -> &'static str {
         SignalType::Net => "net",
         SignalType::Exec => "exec",
         SignalType::Llm => "llm",
+        SignalType::Annotation => "annotation",
     }
 }
 
@@ -375,6 +376,7 @@ mod tests {
     fn maps_payload_ref_and_signals() {
         assert_eq!(signal_str(SignalType::Span), "span");
         assert_eq!(signal_str(SignalType::Net), "net");
+        assert_eq!(signal_str(SignalType::Annotation), "annotation");
 
         let event = sample_event().with_payload_ref(
             PayloadRef::new(PayloadDigest::new("blake3:abc").expect("digest")).with_size_bytes(9),
