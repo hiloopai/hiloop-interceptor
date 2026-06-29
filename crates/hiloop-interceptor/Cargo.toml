@@ -28,6 +28,7 @@ http-body-util.workspace = true
 hudsucker.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+ipnet.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
 regex.workspace = true
@@ -38,6 +39,8 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+url.workspace = true
+zeroize.workspace = true
 
 # Signal forwarding and process-group teardown are Unix-only (the wrapper's
 # PID-1/supervisor product scope). nix is available to the binary and the

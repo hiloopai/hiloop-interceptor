@@ -10,6 +10,19 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- Egress policy enforcement for intercepted HTTP(S) traffic (`--egress-mode allow|deny` with
+  repeatable `--egress-domain` / `--egress-cidr` rules, and the `RunOptions::with_egress` builder).
+  Hosts are canonicalized (control-char/percent/userinfo rejection, IDNA→punycode, IP-literal
+  detection across dotted/decimal/hex/octal/IPv6/IPv4-mapped notations) before a label-anchored
+  domain match or CIDR membership check; a denied CONNECT or decrypted request — or a decrypted
+  `Host` that disagrees with the CONNECT's SNI host — short-circuits with `403` and emits a structured
+  `egress.denied` event. This is a **cooperative** control over proxied traffic; the un-bypassable
+  egress boundary is host-side.
+- Credential injection: bind a named secret to a destination host and request header
+  (`--secret-binding`, broker via `--secret-broker-url` + `HILOOP_SECRET_BROKER_TOKEN`, and the
+  `RunOptions::with_secret_bindings` builder). On a request to the bound host the proxy resolves the
+  secret from the broker and writes `<scheme> <value>` into the header; the value is scrubbed from the
+  captured telemetry, zeroized after use, and a broker failure fails the request closed.
 - gRPC export now flushes on a size **or** age trigger, whichever comes first: a partial batch ships
   once it has waited `--export-flush-interval-ms` (default 1000 ms; `0` disables the timer) even
   before it reaches `--export-batch-size` (default 128). This bounds export latency so a long-running
