@@ -32,16 +32,18 @@ use hiloop_core::{
 };
 use std::{
     ffi::OsString,
-    io::Write as _,
+    future::Future,
+    io::{self, IsTerminal, Write as _},
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     process::{ExitCode, ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    process::Command,
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::mpsc,
 };
 
@@ -50,6 +52,8 @@ const OTEL_RUN_ID: &str = "hiloop.run.id";
 const OTEL_FORK_NODE_ID: &str = "hiloop.fork.node_id";
 const OTEL_FORK_PATH: &str = "hiloop.fork.path";
 const OTEL_EXECUTION_ID: &str = "hiloop.execution.id";
+
+type CaptureFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 
 /// gRPC export target for captured events.
 #[derive(Debug, Clone)]
@@ -91,6 +95,7 @@ pub struct RunOptions {
     egress: EgressPolicy,
     secret_bindings: Vec<SecretBinding>,
     secret_broker: Option<BrokerConfig>,
+    verbose_diagnostics: bool,
 }
 
 impl RunOptions {
@@ -140,6 +145,7 @@ impl RunOptions {
             egress: EgressPolicy::default(),
             secret_bindings: Vec::new(),
             secret_broker: None,
+            verbose_diagnostics: false,
         }
     }
 
@@ -215,6 +221,13 @@ impl RunOptions {
             );
             self.execution_id = Some(execution_id);
         }
+        self
+    }
+
+    /// Print wrapper diagnostics to stderr. Disabled by default so `run` stays transparent.
+    #[must_use]
+    pub fn with_verbose_diagnostics(mut self, verbose: bool) -> Self {
+        self.verbose_diagnostics = verbose;
         self
     }
 }
@@ -413,7 +426,7 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
-    let status = with_signal_forwarding(child.id(), child.wait())
+    let status = with_signal_forwarding(child.id(), None, child.wait())
         .await
         .with_context(|| format!("failed to run child command `{}`", options.command[0]))?;
     Ok(exit_code_from_status(status))
@@ -474,13 +487,21 @@ where
         _ => None,
     };
 
-    let mut child = Command::new(&options.command[0]);
-    child
-        .args(&options.command[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut command = Command::new(&options.command[0]);
+    command.args(&options.command[1..]).kill_on_drop(true);
+    #[cfg(unix)]
+    let pty_stdio = configure_interactive_pty_stdio(&mut command)?;
+    #[cfg(unix)]
+    let uses_pty = pty_stdio.is_some();
+    #[cfg(not(unix))]
+    let uses_pty = false;
+    if !uses_pty {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        set_child_process_group(&mut command);
+    }
     let mut child_env = ChildEnv::for_run(&options.context, options.execution_id.as_deref());
     if let Some(receiver) = &otlp_receiver {
         let addr = receiver
@@ -494,26 +515,21 @@ where
             .context("failed to read proxy server address")?;
         child_env.set_proxy(addr, file.path());
     }
-    child_env.apply_to(&mut child);
-    set_child_process_group(&mut child);
+    child_env.apply_to(&mut command);
 
-    let mut child = child
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
+    drop(command);
     let child_pid = child.id();
     let process = child_process_context(options, child_pid);
-    let child_stdin = child
-        .stdin
-        .take()
-        .context("child stdin was not available for capture")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("child stdout was not available for capture")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("child stderr was not available for capture")?;
+    #[cfg(unix)]
+    let stdio = match pty_stdio {
+        Some(pty_stdio) => CaptureStdio::Pty(Box::new(pty_stdio)),
+        None => take_piped_stdio(&mut child)?,
+    };
+    #[cfg(not(unix))]
+    let stdio = take_piped_stdio(&mut child)?;
 
     let mut options_pipeline = PipelineOptions::default()
         .with_export_batch_size(options.export_batch_size)
@@ -524,40 +540,42 @@ where
     }
     let (signal_tx, signal_rx) = mpsc::channel(options_pipeline.raw_queue_capacity());
 
-    let stdout_capture = capture_stream(
-        stdout,
-        tokio::io::stdout(),
-        "stdout",
-        signal_tx.clone(),
-        Arc::clone(&clock),
-    );
-    let stderr_capture = capture_stream(
-        stderr,
-        tokio::io::stderr(),
-        "stderr",
-        signal_tx.clone(),
-        Arc::clone(&clock),
-    );
-    // stdin: pump the parent's stdin into the child while capturing it as `process.stdin` events.
-    // Unlike stdout/stderr (which EOF when the child exits), the parent's stdin may never close (an
-    // interactive TTY), so a child-exit shutdown signal cancels the pump instead of blocking teardown.
-    // When the pump ends — parent EOF or shutdown — `child_stdin` drops, closing the child's stdin.
     let (stdin_shutdown_tx, stdin_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let stdin_capture = {
-        let signal_tx = signal_tx.clone();
-        let clock = Arc::clone(&clock);
-        async move {
-            tokio::select! {
-                result = capture_stream(
-                    tokio::io::stdin(),
-                    child_stdin,
-                    "stdin",
-                    signal_tx,
-                    clock,
-                ) => result,
-                _ = stdin_shutdown_rx => Ok(()),
-            }
-        }
+    #[cfg(unix)]
+    let pty_resize_fd = match &stdio {
+        CaptureStdio::Pty(pty) => Some(
+            pty.resize_fd
+                .try_clone()
+                .context("failed to clone PTY resize handle")?,
+        ),
+        CaptureStdio::Pipes { .. } => None,
+    };
+    #[cfg(not(unix))]
+    let pty_resize_fd = ();
+    let (stdin_capture, stdout_capture, stderr_capture): (
+        CaptureFuture<'_>,
+        CaptureFuture<'_>,
+        CaptureFuture<'_>,
+    ) = match stdio {
+        CaptureStdio::Pipes {
+            stdin,
+            stdout,
+            stderr,
+        } => stdio_pipe_captures(
+            stdin,
+            stdout,
+            stderr,
+            stdin_shutdown_rx,
+            signal_tx.clone(),
+            Arc::clone(&clock),
+        ),
+        #[cfg(unix)]
+        CaptureStdio::Pty(pty) => stdio_pty_captures(
+            *pty,
+            stdin_shutdown_rx,
+            signal_tx.clone(),
+            Arc::clone(&clock),
+        ),
     };
 
     let (otlp_shutdown_tx, otlp_server) = match otlp_receiver {
@@ -625,7 +643,7 @@ where
     // The child exiting is the cue to stop the capture servers: dropping their
     // senders lets the pipeline drain and finish.
     let child_and_shutdown = async {
-        let status = with_signal_forwarding(child_pid, child.wait())
+        let status = with_signal_forwarding(child_pid, pty_resize_fd, child.wait())
             .await
             .with_context(|| format!("failed to wait for child command `{}`", options.command[0]));
         // Stop the stdin pump (its source may never EOF) and the capture servers; dropping their
@@ -642,9 +660,11 @@ where
         }
     };
     let proxy_task = async {
-        // Capture is best effort: a proxy failure is reported, not fatal to the child.
+        // Capture is best effort: a proxy failure can be diagnosed with --verbose, but is not fatal
+        // to the child.
         if let Some(task) = proxy_server_task
             && let Err(error) = task.await
+            && options.verbose_diagnostics
         {
             eprintln!("hiloop-interceptor: proxy capture failed: {error}");
         }
@@ -682,6 +702,509 @@ fn child_process_context(options: &RunOptions, pid: Option<u32>) -> ProcessConte
     }
 }
 
+enum CaptureStdio {
+    Pipes {
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+    },
+    #[cfg(unix)]
+    Pty(Box<PtyStdio>),
+}
+
+#[cfg(unix)]
+struct PtyStdio {
+    master_reader: tokio::fs::File,
+    master_writer: tokio::fs::File,
+    resize_fd: std::fs::File,
+    raw_mode: RawTerminalMode,
+}
+
+fn take_piped_stdio(child: &mut Child) -> Result<CaptureStdio> {
+    let stdin = child
+        .stdin
+        .take()
+        .context("child stdin was not available for capture")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("child stdout was not available for capture")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("child stderr was not available for capture")?;
+    Ok(CaptureStdio::Pipes {
+        stdin,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(unix)]
+fn configure_interactive_pty_stdio(command: &mut Command) -> Result<Option<PtyStdio>> {
+    use std::os::fd::AsRawFd as _;
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    if !(stdin.is_terminal() && stdout.is_terminal() && stderr.is_terminal()) {
+        return Ok(None);
+    }
+
+    let raw_mode = RawTerminalMode::enable(&stdin).context("failed to enter raw terminal mode")?;
+    let winsize = current_terminal_winsize();
+    let pty = nix::pty::openpty(winsize.as_ref(), None).context("failed to allocate PTY")?;
+    let master = std::fs::File::from(pty.master);
+    set_cloexec(master.as_raw_fd()).context("failed to set PTY master close-on-exec")?;
+    let resize_fd = master
+        .try_clone()
+        .context("failed to clone PTY master for resize forwarding")?;
+    let master_reader = tokio::fs::File::from_std(
+        master
+            .try_clone()
+            .context("failed to clone PTY master for output capture")?,
+    );
+    let master_writer = tokio::fs::File::from_std(master);
+    let slave = std::fs::File::from(pty.slave);
+    command
+        .stdin(Stdio::from(
+            slave
+                .try_clone()
+                .context("failed to clone PTY slave for stdin")?,
+        ))
+        .stdout(Stdio::from(
+            slave
+                .try_clone()
+                .context("failed to clone PTY slave for stdout")?,
+        ))
+        .stderr(Stdio::from(slave));
+    set_child_controlling_terminal(command);
+
+    Ok(Some(PtyStdio {
+        master_reader,
+        master_writer,
+        resize_fd,
+        raw_mode,
+    }))
+}
+
+#[cfg(unix)]
+struct RawTerminalMode {
+    original: nix::sys::termios::Termios,
+}
+
+#[cfg(unix)]
+impl RawTerminalMode {
+    fn enable(stdin: &io::Stdin) -> Result<Self> {
+        use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
+
+        let original = tcgetattr(stdin).context("failed to read terminal mode")?;
+        let mut raw = original.clone();
+        cfmakeraw(&mut raw);
+        tcsetattr(stdin, SetArg::TCSANOW, &raw).context("failed to set raw terminal mode")?;
+        Ok(Self { original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawTerminalMode {
+    fn drop(&mut self) {
+        use nix::sys::termios::{SetArg, tcsetattr};
+
+        let stdin = io::stdin();
+        let _ = tcsetattr(&stdin, SetArg::TCSANOW, &self.original);
+    }
+}
+
+#[cfg(unix)]
+fn current_terminal_winsize() -> Option<nix::pty::Winsize> {
+    use std::os::fd::AsRawFd as _;
+
+    let stdout = io::stdout();
+    if stdout.is_terminal() {
+        return read_winsize(stdout.as_raw_fd());
+    }
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return read_winsize(stdin.as_raw_fd());
+    }
+    None
+}
+
+#[cfg(unix)]
+fn read_winsize(fd: std::os::fd::RawFd) -> Option<nix::pty::Winsize> {
+    let mut winsize = std::mem::MaybeUninit::<nix::pty::Winsize>::uninit();
+    // SAFETY: `ioctl(TIOCGWINSZ)` writes a `winsize` struct to the provided pointer when it returns
+    // success. `fd` is borrowed from stdin/stdout and remains valid for the duration of the call.
+    #[expect(
+        unsafe_code,
+        reason = "terminal size is only exposed through ioctl(TIOCGWINSZ); see SAFETY"
+    )]
+    let rc = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCGWINSZ, winsize.as_mut_ptr()) };
+    if rc == 0 {
+        // SAFETY: a zero return from TIOCGWINSZ means the kernel initialized the struct.
+        #[expect(
+            unsafe_code,
+            reason = "TIOCGWINSZ success initializes the winsize struct; see SAFETY"
+        )]
+        Some(unsafe { winsize.assume_init() })
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn set_pty_winsize(fd: std::os::fd::RawFd, winsize: &nix::pty::Winsize) -> io::Result<()> {
+    // SAFETY: `ioctl(TIOCSWINSZ)` reads the provided winsize struct and applies it to a PTY fd.
+    // Errors are reported via errno and do not affect Rust memory safety.
+    #[expect(
+        unsafe_code,
+        reason = "terminal resize forwarding uses ioctl(TIOCSWINSZ); see SAFETY"
+    )]
+    let rc = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, std::ptr::from_ref(winsize)) };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn set_child_controlling_terminal(command: &mut Command) {
+    // SAFETY: this pre-exec closure runs after stdio has been remapped to the PTY slave and before
+    // exec. It calls only async-signal-safe libc functions to make the child a session leader with
+    // fd 0 as its controlling terminal.
+    #[expect(
+        unsafe_code,
+        reason = "pre-exec PTY setup requires setsid + TIOCSCTTY in the child; see SAFETY"
+    )]
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if nix::libc::ioctl(nix::libc::STDIN_FILENO, nix::libc::TIOCSCTTY, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn stdio_pipe_captures(
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    stdin_shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: Arc<hiloop_core::identity::HlcClock>,
+) -> (
+    CaptureFuture<'static>,
+    CaptureFuture<'static>,
+    CaptureFuture<'static>,
+) {
+    let stdout_capture = Box::pin(capture_stream(
+        stdout,
+        tokio::io::stdout(),
+        "stdout",
+        signal_tx.clone(),
+        Arc::clone(&clock),
+    ));
+    let stderr_capture = Box::pin(capture_stream(
+        stderr,
+        tokio::io::stderr(),
+        "stderr",
+        signal_tx.clone(),
+        Arc::clone(&clock),
+    ));
+    let stdin_capture = Box::pin(stdin_capture(stdin, stdin_shutdown_rx, signal_tx, clock));
+    (stdin_capture, stdout_capture, stderr_capture)
+}
+
+#[cfg(unix)]
+fn stdio_pty_captures(
+    pty: PtyStdio,
+    stdin_shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: Arc<hiloop_core::identity::HlcClock>,
+) -> (
+    CaptureFuture<'static>,
+    CaptureFuture<'static>,
+    CaptureFuture<'static>,
+) {
+    let PtyStdio {
+        master_reader,
+        master_writer,
+        resize_fd: _,
+        raw_mode,
+    } = pty;
+    let stdin_capture = Box::pin(pty_stdin_capture(
+        master_writer,
+        stdin_shutdown_rx,
+        signal_tx.clone(),
+        Arc::clone(&clock),
+    ));
+    let stdout_capture = Box::pin(async move {
+        let _raw_mode = raw_mode;
+        capture_pty_output(
+            master_reader,
+            tokio::io::stdout(),
+            "stdout",
+            signal_tx,
+            clock,
+        )
+        .await
+    });
+    let stderr_capture = Box::pin(async { Ok(()) });
+    (stdin_capture, stdout_capture, stderr_capture)
+}
+
+#[cfg(unix)]
+async fn pty_stdin_capture<W>(
+    child_stdin: W,
+    stdin_shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: Arc<hiloop_core::identity::HlcClock>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        result = capture_nonblocking_stdin(child_stdin, signal_tx, clock) => result,
+        _ = stdin_shutdown_rx => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+async fn capture_nonblocking_stdin<W>(
+    mut writer: W,
+    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: Arc<hiloop_core::identity::HlcClock>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    let (stdin, stdin_flags) = {
+        // SAFETY: `dup(0)` returns a new owned descriptor on success. Its status flags are shared
+        // with fd 0, so the restore guard resets the parent terminal flags when capture ends.
+        #[expect(
+            unsafe_code,
+            reason = "dup(2) is needed to drive terminal stdin through AsyncFd; see SAFETY"
+        )]
+        let fd = unsafe { nix::libc::dup(nix::libc::STDIN_FILENO) };
+        if fd == -1 {
+            return Err(io::Error::last_os_error()).context("failed to duplicate stdin");
+        }
+        // SAFETY: `fd` is the successful return from `dup`, so this takes ownership exactly once.
+        #[expect(
+            unsafe_code,
+            reason = "successful dup returns a fresh owned fd; see SAFETY"
+        )]
+        let stdin = unsafe { OwnedFd::from_raw_fd(fd) };
+        let restore = set_nonblocking_with_restore(stdin.as_raw_fd(), nix::libc::STDIN_FILENO)
+            .context("failed to set stdin duplicate nonblocking")?;
+        (stdin, restore)
+    };
+    let stdin = tokio::io::unix::AsyncFd::new(stdin).context("failed to register stdin")?;
+    let _stdin_flags = stdin_flags;
+    let mut framer = LineFramer::new(MAX_STDIO_LINE_BYTES);
+    let mut buffer = [0; 8192];
+    let mut signal_tx = Some(signal_tx);
+
+    loop {
+        let mut guard = stdin
+            .readable()
+            .await
+            .context("failed to wait for stdin readiness")?;
+        let read = match guard.try_io(|inner| {
+            // SAFETY: `buffer` is valid for writes up to its length, and `inner` owns a valid
+            // nonblocking duplicate of stdin for the duration of the call.
+            #[expect(
+                unsafe_code,
+                reason = "read(2) is used with AsyncFd for cancellable terminal input; see SAFETY"
+            )]
+            let rc = unsafe {
+                nix::libc::read(
+                    inner.get_ref().as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if rc >= 0 {
+                usize::try_from(rc).map_err(|_| io::Error::other("stdin read count out of range"))
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }) {
+            Ok(Ok(read)) => read,
+            Ok(Err(error)) if is_pty_eio(&error) => 0,
+            Ok(Err(error)) => return Err(error).context("failed to read stdin"),
+            Err(_would_block) => continue,
+        };
+        if read == 0 {
+            break;
+        }
+
+        let chunk = &buffer[..read];
+        if let Err(error) = writer.write_all(chunk).await {
+            if is_pty_eio(&error) {
+                break;
+            }
+            return Err(error).context("failed to write stdin to child PTY");
+        }
+        if let Err(error) = writer.flush().await {
+            if is_pty_eio(&error) {
+                break;
+            }
+            return Err(error).context("failed to flush child PTY stdin");
+        }
+
+        for record in framer.push(chunk) {
+            send_stdio_signal(&mut signal_tx, "stdin", &clock, record).await;
+        }
+    }
+
+    if let Some(record) = framer.flush() {
+        send_stdio_signal(&mut signal_tx, "stdin", &clock, record).await;
+    }
+
+    if signal_tx.is_none() {
+        bail!("stdio event pipeline stopped before stdin capture finished");
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+struct FdStatusRestore {
+    fd: std::os::fd::RawFd,
+    flags: nix::libc::c_int,
+}
+
+#[cfg(unix)]
+impl Drop for FdStatusRestore {
+    fn drop(&mut self) {
+        let _ = set_fd_status_flags(self.fd, self.flags);
+    }
+}
+
+#[cfg(unix)]
+fn set_nonblocking_with_restore(
+    fd: std::os::fd::RawFd,
+    restore_fd: std::os::fd::RawFd,
+) -> io::Result<FdStatusRestore> {
+    let flags = fd_status_flags(fd)?;
+    set_fd_status_flags(fd, flags | nix::libc::O_NONBLOCK)?;
+    Ok(FdStatusRestore {
+        fd: restore_fd,
+        flags,
+    })
+}
+
+#[cfg(unix)]
+fn fd_status_flags(fd: std::os::fd::RawFd) -> io::Result<nix::libc::c_int> {
+    // SAFETY: `fcntl` operates on a valid descriptor; errors are reported via errno and do not
+    // affect Rust memory safety.
+    #[expect(
+        unsafe_code,
+        reason = "fcntl(F_GETFL) reads descriptor status flags; see SAFETY"
+    )]
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+    if flags == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(flags)
+    }
+}
+
+#[cfg(unix)]
+fn set_fd_status_flags(fd: std::os::fd::RawFd, flags: nix::libc::c_int) -> io::Result<()> {
+    // SAFETY: `fcntl` operates on a valid descriptor; errors are reported via errno and do not
+    // affect Rust memory safety.
+    #[expect(
+        unsafe_code,
+        reason = "fcntl(F_SETFL) writes descriptor status flags; see SAFETY"
+    )]
+    let rc = unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFL, flags) };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn set_cloexec(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // SAFETY: `fcntl` operates on a valid descriptor; errors are reported via errno and do not
+    // affect Rust memory safety.
+    #[expect(
+        unsafe_code,
+        reason = "fcntl(F_GETFD/F_SETFD) configures descriptor inheritance; see SAFETY"
+    )]
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: same descriptor as above; the flag value preserves existing flags and adds FD_CLOEXEC.
+    #[expect(
+        unsafe_code,
+        reason = "fcntl(F_SETFD) configures descriptor inheritance; see SAFETY"
+    )]
+    let rc = unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, flags | nix::libc::FD_CLOEXEC) };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+async fn stdin_capture<W>(
+    child_stdin: W,
+    stdin_shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: Arc<hiloop_core::identity::HlcClock>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // stdin: pump the parent's stdin into the child while capturing it as `process.stdin` events.
+    // Unlike stdout/stderr (which EOF when the child exits), the parent's stdin may never close (an
+    // interactive TTY), so a child-exit shutdown signal cancels the pump instead of blocking teardown.
+    // When the pump ends — parent EOF or shutdown — `child_stdin` drops, closing the child's stdin.
+    let task = tokio::spawn(capture_stream(
+        tokio::io::stdin(),
+        child_stdin,
+        "stdin",
+        signal_tx,
+        clock,
+    ));
+    tokio::pin!(task);
+    tokio::select! {
+        result = &mut task => result.context("stdin capture task panicked")?,
+        _ = stdin_shutdown_rx => {
+            task.abort();
+            Ok(())
+        },
+    }
+}
+
+#[cfg(unix)]
+async fn capture_pty_output<R, W>(
+    reader: R,
+    writer: W,
+    stream_name: &'static str,
+    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: Arc<hiloop_core::identity::HlcClock>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    capture_stream_impl(reader, writer, stream_name, signal_tx, clock, true).await
+}
+
 // TODO(source-seam): migrate this inline capture to `stdio::StdioSource`, which
 // already composes the same `LineFramer` + verbatim-tee logic behind the
 // `Source` trait. The blocker is a deliberate behavior difference, not the
@@ -695,13 +1218,28 @@ fn child_process_context(options: &RunOptions, pid: Option<u32>) -> ProcessConte
 // the migration must instead drive two `StdioSource`s against a shared
 // `RawSignalSink` and decide how to preserve the closed-pipeline-is-fatal
 // contract (e.g. a sink-closed callback or a supervisor-side check). Until that
-// is designed, keep this path byte-for-byte to protect TESTING.md B1-B16.
+// is designed, keep this behavior stable to protect TESTING.md B1-B16.
 async fn capture_stream<R, W>(
+    reader: R,
+    writer: W,
+    stream_name: &'static str,
+    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    clock: Arc<hiloop_core::identity::HlcClock>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    capture_stream_impl(reader, writer, stream_name, signal_tx, clock, false).await
+}
+
+async fn capture_stream_impl<R, W>(
     mut reader: R,
     mut writer: W,
     stream_name: &'static str,
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
     clock: Arc<hiloop_core::identity::HlcClock>,
+    pty_eio_is_eof: bool,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -712,10 +1250,13 @@ where
     let mut signal_tx = Some(signal_tx);
 
     loop {
-        let read = reader
-            .read(&mut buffer)
-            .await
-            .with_context(|| format!("failed to read child {stream_name}"))?;
+        let read = match reader.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error) if pty_eio_is_eof && is_pty_eio(&error) => 0,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read child {stream_name}"));
+            }
+        };
         if read == 0 {
             break;
         }
@@ -744,6 +1285,18 @@ where
     }
 
     Ok(())
+}
+
+fn is_pty_eio(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(nix::libc::EIO)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 async fn send_stdio_signal(
@@ -809,7 +1362,11 @@ fn set_child_process_group(command: &mut Command) {
 /// the child and reports its exit status. If handler installation fails, or off
 /// Unix, `work` runs without forwarding.
 #[cfg(unix)]
-async fn with_signal_forwarding<F, T>(child_pid: Option<u32>, work: F) -> T
+async fn with_signal_forwarding<F, T>(
+    child_pid: Option<u32>,
+    pty_resize_fd: Option<std::fs::File>,
+    work: F,
+) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -821,6 +1378,11 @@ where
     ) else {
         return work.await;
     };
+    let mut sigwinch = if pty_resize_fd.is_some() {
+        signal(SignalKind::window_change()).ok()
+    } else {
+        None
+    };
 
     tokio::pin!(work);
     loop {
@@ -828,16 +1390,39 @@ where
             output = &mut work => return output,
             _ = sigint.recv() => forward_signal(child_pid, nix::sys::signal::Signal::SIGINT),
             _ = sigterm.recv() => forward_signal(child_pid, nix::sys::signal::Signal::SIGTERM),
+            () = async {
+                match sigwinch.as_mut() {
+                    Some(sigwinch) => {
+                        if sigwinch.recv().await.is_none() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if let Some(pty) = &pty_resize_fd {
+                    resize_pty_to_current_terminal(pty);
+                }
+            },
         }
     }
 }
 
 #[cfg(not(unix))]
-async fn with_signal_forwarding<F, T>(_child_pid: Option<u32>, work: F) -> T
+async fn with_signal_forwarding<F, T>(_child_pid: Option<u32>, _pty_resize_fd: (), work: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
     work.await
+}
+
+#[cfg(unix)]
+fn resize_pty_to_current_terminal(pty: &std::fs::File) {
+    use std::os::fd::AsRawFd as _;
+
+    if let Some(winsize) = current_terminal_winsize() {
+        let _ = set_pty_winsize(pty.as_raw_fd(), &winsize);
+    }
 }
 
 /// Best-effort forward of `signal` to the child's process group.
@@ -916,6 +1501,25 @@ mod tests {
         // Signal termination uses the conventional 128 + signo encoding.
         assert_eq!(exit_u8_from_status(ExitStatus::from_raw(15)), 143); // SIGTERM
         assert_eq!(exit_u8_from_status(ExitStatus::from_raw(2)), 130); // SIGINT
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonblocking_guard_restores_status_flags() {
+        use std::os::fd::AsRawFd as _;
+
+        let (reader, _writer) = nix::unistd::pipe().expect("pipe");
+        let original = fd_status_flags(reader.as_raw_fd()).expect("initial flags");
+
+        {
+            let _restore = set_nonblocking_with_restore(reader.as_raw_fd(), reader.as_raw_fd())
+                .expect("set nonblocking");
+            let flags = fd_status_flags(reader.as_raw_fd()).expect("nonblocking flags");
+            assert_ne!(flags & nix::libc::O_NONBLOCK, 0);
+        }
+
+        let restored = fd_status_flags(reader.as_raw_fd()).expect("restored flags");
+        assert_eq!(restored, original);
     }
 
     #[test]
@@ -1113,6 +1717,14 @@ mod tests {
                 .get(&AttributeKey::from_static(provenance_keys::EXECUTION_ID)),
             Some(&AttributeValue::String("exec-123".to_owned()))
         );
+    }
+
+    #[test]
+    fn run_options_suppress_verbose_diagnostics_by_default() {
+        let options = base_options(vec!["echo".to_owned(), "hi".to_owned()]);
+
+        assert!(!options.verbose_diagnostics);
+        assert!(options.with_verbose_diagnostics(true).verbose_diagnostics);
     }
 
     #[tokio::test]
