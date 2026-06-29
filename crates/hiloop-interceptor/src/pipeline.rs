@@ -832,9 +832,12 @@ mod tests {
     #[tokio::test]
     async fn pipeline_stamps_static_context_attributes() {
         let context = NormalizationContext::new(ForkContext::new_local_root()).with_attributes(
-            [(AttributeKey::from_static("execution_id"), "exec-123".into())]
-                .into_iter()
-                .collect(),
+            [(
+                AttributeKey::from_static(provenance_keys::EXECUTION_ID),
+                "exec-123".into(),
+            )]
+            .into_iter()
+            .collect(),
         );
         let normalizer = StdioLogNormalizer;
         let exporter = RecordingExporter::default();
@@ -858,7 +861,10 @@ mod tests {
         let events = exporter.events();
         let value = serde_json::to_value(&events[0]).expect("serialize event");
 
-        assert_eq!(value["attributes"]["execution_id"], "exec-123");
+        assert_eq!(
+            value["attributes"][provenance_keys::EXECUTION_ID],
+            "exec-123"
+        );
     }
 
     #[tokio::test]

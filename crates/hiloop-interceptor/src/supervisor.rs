@@ -19,7 +19,7 @@ use crate::{
     redact::RedactionPolicy,
     seams::{
         Exporter, NormalizationContext, Normalizer, NormalizerRouter, ProcessContext,
-        RawRetentionPolicy, RawSignal, RawStore, SourceError,
+        RawRetentionPolicy, RawSignal, RawStore, SourceError, provenance_keys,
     },
     secret::{BrokerConfig, SecretBinding, SecretInjector},
     stdio::StdioLogNormalizer,
@@ -49,6 +49,7 @@ const MAX_STDIO_LINE_BYTES: usize = 64 * 1024;
 const OTEL_RUN_ID: &str = "hiloop.run.id";
 const OTEL_FORK_NODE_ID: &str = "hiloop.fork.node_id";
 const OTEL_FORK_PATH: &str = "hiloop.fork.path";
+const OTEL_EXECUTION_ID: &str = "hiloop.execution.id";
 
 /// gRPC export target for captured events.
 #[derive(Debug, Clone)]
@@ -74,6 +75,7 @@ pub struct GrpcExportOptions {
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     context: ForkContext,
+    execution_id: Option<String>,
     command: Vec<String>,
     events_jsonl: Option<PathBuf>,
     raw_jsonl: Option<PathBuf>,
@@ -122,6 +124,7 @@ impl RunOptions {
     ) -> Self {
         Self {
             context,
+            execution_id: None,
             command,
             events_jsonl,
             raw_jsonl,
@@ -200,6 +203,20 @@ impl RunOptions {
         self.attributes.insert(key, value.into());
         self
     }
+
+    /// Stamp a control-plane execution id onto emitted events and child telemetry resources.
+    #[must_use]
+    pub fn with_execution_id(mut self, execution_id: impl Into<String>) -> Self {
+        let execution_id = execution_id.into();
+        if !execution_id.trim().is_empty() {
+            self.attributes.insert(
+                AttributeKey::from_static(provenance_keys::EXECUTION_ID),
+                execution_id.clone().into(),
+            );
+            self.execution_id = Some(execution_id);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,29 +225,40 @@ struct ChildEnv {
 }
 
 impl ChildEnv {
-    fn for_context(context: &ForkContext) -> Self {
-        let resource_attributes = format!(
-            "{OTEL_RUN_ID}={},{OTEL_FORK_NODE_ID}={},{OTEL_FORK_PATH}={}",
-            context.run_id, context.fork_node_id, context.fork_path
-        );
-
-        Self {
-            vars: vec![
-                ("HILOOP_RUN_ID".into(), context.run_id.to_string().into()),
-                (
-                    "HILOOP_FORK_NODE_ID".into(),
-                    context.fork_node_id.to_string().into(),
-                ),
-                (
-                    "HILOOP_FORK_PATH".into(),
-                    context.fork_path.to_string().into(),
-                ),
-                (
-                    "OTEL_RESOURCE_ATTRIBUTES".into(),
-                    resource_attributes.into(),
-                ),
-            ],
+    fn for_run(context: &ForkContext, execution_id: Option<&str>) -> Self {
+        let execution_id = execution_id.filter(|value| !value.trim().is_empty());
+        let mut resource_attributes = vec![
+            format!("{OTEL_RUN_ID}={}", context.run_id),
+            format!("{OTEL_FORK_NODE_ID}={}", context.fork_node_id),
+            format!("{OTEL_FORK_PATH}={}", context.fork_path),
+        ];
+        if let Some(execution_id) = execution_id {
+            resource_attributes.push(format!(
+                "{OTEL_EXECUTION_ID}={}",
+                encode_otel_resource_value(execution_id)
+            ));
         }
+
+        let mut vars = vec![
+            ("HILOOP_RUN_ID".into(), context.run_id.to_string().into()),
+            (
+                "HILOOP_FORK_NODE_ID".into(),
+                context.fork_node_id.to_string().into(),
+            ),
+            (
+                "HILOOP_FORK_PATH".into(),
+                context.fork_path.to_string().into(),
+            ),
+            (
+                "OTEL_RESOURCE_ATTRIBUTES".into(),
+                resource_attributes.join(",").into(),
+            ),
+        ];
+        if let Some(execution_id) = execution_id {
+            vars.push(("HILOOP_EXECUTION_ID".into(), execution_id.into()));
+        }
+
+        Self { vars }
     }
 
     #[cfg(test)]
@@ -269,6 +297,22 @@ impl ChildEnv {
     fn apply_to(&self, command: &mut Command) {
         command.envs(self.vars.iter().cloned());
     }
+}
+
+fn encode_otel_resource_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                use std::fmt::Write as _;
+                write!(&mut encoded, "%{byte:02X}").expect("writing to String cannot fail");
+            }
+        }
+    }
+    encoded
 }
 
 /// Supervise the child command described by `options`, returning its exit code.
@@ -363,7 +407,7 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
 
     let mut command = Command::new(&options.command[0]);
     command.args(&options.command[1..]);
-    ChildEnv::for_context(&options.context).apply_to(&mut command);
+    ChildEnv::for_run(&options.context, options.execution_id.as_deref()).apply_to(&mut command);
     set_child_process_group(&mut command);
 
     let mut child = command
@@ -437,7 +481,7 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child_env = ChildEnv::for_context(&options.context);
+    let mut child_env = ChildEnv::for_run(&options.context, options.execution_id.as_deref());
     if let Some(receiver) = &otlp_receiver {
         let addr = receiver
             .local_addr()
@@ -837,7 +881,7 @@ mod tests {
 
     #[test]
     fn child_env_sets_otlp_endpoint_and_protocol() {
-        let mut env = ChildEnv::for_context(&ForkContext::new_local_root());
+        let mut env = ChildEnv::for_run(&ForkContext::new_local_root(), None);
         env.set_otlp_endpoint("127.0.0.1:4317".parse().expect("addr"));
 
         let vars = env
@@ -881,7 +925,7 @@ mod tests {
         let fork_path = ForkPath::parse("/0/3").expect("fork path");
         let context = ForkContext::new(run_id, fork_node_id, fork_path);
 
-        let env = ChildEnv::for_context(&context);
+        let env = ChildEnv::for_run(&context, None);
         let vars = env
             .vars()
             .iter()
@@ -910,6 +954,38 @@ mod tests {
             Some(
                 "hiloop.run.id=01J00000000000000000000000,hiloop.fork.node_id=01J00000000000000000000001,hiloop.fork.path=/0/3"
             )
+        );
+    }
+
+    #[test]
+    fn child_env_stamps_execution_id_when_present() {
+        let env = ChildEnv::for_run(&ForkContext::new_local_root(), Some("execution-123"));
+        let vars = env
+            .vars()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        assert_eq!(
+            vars.get("HILOOP_EXECUTION_ID").map(String::as_str),
+            Some("execution-123")
+        );
+        assert!(
+            vars.get("OTEL_RESOURCE_ATTRIBUTES")
+                .is_some_and(|attrs| attrs.contains(&format!("{OTEL_EXECUTION_ID}=execution-123")))
+        );
+    }
+
+    #[test]
+    fn otel_resource_attribute_values_are_percent_encoded() {
+        assert_eq!(
+            encode_otel_resource_value("exec,= id/1"),
+            "exec%2C%3D%20id%2F1"
         );
     }
 
@@ -1021,6 +1097,20 @@ mod tests {
             options
                 .attributes
                 .get(&AttributeKey::from_static("execution_id")),
+            Some(&AttributeValue::String("exec-123".to_owned()))
+        );
+    }
+
+    #[test]
+    fn run_options_with_execution_id_stamps_attribute_and_child_env_id() {
+        let options =
+            base_options(vec!["echo".to_owned(), "hi".to_owned()]).with_execution_id("exec-123");
+
+        assert_eq!(options.execution_id.as_deref(), Some("exec-123"));
+        assert_eq!(
+            options
+                .attributes
+                .get(&AttributeKey::from_static(provenance_keys::EXECUTION_ID)),
             Some(&AttributeValue::String("exec-123".to_owned()))
         );
     }

@@ -18,6 +18,7 @@ use thiserror::Error;
 
 /// Normalized attribute keys reserved for interceptor provenance.
 pub mod provenance_keys {
+    pub const EXECUTION_ID: &str = "execution.id";
     pub const NORMALIZER_NAME: &str = "normalizer.name";
     pub const NORMALIZER_VERSION: &str = "normalizer.version";
     pub const NORMALIZER_OUTPUT_SCHEMA_VERSION: &str = "normalizer.output_schema_version";
