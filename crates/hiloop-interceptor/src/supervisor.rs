@@ -26,7 +26,10 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use hiloop_core::identity::ForkContext;
+use hiloop_core::{
+    event::{AttributeKey, AttributeValue, Attributes},
+    identity::ForkContext,
+};
 use std::{
     ffi::OsString,
     io::Write as _,
@@ -81,6 +84,7 @@ pub struct RunOptions {
     export_grpc: Option<GrpcExportOptions>,
     export_batch_size: usize,
     export_flush_interval: Option<Duration>,
+    attributes: Attributes,
     redaction: RedactionPolicy,
     egress: EgressPolicy,
     secret_bindings: Vec<SecretBinding>,
@@ -128,6 +132,7 @@ impl RunOptions {
             export_grpc,
             export_batch_size: DEFAULT_EXPORT_BATCH_SIZE,
             export_flush_interval: Some(DEFAULT_EXPORT_FLUSH_INTERVAL),
+            attributes: Attributes::new(),
             redaction: RedactionPolicy::default(),
             egress: EgressPolicy::default(),
             secret_bindings: Vec::new(),
@@ -186,6 +191,13 @@ impl RunOptions {
     #[must_use]
     pub fn with_export_flush_interval(mut self, interval: Option<Duration>) -> Self {
         self.export_flush_interval = interval.filter(|d| !d.is_zero());
+        self
+    }
+
+    /// Stamp one static attribute onto every normalized event produced by this run.
+    #[must_use]
+    pub fn with_attribute(mut self, key: AttributeKey, value: impl Into<AttributeValue>) -> Self {
+        self.attributes.insert(key, value.into());
         self
     }
 }
@@ -555,8 +567,9 @@ where
     }
     let router = NormalizerRouter::new(normalizers).expect("router has at least one normalizer");
 
-    let normalization_context =
-        NormalizationContext::new(options.context.clone()).with_process(process);
+    let normalization_context = NormalizationContext::new(options.context.clone())
+        .with_attributes(options.attributes.clone())
+        .with_process(process);
     let stream = tokio_stream::wrappers::ReceiverStream::new(signal_rx);
     let mut pipeline_builder =
         Pipeline::with_router(normalization_context, router, exporter).options(options_pipeline);
@@ -997,6 +1010,19 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn run_options_carry_static_attributes() {
+        let options = base_options(vec!["echo".to_owned(), "hi".to_owned()])
+            .with_attribute(AttributeKey::from_static("execution_id"), "exec-123");
+
+        assert_eq!(
+            options
+                .attributes
+                .get(&AttributeKey::from_static("execution_id")),
+            Some(&AttributeValue::String("exec-123".to_owned()))
+        );
     }
 
     #[tokio::test]

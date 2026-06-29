@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
 use hiloop_core::{
-    event::{Event, PayloadRef},
+    event::{Attributes, Event, PayloadRef},
     identity::{ForkContext, Hlc},
 };
 use std::{
@@ -408,9 +408,10 @@ impl WrapperContext {
 }
 
 /// Context shared by every normalizer invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NormalizationContext {
     fork: ForkContext,
+    attributes: Attributes,
     pub process: Option<ProcessContext>,
     pub wrapper: WrapperContext,
 }
@@ -419,9 +420,17 @@ impl NormalizationContext {
     pub fn new(fork: ForkContext) -> Self {
         Self {
             fork,
+            attributes: Attributes::new(),
             process: None,
             wrapper: WrapperContext::current(),
         }
+    }
+
+    /// Attach attributes that every normalized event should carry.
+    #[must_use]
+    pub fn with_attributes(mut self, attributes: Attributes) -> Self {
+        self.attributes = attributes;
+        self
     }
 
     #[must_use]
@@ -432,6 +441,11 @@ impl NormalizationContext {
 
     pub fn fork_context(&self) -> &ForkContext {
         &self.fork
+    }
+
+    /// Static attributes stamped onto every normalized event.
+    pub fn attributes(&self) -> &Attributes {
+        &self.attributes
     }
 }
 

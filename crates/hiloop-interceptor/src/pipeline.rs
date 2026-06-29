@@ -507,6 +507,11 @@ fn stamp_normalization_metadata(
 ) -> Result<Event, PipelineError> {
     use provenance_keys as keys;
 
+    let mut event = event;
+    for (key, value) in context.attributes() {
+        event = event.with_attribute(key.clone(), value.clone());
+    }
+
     let mut event = event
         .with_attribute(
             AttributeKey::from_static(keys::NORMALIZER_NAME),
@@ -822,6 +827,38 @@ mod tests {
             value["attributes"][provenance_keys::WRAPPER_VERSION],
             env!("CARGO_PKG_VERSION")
         );
+    }
+
+    #[tokio::test]
+    async fn pipeline_stamps_static_context_attributes() {
+        let context = NormalizationContext::new(ForkContext::new_local_root()).with_attributes(
+            [(AttributeKey::from_static("execution_id"), "exec-123".into())]
+                .into_iter()
+                .collect(),
+        );
+        let normalizer = StdioLogNormalizer;
+        let exporter = RecordingExporter::default();
+        let raw = RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::from_static(b"hello"),
+        );
+        let stream = futures_util::stream::iter([Ok(raw)]);
+
+        Pipeline::new(context, &normalizer, &exporter)
+            .options(PipelineOptions::new(1, 1, 8).expect("pipeline options"))
+            .run(stream)
+            .await
+            .expect("pipeline should run");
+
+        let events = exporter.events();
+        let value = serde_json::to_value(&events[0]).expect("serialize event");
+
+        assert_eq!(value["attributes"]["execution_id"], "exec-123");
     }
 
     #[tokio::test]
