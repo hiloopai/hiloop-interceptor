@@ -165,6 +165,85 @@ async fn captures_and_tees_stdin_to_the_child() {
     assert_eq!(event["run_id"], RUN_ID);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn capture_preserves_tty_stdio_for_interactive_children() {
+    use nix::pty::openpty;
+    use tokio::io::AsyncReadExt as _;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let pty = openpty(None, None).expect("open pty");
+    let master = std::fs::File::from(pty.master);
+    let slave = std::fs::File::from(pty.slave);
+
+    let mut command = interceptor_command();
+    command
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(
+            "if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then \
+                 printf 'tty-ok\\n'; \
+             else \
+                 printf 'not-a-tty\\n'; \
+                 exit 42; \
+             fi",
+        )
+        .stdin(std::process::Stdio::from(
+            slave.try_clone().expect("clone pty slave for stdin"),
+        ))
+        .stdout(std::process::Stdio::from(
+            slave.try_clone().expect("clone pty slave for stdout"),
+        ))
+        .stderr(std::process::Stdio::from(slave));
+
+    let mut child = command.spawn().expect("spawn interceptor under pty");
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader_output = std::sync::Arc::clone(&output);
+    let mut master = tokio::fs::File::from_std(master);
+    let reader = tokio::spawn(async move {
+        let mut buf = [0_u8; 1024];
+        loop {
+            match master.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => reader_output
+                    .lock()
+                    .expect("output buffer mutex")
+                    .extend_from_slice(&buf[..n]),
+                Err(err) if err.raw_os_error() == Some(nix::libc::EIO) => break,
+                Err(err) => panic!("read pty output: {err}"),
+            }
+        }
+    });
+
+    let status = tokio::time::timeout(E2E_TIMEOUT, child.wait())
+        .await
+        .expect("pty capture scenario timed out")
+        .expect("wait for interceptor");
+    reader.abort();
+    let output = output.lock().expect("output buffer mutex").clone();
+
+    assert!(
+        status.success(),
+        "child should see a tty; pty output: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("tty-ok"),
+        "pty output: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        event_messages(&read_jsonl(&events_path), "stdout")
+            .iter()
+            .any(|message| message == "tty-ok"),
+        "tty output should be captured as stdout telemetry"
+    );
+}
+
 #[tokio::test]
 async fn capture_is_lossless_and_ordered_per_stream_under_load() {
     const LINE_COUNT: usize = 512;

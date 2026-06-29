@@ -30,7 +30,7 @@ hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 url = "2.5"
 # CIDR membership matching (IPv4 + IPv6) for egress policy. Pure Rust, MSRV-lenient.
 ipnet = "2"
-nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "process", "term"] }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 proptest = "1"
 prost = "0.14"

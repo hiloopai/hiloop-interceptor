@@ -196,6 +196,10 @@ struct RunArgs {
     )]
     export_flush_interval_ms: u64,
 
+    /// Print wrapper diagnostics to stderr.
+    #[arg(long = "verbose")]
+    verbose: bool,
+
     /// Command to wrap. Everything after `--` is passed to the child.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -247,7 +251,8 @@ impl RunArgs {
         .with_export_batch_size(self.export_batch_size)
         .with_export_flush_interval(export_flush_interval)
         .with_redaction(redaction)
-        .with_egress(egress);
+        .with_egress(egress)
+        .with_verbose_diagnostics(self.verbose);
 
         if !self.secret_binding.is_empty() {
             let url = self
