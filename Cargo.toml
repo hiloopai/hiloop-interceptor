@@ -23,7 +23,13 @@ hiloop-core = { version = "0.1.0", path = "crates/hiloop-core" }
 hudsucker = { version = "0.24", features = ["http2"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+# `client-legacy`/`http1` power the credential-broker HTTP client; `tokio` the proxy.
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+# IDNA/host canonicalization for egress policy matching (NFC + IDN→punycode + IP-literal
+# detection in every notation, via the WHATWG URL host parser). MSRV 1.63.
+url = "2.5"
+# CIDR membership matching (IPv4 + IPv6) for egress policy. Pure Rust, MSRV-lenient.
+ipnet = "2"
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 proptest = "1"
@@ -44,6 +50,8 @@ tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 ulid = { version = "1", features = ["serde"] }
+# Best-effort zeroing of fetched secret values after each request is built.
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

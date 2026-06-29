@@ -104,6 +104,65 @@ impl RedactionPolicy {
         }
         redact_body(body)
     }
+
+    /// Redact both the pattern set and any caller-supplied exact-literal secrets
+    /// (e.g. a credential the proxy injected into a request) from a captured body.
+    ///
+    /// The literals are scrubbed even when the policy is disabled: an injected
+    /// credential must never reach telemetry verbatim regardless of the body-pattern
+    /// redaction toggle, since the placeholder — not the secret — is what the user
+    /// authored. Pattern redaction still honors the toggle.
+    #[must_use]
+    pub fn redact_body_with_literals(self, body: Bytes, literals: &[&[u8]]) -> Bytes {
+        let body = self.redact_body(body);
+        redact_literals(body, literals)
+    }
+}
+
+/// Replace every occurrence of each non-empty `literal` in `body` with
+/// [`REDACTION_PLACEHOLDER`]. Returns the input untouched when nothing matches, so a
+/// body with no injected secret allocates nothing.
+#[must_use]
+pub fn redact_literals(body: Bytes, literals: &[&[u8]]) -> Bytes {
+    let needs = literals
+        .iter()
+        .any(|literal| !literal.is_empty() && contains_subslice(&body, literal));
+    if !needs {
+        return body;
+    }
+    let mut scrubbed = body.to_vec();
+    for literal in literals {
+        if literal.is_empty() {
+            continue;
+        }
+        scrubbed = replace_subslices(&scrubbed, literal, REDACTION_PLACEHOLDER.as_bytes());
+    }
+    Bytes::from(scrubbed)
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// Replace every non-overlapping occurrence of `needle` in `haystack` with
+/// `replacement`.
+fn replace_subslices(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut index = 0;
+    while index < haystack.len() {
+        if haystack[index..].starts_with(needle) {
+            out.extend_from_slice(replacement);
+            index += needle.len();
+        } else {
+            out.push(haystack[index]);
+            index += 1;
+        }
+    }
+    out
 }
 
 /// Scrub every `BODY_PATTERNS` match from `body`, replacing each with
@@ -227,6 +286,43 @@ mod tests {
         // "bearer" with no token must survive untouched.
         let prose = "the basketball score; AKIA short; just bearer";
         assert_eq!(redact(prose), prose);
+    }
+
+    #[test]
+    fn literal_redaction_scrubs_injected_value() {
+        let body = Bytes::from_static(b"prefix sk-injected-credential suffix");
+        let out = redact_literals(body, &[b"sk-injected-credential"]);
+        assert_eq!(out.as_ref(), b"prefix [REDACTED] suffix");
+    }
+
+    #[test]
+    fn literal_redaction_is_noop_when_absent() {
+        let body = Bytes::from_static(b"no secret here");
+        let out = redact_literals(body.clone(), &[b"absent-secret"]);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn literal_redaction_ignores_empty_literal() {
+        let body = Bytes::from_static(b"untouched");
+        let out = redact_literals(body.clone(), &[b""]);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn literals_redacted_even_when_pattern_redaction_disabled() {
+        let body = Bytes::from_static(b"value=injected-token-xyz");
+        let out =
+            RedactionPolicy::disabled().redact_body_with_literals(body, &[b"injected-token-xyz"]);
+        assert_eq!(out.as_ref(), b"value=[REDACTED]");
+    }
+
+    #[test]
+    fn redact_body_with_literals_applies_both_passes() {
+        // The pattern pass redacts the Bearer token; the literal pass the injected key.
+        let body = Bytes::from_static(b"Bearer abc and key injected-xyz done");
+        let out = RedactionPolicy::enabled().redact_body_with_literals(body, &[b"injected-xyz"]);
+        assert_eq!(out.as_ref(), b"[REDACTED] and key [REDACTED] done");
     }
 
     #[test]

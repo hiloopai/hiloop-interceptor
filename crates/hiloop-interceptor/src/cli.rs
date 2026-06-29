@@ -3,8 +3,10 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use hiloop_core::identity::{ForkContext, ForkNodeId, ForkPath, RunId};
+use hiloop_interceptor::egress::{EgressMode, EgressPolicy};
 use hiloop_interceptor::pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL_MS};
 use hiloop_interceptor::proxy::DEFAULT_MAX_CAPTURE_BYTES;
+use hiloop_interceptor::secret::{BrokerConfig, SecretBinding};
 use hiloop_interceptor::{GrpcExportOptions, RedactionPolicy, RunOptions, run};
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
@@ -23,7 +25,7 @@ impl Cli {
     async fn execute(self) -> Result<ExitCode> {
         match self.command {
             Command::Run(args) => {
-                let options = args.into_run_options();
+                let options = args.into_run_options()?;
                 Box::pin(run(&options)).await
             }
             Command::Inspect(args) => {
@@ -113,6 +115,44 @@ struct RunArgs {
     #[arg(long = "no-redact", env = "HILOOP_NO_REDACT")]
     no_redact: bool,
 
+    /// Egress policy mode for intercepted traffic: `allow` (deny only matched
+    /// destinations) or `deny` (allow only matched destinations, deny by default).
+    /// Defaults to `allow`. Requires `--proxy` when any rule is set.
+    #[arg(long = "egress-mode", value_enum, default_value_t = EgressModeArg::Allow)]
+    egress_mode: EgressModeArg,
+
+    /// Egress domain rule (repeatable). Matched at a label boundary: `example.com`
+    /// covers `example.com` and `api.example.com`, never `evil-example.com`.
+    #[arg(long = "egress-domain")]
+    egress_domain: Vec<String>,
+
+    /// Egress CIDR rule (repeatable), e.g. `10.0.0.0/8` or a bare address as a host
+    /// route. Matches IPv4 and IPv6 destinations, including IP-literal request hosts.
+    #[arg(long = "egress-cidr")]
+    egress_cidr: Vec<String>,
+
+    /// Bind a named secret to a destination host and header (repeatable), as
+    /// `name=<name>,placeholder=<token>,host=<host>,header=<header>[,scheme=<scheme>]`.
+    /// On a request to the bound host the proxy resolves the secret from the broker and
+    /// writes `<scheme> <value>` into the header. Requires `--secret-broker-url`.
+    #[arg(long = "secret-binding", value_parser = parse_secret_binding)]
+    secret_binding: Vec<SecretBinding>,
+
+    /// Credential broker endpoint the proxy resolves secret bindings from. The broker
+    /// token is read from `HILOOP_SECRET_BROKER_TOKEN` (never a flag, to keep it out of
+    /// argv). Required when `--secret-binding` is set.
+    #[arg(long = "secret-broker-url", env = "HILOOP_SECRET_BROKER_URL")]
+    secret_broker_url: Option<String>,
+
+    /// Bearer token authenticating the proxy to the credential broker. Read only from
+    /// the environment to keep it out of argv.
+    #[arg(
+        long = "secret-broker-token",
+        env = "HILOOP_SECRET_BROKER_TOKEN",
+        hide = true
+    )]
+    secret_broker_token: Option<String>,
+
     /// Stream captured events to a telemetry gateway over gRPC, e.g.
     /// `https://telemetry.example.com:443`. Composes with `--events-jsonl`. The API token is read
     /// from the `HILOOP_API_KEY` environment variable (never a flag, to keep it out of argv).
@@ -162,7 +202,7 @@ struct RunArgs {
 }
 
 impl RunArgs {
-    fn into_run_options(self) -> RunOptions {
+    fn into_run_options(self) -> Result<RunOptions> {
         let context = ForkContext::new(
             self.run_id.unwrap_or_default(),
             self.fork_node_id.unwrap_or_default(),
@@ -187,7 +227,13 @@ impl RunArgs {
 
         let max_capture_bytes = resolve_max_capture_bytes(self.max_capture_bytes);
 
-        RunOptions::new(
+        let egress = EgressPolicy::new(
+            self.egress_mode.into(),
+            self.egress_domain,
+            self.egress_cidr,
+        )?;
+
+        let mut options = RunOptions::new(
             context,
             self.command,
             self.events_jsonl,
@@ -201,7 +247,82 @@ impl RunArgs {
         .with_export_batch_size(self.export_batch_size)
         .with_export_flush_interval(export_flush_interval)
         .with_redaction(redaction)
+        .with_egress(egress);
+
+        if !self.secret_binding.is_empty() {
+            let url = self
+                .secret_broker_url
+                .ok_or_else(|| anyhow::anyhow!("--secret-binding requires --secret-broker-url"))?;
+            let token = self.secret_broker_token.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--secret-binding requires a broker token in HILOOP_SECRET_BROKER_TOKEN"
+                )
+            })?;
+            options =
+                options.with_secret_bindings(self.secret_binding, BrokerConfig { url, token });
+        }
+
+        Ok(options)
     }
+}
+
+/// CLI mirror of [`EgressMode`] so the lib crate stays clap-free.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum EgressModeArg {
+    Allow,
+    Deny,
+}
+
+impl From<EgressModeArg> for EgressMode {
+    fn from(arg: EgressModeArg) -> Self {
+        match arg {
+            EgressModeArg::Allow => EgressMode::Allow,
+            EgressModeArg::Deny => EgressMode::Deny,
+        }
+    }
+}
+
+/// Parse a `--secret-binding` value of the form
+/// `name=<name>,placeholder=<token>,host=<host>,header=<header>[,scheme=<scheme>]`.
+///
+/// Fields are comma-separated, so **field values may not contain a comma** — a comma in
+/// a value would be parsed as a field separator and silently truncate. Each field must
+/// be a single `key=value` pair, each key may appear at most once, and an empty value is
+/// rejected; any of these produces a clear error rather than a quietly mangled binding.
+fn parse_secret_binding(raw: &str) -> Result<SecretBinding, String> {
+    let mut name = None;
+    let mut placeholder = None;
+    let mut host = None;
+    let mut header = None;
+    let mut scheme = None;
+    for field in raw.split(',') {
+        let (key, value) = field.split_once('=').ok_or_else(|| {
+            format!("expected `key=value`, got `{field}` (values may not contain a comma)")
+        })?;
+        let key = key.trim();
+        if value.is_empty() {
+            return Err(format!("secret-binding field `{key}` has an empty value"));
+        }
+        let slot = match key {
+            "name" => &mut name,
+            "placeholder" => &mut placeholder,
+            "host" => &mut host,
+            "header" => &mut header,
+            "scheme" => &mut scheme,
+            other => return Err(format!("unknown secret-binding field `{other}`")),
+        };
+        if slot.is_some() {
+            return Err(format!("duplicate secret-binding field `{key}`"));
+        }
+        *slot = Some(value.to_owned());
+    }
+    Ok(SecretBinding {
+        name: name.ok_or("secret-binding is missing `name`")?,
+        env_placeholder: placeholder.ok_or("secret-binding is missing `placeholder`")?,
+        host: host.ok_or("secret-binding is missing `host`")?,
+        header: header.ok_or("secret-binding is missing `header`")?,
+        scheme: scheme.unwrap_or_default(),
+    })
 }
 
 /// Map the `--max-capture-bytes` CLI surface onto the internal representation, where
@@ -248,6 +369,87 @@ mod tests {
             resolve_max_capture_bytes(args.max_capture_bytes),
             Some(DEFAULT_MAX_CAPTURE_BYTES)
         );
+    }
+
+    #[test]
+    fn secret_binding_parses_all_fields() {
+        let binding = parse_secret_binding(
+            "name=openai,placeholder=hil-secret://openai,host=api.openai.com,header=authorization,scheme=Bearer",
+        )
+        .expect("parse");
+        assert_eq!(binding.name, "openai");
+        assert_eq!(binding.env_placeholder, "hil-secret://openai");
+        assert_eq!(binding.host, "api.openai.com");
+        assert_eq!(binding.header, "authorization");
+        assert_eq!(binding.scheme, "Bearer");
+    }
+
+    #[test]
+    fn secret_binding_scheme_is_optional() {
+        let binding = parse_secret_binding("name=k,placeholder=p,host=h.com,header=x-api-key")
+            .expect("parse");
+        assert_eq!(binding.scheme, "");
+    }
+
+    #[test]
+    fn secret_binding_rejects_missing_field_and_bad_syntax() {
+        assert!(parse_secret_binding("name=k,host=h.com,header=a").is_err());
+        assert!(parse_secret_binding("not-a-pair").is_err());
+        assert!(parse_secret_binding("name=k,bogus=x,placeholder=p,host=h,header=a").is_err());
+    }
+
+    #[test]
+    fn secret_binding_rejects_comma_in_value() {
+        // A value containing a comma would be split as a separate field; that field has
+        // no `=`, so it is rejected with a clear error rather than silently truncating.
+        let err = parse_secret_binding(
+            "name=k,placeholder=hil-secret://x,host=h.com,header=a,scheme=foo,bar",
+        )
+        .expect_err("comma in value must error");
+        assert!(err.contains("values may not contain a comma"), "got: {err}");
+    }
+
+    #[test]
+    fn secret_binding_rejects_duplicate_field() {
+        let err = parse_secret_binding("name=k,name=evil,placeholder=p,host=h.com,header=a")
+            .expect_err("duplicate key must error");
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn secret_binding_rejects_empty_value() {
+        let err = parse_secret_binding("name=,placeholder=p,host=h.com,header=a")
+            .expect_err("empty value must error");
+        assert!(err.contains("empty value"), "got: {err}");
+    }
+
+    #[test]
+    fn egress_flags_build_a_deny_policy() {
+        let cli = Cli::try_parse_from([
+            "hiloop-interceptor",
+            "run",
+            "--proxy",
+            "--events-jsonl",
+            "/tmp/does-not-matter.jsonl",
+            "--blob-dir",
+            "/tmp/blob",
+            "--egress-mode",
+            "deny",
+            "--egress-domain",
+            "api.openai.com",
+            "--egress-cidr",
+            "10.0.0.0/8",
+            "--",
+            "echo",
+            "hi",
+        ])
+        .expect("parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run subcommand");
+        };
+        let options = args.into_run_options().expect("options");
+        assert!(!options.egress_policy().is_allow_all());
+        assert_eq!(options.egress_policy().mode(), EgressMode::Deny);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 use crate::{
     blob::DirBlobStore,
+    egress::EgressPolicy,
     exporters::{FanOutExporter, JsonlExporter},
     framing::LineFramer,
     grpc_export::GrpcIngestExporter,
@@ -20,6 +21,7 @@ use crate::{
         Exporter, NormalizationContext, Normalizer, NormalizerRouter, ProcessContext,
         RawRetentionPolicy, RawSignal, RawStore, SourceError,
     },
+    secret::{BrokerConfig, SecretBinding, SecretInjector},
     stdio::StdioLogNormalizer,
 };
 use anyhow::{Context, Result, bail};
@@ -80,6 +82,9 @@ pub struct RunOptions {
     export_batch_size: usize,
     export_flush_interval: Option<Duration>,
     redaction: RedactionPolicy,
+    egress: EgressPolicy,
+    secret_bindings: Vec<SecretBinding>,
+    secret_broker: Option<BrokerConfig>,
 }
 
 impl RunOptions {
@@ -124,6 +129,9 @@ impl RunOptions {
             export_batch_size: DEFAULT_EXPORT_BATCH_SIZE,
             export_flush_interval: Some(DEFAULT_EXPORT_FLUSH_INTERVAL),
             redaction: RedactionPolicy::default(),
+            egress: EgressPolicy::default(),
+            secret_bindings: Vec::new(),
+            secret_broker: None,
         }
     }
 
@@ -132,6 +140,35 @@ impl RunOptions {
     #[must_use]
     pub fn with_redaction(mut self, redaction: RedactionPolicy) -> Self {
         self.redaction = redaction;
+        self
+    }
+
+    /// Set the egress policy the proxy enforces. The default
+    /// ([`EgressPolicy::default`]) allows all egress (a no-op). The policy applies
+    /// only to traffic that flows through the proxy (`proxy` must be enabled) and is a
+    /// cooperative control — the un-bypassable boundary is host-side.
+    #[must_use]
+    pub fn with_egress(mut self, egress: EgressPolicy) -> Self {
+        self.egress = egress;
+        self
+    }
+
+    /// The configured egress policy (default allow-all).
+    pub fn egress_policy(&self) -> &EgressPolicy {
+        &self.egress
+    }
+
+    /// Bind named secrets to destination hosts and configure the credential broker the
+    /// proxy resolves them from. Injection applies only when `proxy` is enabled; a
+    /// binding with no broker configured is a configuration error caught by [`run`].
+    #[must_use]
+    pub fn with_secret_bindings(
+        mut self,
+        bindings: Vec<SecretBinding>,
+        broker: BrokerConfig,
+    ) -> Self {
+        self.secret_bindings = bindings;
+        self.secret_broker = Some(broker);
         self
     }
 
@@ -253,6 +290,23 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
     if options.proxy && (!has_exporter || options.blob_dir.is_none()) {
         bail!(
             "--proxy requires an export target (--events-jsonl or --export-grpc) and --blob-dir so captured bodies are streamed to the blob store"
+        );
+    }
+
+    if !options.secret_bindings.is_empty() {
+        if !options.proxy {
+            bail!(
+                "secret bindings require --proxy: credentials are injected into intercepted HTTP(S) requests"
+            );
+        }
+        if options.secret_broker.is_none() {
+            bail!("secret bindings require a configured credential broker");
+        }
+    }
+
+    if !options.egress.is_allow_all() && !options.proxy {
+        bail!(
+            "an egress policy requires --proxy: egress is enforced on intercepted HTTP(S) traffic"
         );
     }
 
@@ -460,6 +514,14 @@ where
         }
         None => (None, None),
     };
+    let egress = Arc::new(options.egress.clone());
+    let injector = match (&options.secret_broker, options.secret_bindings.is_empty()) {
+        (Some(broker), false) => Some(
+            SecretInjector::new(options.secret_bindings.clone(), broker)
+                .context("failed to build the credential injector from the secret bindings")?,
+        ),
+        _ => None,
+    };
     let (proxy_shutdown_tx, proxy_server_task) = match (proxy_server, proxy_ca, blob_store) {
         (Some(server), Some(ca), Some(blob_store)) => {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -469,6 +531,8 @@ where
                 blob_store,
                 options.max_capture_bytes,
                 options.redaction,
+                Arc::clone(&egress),
+                injector,
                 async move {
                     let _ = shutdown_rx.await;
                 },
@@ -918,6 +982,56 @@ mod tests {
             error
                 .to_string()
                 .contains("stdio event pipeline stopped before stdout capture finished")
+        );
+    }
+
+    fn base_options(command: Vec<String>) -> RunOptions {
+        RunOptions::new(
+            ForkContext::new_local_root(),
+            command,
+            Some(PathBuf::from("/tmp/never-created.jsonl")),
+            None,
+            None,
+            false,
+            false, // proxy disabled
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn egress_policy_without_proxy_is_rejected() {
+        let egress = EgressPolicy::new(
+            crate::egress::EgressMode::Deny,
+            ["api.openai.com".to_owned()],
+            [],
+        )
+        .expect("policy");
+        let options = base_options(vec!["echo".to_owned(), "hi".to_owned()]).with_egress(egress);
+        let error = run(&options).await.expect_err("egress needs proxy");
+        assert!(error.to_string().contains("egress policy requires --proxy"));
+    }
+
+    #[tokio::test]
+    async fn secret_bindings_without_proxy_are_rejected() {
+        let options = base_options(vec!["echo".to_owned(), "hi".to_owned()]).with_secret_bindings(
+            vec![SecretBinding {
+                name: "k".to_owned(),
+                env_placeholder: "hil-secret://k".to_owned(),
+                host: "api.openai.com".to_owned(),
+                header: "authorization".to_owned(),
+                scheme: "Bearer".to_owned(),
+            }],
+            BrokerConfig {
+                url: "http://localhost:9/resolve".to_owned(),
+                token: "t".to_owned(),
+            },
+        );
+        let error = run(&options).await.expect_err("secrets need proxy");
+        assert!(
+            error
+                .to_string()
+                .contains("secret bindings require --proxy")
         );
     }
 
