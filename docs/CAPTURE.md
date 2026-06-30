@@ -13,7 +13,7 @@ cooperative** mechanisms (env injection); the sandbox-only transparent-redirect 
 (DESIGN.md §2) stay deferred behind the same `Source` seam.
 
 The wrapper already injects `OTEL_RESOURCE_ATTRIBUTES` (the spine) into the child, so either
-surface inherits fork-stamping for free.
+surface inherits run-lineage-stamping for free.
 
 ## Candidate A — OTLP receiver
 

@@ -1,4 +1,4 @@
-//! Cross-cutting conformance for the fork-tree spine and the event schema.
+//! Cross-cutting conformance for the run-lineage spine and the event schema.
 //!
 //! These tests run against the public crate API only, and they encode the
 //! invariants the rest of hiloop (and the private control plane) relies on.
@@ -9,27 +9,24 @@
 //! schema decision (and a coordinated migration), never an accident.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::thread;
 
 use hiloop_core::event::{AttributeKey, Event, EventName, SignalType};
-use hiloop_core::identity::{ChildOrdinalAllocator, ForkContext, Hlc};
+use hiloop_core::identity::{Hlc, RunContext};
 
 #[test]
-fn concurrent_children_have_unique_gap_free_descendant_paths() {
+fn concurrent_children_have_unique_descendant_paths_under_one_root() {
     const THREADS: u64 = 8;
     const PER_THREAD: u64 = 64;
 
-    let parent = ForkContext::new_local_root();
-    let allocator = Arc::new(ChildOrdinalAllocator::new());
+    let parent = RunContext::new_local_root();
 
     let handles = (0..THREADS)
         .map(|_| {
-            let allocator = Arc::clone(&allocator);
             let parent = parent.clone();
             thread::spawn(move || {
                 (0..PER_THREAD)
-                    .map(|_| parent.child(allocator.next()).expect("child context"))
+                    .map(|_| parent.child().expect("child context"))
                     .collect::<Vec<_>>()
             })
         })
@@ -43,39 +40,33 @@ fn concurrent_children_have_unique_gap_free_descendant_paths() {
     let total = (THREADS * PER_THREAD) as usize;
     assert_eq!(children.len(), total);
 
-    // Every node id is unique.
-    let node_ids = children
+    // Every child run id is unique.
+    let run_ids = children
         .iter()
-        .map(|child| child.fork_node_id.to_string())
+        .map(|child| child.run_id.to_string())
         .collect::<BTreeSet<_>>();
-    assert_eq!(node_ids.len(), total, "fork_node_id values must be unique");
+    assert_eq!(run_ids.len(), total, "child run_id values must be unique");
 
-    // Every fork path is unique.
+    // Every lineage path is unique.
     let paths = children
         .iter()
-        .map(|child| child.fork_path.to_string())
+        .map(|child| child.lineage_path.to_string())
         .collect::<BTreeSet<_>>();
-    assert_eq!(paths.len(), total, "fork_path values must be unique");
+    assert_eq!(paths.len(), total, "lineage_path values must be unique");
 
-    // Every child stays in the run and descends from the parent at depth 1.
+    // Every child descends from the parent root at depth 2 (root + child) and its
+    // path leaf is its own run id.
     for child in &children {
-        assert_eq!(child.run_id, parent.run_id);
-        assert!(parent.fork_path.is_ancestor_of(&child.fork_path));
-        assert_eq!(child.fork_path.depth(), 1);
+        assert!(parent.lineage_path.is_ancestor_of(&child.lineage_path));
+        assert_eq!(child.lineage_path.depth(), parent.lineage_path.depth() + 1);
+        assert_eq!(child.lineage_path.run_id(), child.run_id);
+        assert_eq!(child.lineage_path.segments().first(), Some(&parent.run_id));
     }
-
-    // Sibling ordinals are gap-free over `0..total`.
-    let mut ordinals = children
-        .iter()
-        .map(|child| child.fork_path.ordinals()[0].as_u64())
-        .collect::<Vec<_>>();
-    ordinals.sort_unstable();
-    assert_eq!(ordinals, (0..THREADS * PER_THREAD).collect::<Vec<_>>());
 }
 
 #[test]
 fn event_v1_schema_is_locked() {
-    let context = ForkContext::new_local_root();
+    let context = RunContext::new_local_root();
     let event = Event::new(
         &context,
         Hlc {
@@ -101,8 +92,7 @@ fn event_v1_schema_is_locked() {
         [
             "attributes",
             "event_id",
-            "fork_node_id",
-            "fork_path",
+            "lineage_path",
             "name",
             "payload_ref",
             "run_id",
@@ -129,6 +119,9 @@ fn event_v1_schema_is_locked() {
     assert_eq!(value["signal"], serde_json::json!("log"));
     // Attributes are a flat map keyed by the attribute name.
     assert_eq!(value["attributes"]["message"], serde_json::json!("hi"));
-    // Root fork path serializes as the empty string.
-    assert_eq!(value["fork_path"], serde_json::json!(""));
+    // A root run's lineage path is its own run id.
+    assert_eq!(
+        value["lineage_path"],
+        serde_json::json!(context.run_id.to_string())
+    );
 }

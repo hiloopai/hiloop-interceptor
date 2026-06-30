@@ -44,7 +44,7 @@ fn render_summary(out: &mut String, summary: &InspectSummary) -> Result<()> {
 
     writeln!(
         out,
-        "{} events across {} fork path(s)",
+        "{} events across {} run lineage path(s)",
         summary.total_events,
         summary.paths.len()
     )
@@ -53,8 +53,7 @@ fn render_summary(out: &mut String, summary: &InspectSummary) -> Result<()> {
         writeln!(
             out,
             "\n  {} \u{2014} {} event(s)",
-            display_path(&path.fork_path),
-            path.events
+            path.lineage_path, path.events
         )
         .context("failed to format path summary")?;
         let signals = path
@@ -80,13 +79,8 @@ fn render_diff(
     use std::fmt::Write as _;
 
     let deltas = diff_event_names(summary, path_a, path_b);
-    writeln!(
-        out,
-        "event-name divergence: {} (a) vs {} (b)",
-        display_path(path_a),
-        display_path(path_b)
-    )
-    .context("failed to format diff header")?;
+    writeln!(out, "event-name divergence: {path_a} (a) vs {path_b} (b)")
+        .context("failed to format diff header")?;
     if deltas.is_empty() {
         writeln!(out, "  (no divergence)").context("failed to format diff")?;
         return Ok(());
@@ -96,12 +90,4 @@ fn render_diff(
             .context("failed to format diff delta")?;
     }
     Ok(())
-}
-
-fn display_path(fork_path: &str) -> &str {
-    if fork_path.is_empty() {
-        "(root)"
-    } else {
-        fork_path
-    }
 }

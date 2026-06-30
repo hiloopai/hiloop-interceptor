@@ -11,7 +11,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hiloop_core::event::{AttributeKey, Event, EventName, SignalType};
-use hiloop_core::identity::{ForkContext, Hlc};
+use hiloop_core::identity::{Hlc, RunContext};
 use hiloop_interceptor::framing::LineFramer;
 
 const MAX_RECORD_BYTES: usize = 64 * 1024;
@@ -48,7 +48,7 @@ fn bench_line_framer(c: &mut Criterion) {
 }
 
 fn bench_event_serialize(c: &mut Criterion) {
-    let context = ForkContext::new_local_root();
+    let context = RunContext::new_local_root();
     let event = Event::new(
         &context,
         Hlc {

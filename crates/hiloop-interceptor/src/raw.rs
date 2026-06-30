@@ -63,13 +63,12 @@ fn raw_record(
     context: &NormalizationContext,
     raw: &RawSignal,
 ) -> Value {
-    let fork = context.fork_context();
+    let run = context.run_context();
     json!({
         "schema": "hiloop.raw_observation.v1",
         "id": raw_ref.id(),
-        "run_id": fork.run_id,
-        "fork_node_id": fork.fork_node_id,
-        "fork_path": &fork.fork_path,
+        "run_id": run.run_id,
+        "lineage_path": &run.lineage_path,
         "observed_at": raw.observed_at,
         "source": raw.source.as_str(),
         "kind": raw.kind.as_str(),
@@ -105,7 +104,7 @@ fn raw_io_error(message: &'static str, error: io::Error) -> RawStoreError {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use hiloop_core::identity::{ForkContext, Hlc};
+    use hiloop_core::identity::{Hlc, RunContext};
     use serde_json::Value;
 
     #[tokio::test]
@@ -115,7 +114,7 @@ mod tests {
         let store = JsonlRawStore::create(&path)
             .await
             .expect("create raw store");
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
         let raw = RawSignal::new(
             "stdio",
             "stdout",
@@ -154,7 +153,7 @@ mod tests {
         let store = JsonlRawStore::create(&path)
             .await
             .expect("create raw store");
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
         let raw = RawSignal::new(
             "stdio",
             "stdout",
@@ -188,7 +187,7 @@ mod tests {
         let store = JsonlRawStore::create(&path)
             .await
             .expect("create raw store");
-        let context = NormalizationContext::new(ForkContext::new_local_root()).with_process(
+        let context = NormalizationContext::new(RunContext::new_local_root()).with_process(
             crate::seams::ProcessContext {
                 pid: Some(42),
                 command: Some(std::path::PathBuf::from("/usr/bin/echo")),
@@ -230,7 +229,7 @@ mod tests {
         let store = JsonlRawStore::create(&path)
             .await
             .expect("create raw store");
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
         let raw = RawSignal::new(
             "stdio",
             "stdout",
@@ -259,7 +258,7 @@ mod tests {
         let store = JsonlRawStore::create(&path)
             .await
             .expect("create raw store");
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
         let raw = RawSignal::new(
             "stdio",
             "stdout",

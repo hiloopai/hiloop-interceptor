@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use hiloop_core::{
     event::{Attributes, Event, PayloadRef},
-    identity::{ForkContext, Hlc},
+    identity::{Hlc, RunContext},
 };
 use std::{
     collections::BTreeMap, error::Error as StdError, future::Future, path::PathBuf, pin::Pin,
@@ -411,16 +411,16 @@ impl WrapperContext {
 /// Context shared by every normalizer invocation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalizationContext {
-    fork: ForkContext,
+    run: RunContext,
     attributes: Attributes,
     pub process: Option<ProcessContext>,
     pub wrapper: WrapperContext,
 }
 
 impl NormalizationContext {
-    pub fn new(fork: ForkContext) -> Self {
+    pub fn new(run: RunContext) -> Self {
         Self {
-            fork,
+            run,
             attributes: Attributes::new(),
             process: None,
             wrapper: WrapperContext::current(),
@@ -440,8 +440,8 @@ impl NormalizationContext {
         self
     }
 
-    pub fn fork_context(&self) -> &ForkContext {
-        &self.fork
+    pub fn run_context(&self) -> &RunContext {
+        &self.run
     }
 
     /// Static attributes stamped onto every normalized event.
@@ -450,9 +450,9 @@ impl NormalizationContext {
     }
 }
 
-impl From<ForkContext> for NormalizationContext {
-    fn from(fork: ForkContext) -> Self {
-        Self::new(fork)
+impl From<RunContext> for NormalizationContext {
+    fn from(run: RunContext) -> Self {
+        Self::new(run)
     }
 }
 
@@ -533,7 +533,7 @@ impl NormalizationOutcome {
     }
 }
 
-/// Turns raw signals into fork-stamped events.
+/// Turns raw signals into run-lineage-stamped events.
 #[async_trait]
 pub trait Normalizer: Send + Sync {
     /// Stable identity used for provenance, replay, and schema evolution.
@@ -695,7 +695,7 @@ pub mod testing {
     };
     use async_trait::async_trait;
     use hiloop_core::event::Event;
-    use hiloop_core::identity::{ForkContext, Hlc};
+    use hiloop_core::identity::{Hlc, RunContext};
     use std::sync::Mutex;
 
     /// Drive a self-terminating [`Source`] (one whose input ends on its own) to
@@ -883,7 +883,7 @@ pub mod testing {
 
         normalizer
             .normalize(
-                &NormalizationContext::new(ForkContext::new_local_root()),
+                &NormalizationContext::new(RunContext::new_local_root()),
                 raw,
             )
             .await
@@ -1095,7 +1095,7 @@ mod tests {
     #[test]
     fn normalization_outcome_into_events() {
         let event = hiloop_core::event::Event::new(
-            &ForkContext::new_local_root(),
+            &RunContext::new_local_root(),
             Hlc {
                 wall_ns: 1,
                 logical: 0,
@@ -1223,10 +1223,10 @@ mod tests {
     }
 
     #[test]
-    fn normalization_context_from_fork() {
-        let fork = ForkContext::new_local_root();
-        let context: NormalizationContext = fork.clone().into();
-        assert_eq!(context.fork_context(), &fork);
+    fn normalization_context_from_run() {
+        let run = RunContext::new_local_root();
+        let context: NormalizationContext = run.clone().into();
+        assert_eq!(context.run_context(), &run);
         assert!(context.process.is_none());
     }
 

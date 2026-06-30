@@ -173,7 +173,7 @@ pub enum PipelineError {
 /// stream or [`Pipeline::run_source`] for a [`Source`].
 ///
 /// ```ignore
-/// Pipeline::new(fork_context, &normalizer, &exporter)
+/// Pipeline::new(run_context, &normalizer, &exporter)
 ///     .options(options)
 ///     .run(stream)
 ///     .await?;
@@ -192,7 +192,7 @@ where
 {
     /// Start a pipeline that routes every signal through one normalizer.
     ///
-    /// `context` accepts either a bare [`ForkContext`](hiloop_core::identity::ForkContext)
+    /// `context` accepts either a bare [`RunContext`](hiloop_core::identity::RunContext)
     /// or a fully built [`NormalizationContext`].
     pub fn new(
         context: impl Into<NormalizationContext>,
@@ -596,7 +596,7 @@ mod tests {
     use bytes::Bytes;
     use hiloop_core::{
         event::{AttributeKey, Event, EventName, SignalType},
-        identity::{ForkContext, Hlc},
+        identity::{Hlc, RunContext},
     };
     use std::path::PathBuf;
     use std::sync::{
@@ -697,7 +697,7 @@ mod tests {
             raw: RawSignal,
         ) -> Result<NormalizationOutcome, NormalizeError> {
             let event = Event::new(
-                context.fork_context(),
+                context.run_context(),
                 raw.observed_at,
                 SignalType::Log,
                 EventName::new("fallback.log").map_err(|error| NormalizeError::Decode {
@@ -721,7 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_exports_and_flushes_final_batch() {
-        let context = ForkContext::new_local_root();
+        let context = RunContext::new_local_root();
         let normalizer = StdioLogNormalizer;
         let exporter = RecordingExporter::default();
         let raw = RawSignal::new(
@@ -778,7 +778,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_stamps_process_and_wrapper_provenance() {
         let context =
-            NormalizationContext::new(ForkContext::new_local_root()).with_process(ProcessContext {
+            NormalizationContext::new(RunContext::new_local_root()).with_process(ProcessContext {
                 pid: Some(42),
                 command: Some(PathBuf::from("example")),
                 argv: vec!["example".to_owned(), "--flag".to_owned()],
@@ -831,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_stamps_static_context_attributes() {
-        let context = NormalizationContext::new(ForkContext::new_local_root()).with_attributes(
+        let context = NormalizationContext::new(RunContext::new_local_root()).with_attributes(
             [(
                 AttributeKey::from_static(provenance_keys::EXECUTION_ID),
                 "exec-123".into(),
@@ -869,7 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_preserves_raw_when_store_is_configured() {
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
         let router = NormalizerRouter::single(&PreserveStdioNormalizer);
         let exporter = RecordingExporter::default();
         let raw_store = MemoryRawStore::default();
@@ -910,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_rejects_preserve_without_raw_store() {
-        let context = ForkContext::new_local_root();
+        let context = RunContext::new_local_root();
         let exporter = RecordingExporter::default();
         let raw = RawSignal::new(
             "stdio",
@@ -937,7 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_runs_all_supported_normalizers() {
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
         let stdio = StdioLogNormalizer;
         let fallback = FallbackNormalizer;
         let normalizers: [&dyn Normalizer; 2] = [&fallback, &stdio];
@@ -972,7 +972,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_returns_export_error_while_source_is_still_open() {
-        let context = ForkContext::new_local_root();
+        let context = RunContext::new_local_root();
         let normalizer = StdioLogNormalizer;
         let (tx, rx) = mpsc::channel(1);
         tx.send(Ok(RawSignal::new(
@@ -1053,7 +1053,7 @@ mod tests {
     async fn age_trigger_flushes_partial_batch_before_stream_ends() {
         use std::time::Duration;
 
-        let context = ForkContext::new_local_root();
+        let context = RunContext::new_local_root();
         let normalizer = StdioLogNormalizer;
         let exporter = RecordingExporter::default();
 
@@ -1103,7 +1103,7 @@ mod tests {
     async fn disabled_age_trigger_waits_for_eof_below_batch_size() {
         use std::time::Duration;
 
-        let context = ForkContext::new_local_root();
+        let context = RunContext::new_local_root();
         let normalizer = StdioLogNormalizer;
         let exporter = RecordingExporter::default();
 
@@ -1137,7 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_accepts_empty_stream_and_still_flushes() {
-        let context = ForkContext::new_local_root();
+        let context = RunContext::new_local_root();
         let normalizer = StdioLogNormalizer;
         let exporter = RecordingExporter::default();
         let stream = futures_util::stream::iter([]);
@@ -1178,7 +1178,7 @@ mod tests {
     async fn pipeline_runs_a_source_to_completion() {
         use crate::seams::testing::VecSource;
 
-        let context = ForkContext::new_local_root();
+        let context = RunContext::new_local_root();
         let normalizer = StdioLogNormalizer;
         let exporter = RecordingExporter::default();
         let signals = vec![
@@ -1255,7 +1255,7 @@ mod tests {
             }
         }
 
-        let context = ForkContext::new_local_root();
+        let context = RunContext::new_local_root();
         let normalizer = StdioLogNormalizer;
         let exporter = RecordingExporter::default();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

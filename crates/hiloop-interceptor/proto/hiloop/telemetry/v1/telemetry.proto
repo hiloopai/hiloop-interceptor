@@ -3,11 +3,11 @@ syntax = "proto3";
 package hiloop.telemetry.v1;
 
 // Vendored copy of the canonical telemetry-gateway contract that consumes the interceptor's
-// fork-stamped events. Keep it in lockstep with hiloop_core::event::Event: the golden-fixture
+// run-lineage-stamped events. Keep it in lockstep with hiloop_core::event::Event: the golden-fixture
 // coverage test in crates/hiloop-interceptor/src/grpc_export.rs guards that this proto's Event and
 // hiloop_core::event::Event stay field-for-field aligned through the wire conversion.
 //
-// The wire form of the interceptor's fork-stamped telemetry event (Event v1). The in-process
+// The wire form of the interceptor's run-lineage-stamped telemetry event (Event v1). The in-process
 // logical contract is hiloop_core::event::Event; this proto owns the network boundary.
 
 // Hybrid logical clock: causal event time.
@@ -34,10 +34,12 @@ message PayloadRef {
 }
 
 message Event {
+  // Retired with the intra-run fork tree: events now key on the run and its lineage_path.
+  reserved 3, 4;
+  reserved "fork_node_id", "fork_path";
+
   Hlc ts = 1;
   string run_id = 2;
-  string fork_node_id = 3;
-  string fork_path = 4;
   string signal = 5;
   string name = 6;
   map<string, AttributeValue> attributes = 7;
@@ -45,6 +47,10 @@ message Event {
   // Interceptor-minted stable identity (ULID) for idempotent ingest. Empty until the interceptor
   // stamps it; the backend then derives a deterministic blake3 fallback so dedup stays correct.
   string event_id = 9;
+  // The run's lineage path: the materialized, prefix-addressable position of the event's run in its
+  // tree (dotted run ULIDs from the root run to this run). The interceptor stamps it on every
+  // exported event from its resolved run context.
+  string lineage_path = 10;
 }
 
 // tenant_id and project_id are request-level: the backend assigns them from the authenticated

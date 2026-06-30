@@ -1,10 +1,10 @@
 //! Tree-native telemetry event schema.
 //!
-//! Every event is stamped with the fork-tree spine. Large payloads such as LLM
+//! Every event is stamped with its run-lineage spine. Large payloads such as LLM
 //! prompts, responses, and HTTP bodies are referenced by content hash instead of
 //! embedded in the row.
 
-use crate::identity::{EventId, ForkContext, ForkNodeId, ForkPath, Hlc, RunId};
+use crate::identity::{EventId, Hlc, LineagePath, RunContext, RunId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
@@ -276,7 +276,7 @@ impl PayloadRef {
     }
 }
 
-/// A single normalized, fork-stamped telemetry event.
+/// A single normalized, run-lineage-stamped telemetry event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     /// Stable per-event identity. Defaults when absent (older records) so deserialization stays
@@ -285,8 +285,7 @@ pub struct Event {
     pub event_id: EventId,
     pub ts: Hlc,
     pub run_id: RunId,
-    pub fork_node_id: ForkNodeId,
-    pub fork_path: ForkPath,
+    pub lineage_path: LineagePath,
     pub signal: SignalType,
     pub name: EventName,
     pub attributes: Attributes,
@@ -294,14 +293,13 @@ pub struct Event {
 }
 
 impl Event {
-    /// Creates an event stamped with the resolved fork context and a freshly minted event id.
-    pub fn new(context: &ForkContext, ts: Hlc, signal: SignalType, name: EventName) -> Self {
+    /// Creates an event stamped with the resolved run context and a freshly minted event id.
+    pub fn new(context: &RunContext, ts: Hlc, signal: SignalType, name: EventName) -> Self {
         Self {
             event_id: EventId::new(),
             ts,
             run_id: context.run_id,
-            fork_node_id: context.fork_node_id,
-            fork_path: context.fork_path.clone(),
+            lineage_path: context.lineage_path.clone(),
             signal,
             name,
             attributes: Attributes::new(),
@@ -327,12 +325,12 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::ForkContext;
+    use crate::identity::RunContext;
     use serde_json::json;
 
     #[test]
     fn event_schema_serializes_opaque_text_types_as_strings() {
-        let context = ForkContext::new_local_root();
+        let context = RunContext::new_local_root();
         let payload_ref = PayloadRef::new(PayloadDigest::new("sha256:abc").expect("digest"))
             .with_media_type(MediaType::new("application/json").expect("media type"))
             .with_size_bytes(12);

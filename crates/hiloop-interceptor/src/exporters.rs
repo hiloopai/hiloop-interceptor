@@ -86,12 +86,12 @@ impl Exporter for FanOutExporter {
 pub(crate) mod testing {
     use hiloop_core::{
         event::{AttributeKey, Event, EventName, SignalType},
-        identity::{ForkContext, Hlc},
+        identity::{Hlc, RunContext},
     };
 
     pub(crate) fn sample_log_event() -> Event {
         Event::new(
-            &ForkContext::new_local_root(),
+            &RunContext::new_local_root(),
             Hlc {
                 wall_ns: 1,
                 logical: 0,

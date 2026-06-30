@@ -6,7 +6,7 @@
 
 The **interception wrapper** for agent harnesses. It runs anywhere — your laptop or
 inside a sandbox — wraps your harness command, and captures its telemetry (OpenTelemetry,
-logs, network calls) **tagged with fork-tree identity**, so observability branches with
+logs, network calls) **tagged with run-lineage identity**, so observability branches with
 your experiments.
 
 It is the open-source edge of hiloop: snapshottable, forkable agent sandboxes with tree-native
@@ -16,7 +16,7 @@ private monorepo.
 
 ## Status
 
-Early alpha. The core capture path — fork-tree identity stamping, stdio/OTLP/HTTPS-proxy
+Early alpha. The core capture path — run-lineage identity stamping, stdio/OTLP/HTTPS-proxy
 capture, JSONL and gRPC export — works end-to-end and is covered by the integration suite.
 What's still evolving: the event schema, harness-aware semantic normalization, and
 additional export sinks. See [`docs/INTERFACES.md`](./docs/INTERFACES.md) for the architecture
@@ -28,7 +28,7 @@ and seam design, and [`docs/TESTING.md`](./docs/TESTING.md) for the behavior con
 cargo run -p hiloop-interceptor -- run -- echo hello
 ```
 
-Today this resolves a fork-tree context, injects the spine into the child environment
+Today this resolves a run-lineage context, injects the spine into the child environment
 (`HILOOP_*`, `OTEL_RESOURCE_ATTRIBUTES`), and passes the command through.
 
 To capture stdout/stderr into normalized JSONL events while still teeing child output:
@@ -42,7 +42,7 @@ Add `--raw-jsonl ./raw.jsonl` with `--events-jsonl` to preserve captured raw obs
 
 Add `--otlp` (with `--events-jsonl`) to also run an embedded OTLP/HTTP receiver: the wrapper injects
 `OTEL_EXPORTER_OTLP_ENDPOINT` into the child, captures the harness's own OpenTelemetry trace export,
-and emits fork-stamped events — `gen_ai.*` / `llm.*` spans become `llm` events.
+and emits run-lineage-stamped events — `gen_ai.*` / `llm.*` spans become `llm` events.
 
 ```sh
 cargo run -p hiloop-interceptor -- run --otlp --events-jsonl ./events.jsonl -- <harness command>
@@ -50,7 +50,7 @@ cargo run -p hiloop-interceptor -- run --otlp --events-jsonl ./events.jsonl -- <
 
 Add `--proxy` (with `--events-jsonl` and `--blob-dir`) to run an embedded MITM proxy: the wrapper
 mints an ephemeral CA, injects `HTTPS_PROXY` plus a child-scoped CA bundle, decrypts the harness's
-HTTPS traffic, and emits fork-stamped `net` events (`llm` for known LLM API hosts). Bodies are
+HTTPS traffic, and emits run-lineage-stamped `net` events (`llm` for known LLM API hosts). Bodies are
 streamed frame-by-frame into a content-addressed blob store (`--blob-dir`), so events carry only a
 `payload_ref` and memory stays bounded even for streaming/SSE responses.
 
@@ -95,11 +95,11 @@ or set `--export-flush-interval-ms 0` to disable the timer and flush only on a f
 ## What it captures
 
 Wrapping a real Claude Code turn with `--proxy --otlp` captures the whole footprint of the harness —
-its LLM calls, every tool/MCP request, its own telemetry export, and its stdio — all fork-stamped.
+its LLM calls, every tool/MCP request, its own telemetry export, and its stdio — all run-lineage-stamped.
 From one `claude -p "…"` (`inspect` output):
 
 ```
-57 events across 1 fork path(s)
+57 events across 1 run lineage path(s)
   signals: llm=13 log=2 net=42
   llm  http.request  api.anthropic.com          # the model calls (request/response bodies → blob store)
   net  http.request  mcp.slack.com / mcp.notion.com / mcp.linear.app   # MCP tool traffic
@@ -112,14 +112,14 @@ Each `llm`/`net` event carries the decrypted request/response body by `payload_r
 store (content-addressed, so identical bodies dedupe and memory stays bounded for SSE). Capturing the
 harness's *own* telemetry (the Datadog export above) is intentional — it's signal, not noise.
 
-Inspect a captured events file — counts grouped by fork-tree node, or how two branches diverged:
+Inspect a captured events file — counts grouped by run lineage path, or how two runs diverged:
 
 ```sh
 cargo run -p hiloop-interceptor -- inspect ./events.jsonl
-cargo run -p hiloop-interceptor -- inspect ./events.jsonl --diff /0 /1
+cargo run -p hiloop-interceptor -- inspect ./events.jsonl --diff <root-run-ulid> <root-run-ulid>.<child-run-ulid>
 ```
 
-The integration tests wrap a real command and assert child output is teed while fork-stamped stdio
+The integration tests wrap a real command and assert child output is teed while run-lineage-stamped stdio
 events are flushed to JSONL, that an OTLP trace export from the child is captured, and that the MITM
 proxy captures decrypted HTTPS and correlates request/response over chunked upstreams. That proves
 the supervisor, env stamping, OTLP ingest, proxy capture, local normalization, and exporter seam
@@ -132,7 +132,7 @@ This repo follows the same basic shape as modern Rust CLI workspaces: root-owned
 metadata, dependency versions, lints, profiles, and toolchain pinning; crates under
 `crates/`; a thin binary crate over testable library modules.
 
-- `hiloop-core`: stable shared contracts for fork identity and telemetry events.
+- `hiloop-core`: stable shared contracts for run-lineage identity and telemetry events.
 - `hiloop-interceptor`: CLI, supervisor scaffolding, and wrapper-local seam traits.
 
 Rust is pinned to stable `1.96.0`; the crate edition and rustfmt style edition are both

@@ -30,6 +30,19 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   Both knobs are also configurable via `HILOOP_EXPORT_FLUSH_INTERVAL_MS` / `HILOOP_EXPORT_BATCH_SIZE`
   and on the embeddable `RunOptions` builder.
 
+### Changed
+
+- **Breaking:** the telemetry spine is now keyed on a run and its **lineage path** (the dotted
+  sequence of run ULIDs from the root run to this run) instead of an intra-run fork tree. The
+  `ForkContext { run_id, fork_node_id, fork_path }` type is replaced by `RunContext { run_id,
+  lineage_path }` (with `LineagePath` superseding `ForkPath`); `ForkNodeId`, `ForkOrdinal`, and
+  `ChildOrdinalAllocator` are removed. `Event` drops `fork_node_id` / `fork_path` and gains
+  `lineage_path` (wire field 10; fields 3–4 reserved). The `run` command replaces `--node` /
+  `--fork-path` (and `HILOOP_FORK_NODE_ID` / `HILOOP_FORK_PATH`) with `--lineage-path` /
+  `HILOOP_LINEAGE_PATH`, and stamps `HILOOP_LINEAGE_PATH` + `hiloop.run.lineage_path` into the child
+  environment. `inspect` groups and diffs by lineage path. This aligns the wire contract with the
+  telemetry gateway, which keys ingested events on `run_id` + `lineage_path`.
+
 ## [0.1.0] - 2026-06-26
 
 First public release. Early alpha — it captures real agent harnesses end-to-end, but APIs, flags,
@@ -37,18 +50,18 @@ and the event schema will still change.
 
 ### Added
 
-- `run` command that wraps an agent harness, resolves a fork-tree context, and injects the spine
+- `run` command that wraps an agent harness, resolves a run-lineage context, and injects the spine
   into the child environment (`HILOOP_*`, `OTEL_RESOURCE_ATTRIBUTES`).
-- stdio capture: tee the child's stdout, stderr, and stdin into normalized, fork-stamped JSONL
+- stdio capture: tee the child's stdout, stderr, and stdin into normalized, run-lineage-stamped JSONL
   events (`--events-jsonl`), with optional raw-observation preservation (`--raw-jsonl`).
 - Embedded OTLP/HTTP receiver (`--otlp`) that captures the harness's own OpenTelemetry trace
   export; `gen_ai.*` / `llm.*` spans become `llm` events.
 - Embedded cooperative MITM proxy (`--proxy`) that mints an ephemeral, child-scoped CA, decrypts
-  the harness's HTTPS traffic, and emits fork-stamped `net` / `llm` events. Bodies stream into a
+  the harness's HTTPS traffic, and emits run-lineage-stamped `net` / `llm` events. Bodies stream into a
   content-addressed blob store (`--blob-dir`), so memory stays bounded for streaming/SSE responses.
 - gRPC export (`--export-grpc`) to a hiloop telemetry gateway, with the API key read from
   `HILOOP_API_KEY` (never a flag). Composes with local JSONL durability logging.
-- `inspect` command to summarize a captured events file by fork-tree node and to diff two branches.
+- `inspect` command to summarize a captured events file by run lineage path and to diff two runs.
 - Prebuilt binaries for Linux (x86_64, arm64), macOS (Intel, Apple Silicon), and Windows (x86_64),
   attached to each GitHub Release with SHA-256 checksums.
 

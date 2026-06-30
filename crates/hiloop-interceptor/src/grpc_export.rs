@@ -144,8 +144,6 @@ fn to_proto_event(event: &Event) -> proto::Event {
             logical: event.ts.logical,
         }),
         run_id: event.run_id.to_string(),
-        fork_node_id: event.fork_node_id.to_string(),
-        fork_path: event.fork_path.to_string(),
         signal: signal_str(event.signal).to_owned(),
         name: event.name.as_str().to_owned(),
         attributes: event
@@ -155,6 +153,7 @@ fn to_proto_event(event: &Event) -> proto::Event {
             .collect(),
         payload_ref: event.payload_ref.as_ref().map(to_proto_payload),
         event_id: event.event_id.to_string(),
+        lineage_path: event.lineage_path.to_string(),
     }
 }
 
@@ -193,7 +192,7 @@ const fn signal_str(signal: SignalType) -> &'static str {
 mod tests {
     use super::*;
     use hiloop_core::event::{AttributeKey, EventName, FiniteF64, MediaType, PayloadDigest};
-    use hiloop_core::identity::{EventId, ForkContext, ForkNodeId, ForkPath, Hlc, RunId};
+    use hiloop_core::identity::{EventId, Hlc, LineagePath, RunContext, RunId};
     use std::str::FromStr;
 
     /// Golden fixture: a `hiloop_core::Event` with EVERY field populated to a distinct,
@@ -203,13 +202,15 @@ mod tests {
     /// `PayloadRef` carries `digest`, `media_type`, and `size_bytes` so all three wire fields are
     /// exercised.
     fn golden_event() -> Event {
-        let run_id = RunId::from_str("00000000000000000000000001").expect("run ulid");
-        let fork_node_id = ForkNodeId::from_str("00000000000000000000000002").expect("node ulid");
+        let root_run_id = RunId::from_str("00000000000000000000000001").expect("root run ulid");
+        let run_id = RunId::from_str("00000000000000000000000002").expect("run ulid");
         let event_id = EventId::from_str("00000000000000000000000003").expect("event ulid");
-        let fork_path = ForkPath::from_str("/0/3/1").expect("fork path");
+        let lineage_path = LineagePath::root(root_run_id)
+            .child(run_id)
+            .expect("lineage path");
 
         let mut event = Event::new(
-            &ForkContext::new(run_id, fork_node_id, fork_path),
+            &RunContext::new(run_id, lineage_path).expect("run context"),
             Hlc {
                 wall_ns: 1_700_000_000_000_000_000,
                 logical: 11,
@@ -243,9 +244,11 @@ mod tests {
 
         // Spine identity.
         assert_eq!(proto.event_id, "00000000000000000000000003");
-        assert_eq!(proto.run_id, "00000000000000000000000001");
-        assert_eq!(proto.fork_node_id, "00000000000000000000000002");
-        assert_eq!(proto.fork_path, "/0/3/1");
+        assert_eq!(proto.run_id, "00000000000000000000000002");
+        assert_eq!(
+            proto.lineage_path,
+            "00000000000000000000000001.00000000000000000000000002"
+        );
 
         // Timestamp.
         assert_eq!(
@@ -291,20 +294,18 @@ mod tests {
         let expected = proto::Event {
             ts: proto.ts,
             run_id: proto.run_id.clone(),
-            fork_node_id: proto.fork_node_id.clone(),
-            fork_path: proto.fork_path.clone(),
             signal: proto.signal.clone(),
             name: proto.name.clone(),
             attributes: proto.attributes.clone(),
             payload_ref: proto.payload_ref.clone(),
             event_id: proto.event_id.clone(),
+            lineage_path: proto.lineage_path.clone(),
         };
         let Event {
             event_id: _,
             ts: _,
             run_id: _,
-            fork_node_id: _,
-            fork_path: _,
+            lineage_path: _,
             signal: _,
             name: _,
             attributes: _,
@@ -315,7 +316,7 @@ mod tests {
 
     fn sample_event() -> Event {
         Event::new(
-            &ForkContext::new_local_root(),
+            &RunContext::new_local_root(),
             Hlc {
                 wall_ns: 42,
                 logical: 7,
@@ -342,8 +343,7 @@ mod tests {
         assert_eq!(proto.event_id, event.event_id.to_string());
         assert!(!proto.event_id.is_empty());
         assert_eq!(proto.run_id, event.run_id.to_string());
-        assert_eq!(proto.fork_node_id, event.fork_node_id.to_string());
-        assert_eq!(proto.fork_path, event.fork_path.to_string());
+        assert_eq!(proto.lineage_path, event.lineage_path.to_string());
         assert_eq!(proto.signal, "llm");
         assert_eq!(proto.name, "gen_ai.request");
         assert_eq!(

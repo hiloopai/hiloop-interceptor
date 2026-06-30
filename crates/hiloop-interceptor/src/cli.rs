@@ -1,8 +1,8 @@
 //! Command-line interface for `hiloop-interceptor`.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
-use hiloop_core::identity::{ForkContext, ForkNodeId, ForkPath, RunId};
+use hiloop_core::identity::{LineagePath, RunContext, RunId};
 use hiloop_interceptor::egress::{EgressMode, EgressPolicy};
 use hiloop_interceptor::pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL_MS};
 use hiloop_interceptor::proxy::DEFAULT_MAX_CAPTURE_BYTES;
@@ -47,7 +47,7 @@ impl Cli {
 enum Command {
     /// Run a command under the interceptor supervisor.
     Run(RunArgs),
-    /// Summarize a captured events JSONL file, grouped by fork path.
+    /// Summarize a captured events JSONL file, grouped by run lineage path.
     Inspect(InspectArgs),
 }
 
@@ -56,7 +56,7 @@ struct InspectArgs {
     /// Newline-delimited JSON events file produced by `run --events-jsonl`.
     events_jsonl: PathBuf,
 
-    /// Compare two fork paths' event-name distributions, e.g. `--diff "" /0`.
+    /// Compare two run lineage paths' event-name distributions.
     #[arg(long, num_args = 2, value_names = ["PATH_A", "PATH_B"])]
     diff: Option<Vec<String>>,
 }
@@ -67,17 +67,10 @@ struct RunArgs {
     #[arg(long, env = "HILOOP_RUN_ID")]
     run_id: Option<RunId>,
 
-    /// Fork-tree node id to stamp on telemetry. Generated locally when omitted.
-    #[arg(
-        long = "node",
-        visible_alias = "fork-node-id",
-        env = "HILOOP_FORK_NODE_ID"
-    )]
-    fork_node_id: Option<ForkNodeId>,
-
-    /// Materialized fork path. Defaults to the root path.
-    #[arg(long, env = "HILOOP_FORK_PATH")]
-    fork_path: Option<ForkPath>,
+    /// Run lineage path (dotted run ULIDs from the root run to this run) to stamp on
+    /// telemetry. Defaults to a fresh root run whose path is the run id itself.
+    #[arg(long = "lineage-path", env = "HILOOP_LINEAGE_PATH")]
+    lineage_path: Option<LineagePath>,
 
     /// Create a newline-delimited JSON event file. Fails if the path exists.
     #[arg(long = "events-jsonl", env = "HILOOP_EVENTS_JSONL")]
@@ -207,11 +200,7 @@ struct RunArgs {
 
 impl RunArgs {
     fn into_run_options(self) -> Result<RunOptions> {
-        let context = ForkContext::new(
-            self.run_id.unwrap_or_default(),
-            self.fork_node_id.unwrap_or_default(),
-            self.fork_path.unwrap_or_default(),
-        );
+        let context = resolve_run_context(self.run_id, self.lineage_path)?;
 
         let export_grpc = self.export_grpc.map(|endpoint| GrpcExportOptions {
             endpoint,
@@ -328,6 +317,32 @@ fn parse_secret_binding(raw: &str) -> Result<SecretBinding, String> {
         header: header.ok_or("secret-binding is missing `header`")?,
         scheme: scheme.unwrap_or_default(),
     })
+}
+
+/// Resolve the run context from the optional `--run-id` and `--lineage-path` flags.
+///
+/// - Neither set: a fresh local root run.
+/// - `--run-id` only: a root run with that id (its lineage path is the id itself).
+/// - `--lineage-path` only: the run is the path's leaf.
+/// - Both set: they must agree — the path's leaf must equal `--run-id`.
+fn resolve_run_context(
+    run_id: Option<RunId>,
+    lineage_path: Option<LineagePath>,
+) -> Result<RunContext> {
+    match (run_id, lineage_path) {
+        (None, None) => Ok(RunContext::new_local_root()),
+        (Some(run_id), None) => Ok(RunContext::new(run_id, LineagePath::root(run_id))?),
+        (None, Some(lineage_path)) => {
+            let run_id = lineage_path.run_id();
+            Ok(RunContext::new(run_id, lineage_path)?)
+        }
+        (Some(run_id), Some(lineage_path)) => {
+            if lineage_path.run_id() != run_id {
+                bail!("--run-id {run_id} does not match the leaf of --lineage-path {lineage_path}");
+            }
+            Ok(RunContext::new(run_id, lineage_path)?)
+        }
+    }
 }
 
 /// Map the `--max-capture-bytes` CLI surface onto the internal representation, where

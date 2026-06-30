@@ -28,7 +28,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use hiloop_core::{
     event::{AttributeKey, AttributeValue, Attributes},
-    identity::ForkContext,
+    identity::RunContext,
 };
 use std::{
     ffi::OsString,
@@ -49,8 +49,7 @@ use tokio::{
 
 const MAX_STDIO_LINE_BYTES: usize = 64 * 1024;
 const OTEL_RUN_ID: &str = "hiloop.run.id";
-const OTEL_FORK_NODE_ID: &str = "hiloop.fork.node_id";
-const OTEL_FORK_PATH: &str = "hiloop.fork.path";
+const OTEL_LINEAGE_PATH: &str = "hiloop.run.lineage_path";
 const OTEL_EXECUTION_ID: &str = "hiloop.execution.id";
 
 type CaptureFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
@@ -78,7 +77,7 @@ pub struct GrpcExportOptions {
 /// export to a telemetry gateway. With no sink configured the child runs uncaptured.
 #[derive(Debug, Clone)]
 pub struct RunOptions {
-    context: ForkContext,
+    context: RunContext,
     execution_id: Option<String>,
     command: Vec<String>,
     events_jsonl: Option<PathBuf>,
@@ -100,7 +99,7 @@ pub struct RunOptions {
 
 impl RunOptions {
     /// Build run options for `command` (argv, where `command[0]` is the executable)
-    /// stamped with the fork `context`.
+    /// stamped with the run `context`.
     ///
     /// Each sink is optional and composes with the others: `events_jsonl` writes a
     /// newline-delimited JSON event log, `raw_jsonl` a raw observation log (requires
@@ -117,7 +116,7 @@ impl RunOptions {
         reason = "public, embeddable run config; the flat constructor mirrors the CLI's RunArgs 1:1 — a builder is deferred while there is a single in-tree caller"
     )]
     pub fn new(
-        context: ForkContext,
+        context: RunContext,
         command: Vec<String>,
         events_jsonl: Option<PathBuf>,
         raw_jsonl: Option<PathBuf>,
@@ -238,12 +237,11 @@ struct ChildEnv {
 }
 
 impl ChildEnv {
-    fn for_run(context: &ForkContext, execution_id: Option<&str>) -> Self {
+    fn for_run(context: &RunContext, execution_id: Option<&str>) -> Self {
         let execution_id = execution_id.filter(|value| !value.trim().is_empty());
         let mut resource_attributes = vec![
             format!("{OTEL_RUN_ID}={}", context.run_id),
-            format!("{OTEL_FORK_NODE_ID}={}", context.fork_node_id),
-            format!("{OTEL_FORK_PATH}={}", context.fork_path),
+            format!("{OTEL_LINEAGE_PATH}={}", context.lineage_path),
         ];
         if let Some(execution_id) = execution_id {
             resource_attributes.push(format!(
@@ -255,12 +253,8 @@ impl ChildEnv {
         let mut vars = vec![
             ("HILOOP_RUN_ID".into(), context.run_id.to_string().into()),
             (
-                "HILOOP_FORK_NODE_ID".into(),
-                context.fork_node_id.to_string().into(),
-            ),
-            (
-                "HILOOP_FORK_PATH".into(),
-                context.fork_path.to_string().into(),
+                "HILOOP_LINEAGE_PATH".into(),
+                context.lineage_path.to_string().into(),
             ),
             (
                 "OTEL_RESOURCE_ATTRIBUTES".into(),
@@ -332,7 +326,7 @@ fn encode_otel_resource_value(value: &str) -> String {
 ///
 /// Validates the sink invariants (e.g. `--proxy` needs a blob dir and an export
 /// target), wires up the configured capture sinks, spawns the child in its own
-/// process group with the fork context stamped into its environment, forwards
+/// process group with the run context stamped into its environment, forwards
 /// terminating signals, and drains telemetry until the child exits. Telemetry
 /// export is best effort and never kills the child; a missing/failed-to-spawn
 /// child or a misconfiguration returns `Err`.
@@ -1444,7 +1438,7 @@ fn forward_signal(child_pid: Option<u32>, signal: nix::sys::signal::Signal) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use hiloop_core::identity::{ForkNodeId, ForkPath, RunId};
+    use hiloop_core::identity::{LineagePath, RunId};
     use std::str::FromStr;
     use tokio::io::AsyncWriteExt;
 
@@ -1466,7 +1460,7 @@ mod tests {
 
     #[test]
     fn child_env_sets_otlp_endpoint_and_protocol() {
-        let mut env = ChildEnv::for_run(&ForkContext::new_local_root(), None);
+        let mut env = ChildEnv::for_run(&RunContext::new_local_root(), None);
         env.set_otlp_endpoint("127.0.0.1:4317".parse().expect("addr"));
 
         let vars = env
@@ -1523,11 +1517,11 @@ mod tests {
     }
 
     #[test]
-    fn child_env_stamps_the_fork_context() {
-        let run_id = RunId::from_str("01J00000000000000000000000").expect("run id");
-        let fork_node_id = ForkNodeId::from_str("01J00000000000000000000001").expect("node id");
-        let fork_path = ForkPath::parse("/0/3").expect("fork path");
-        let context = ForkContext::new(run_id, fork_node_id, fork_path);
+    fn child_env_stamps_the_run_context() {
+        let root = RunId::from_str("01J00000000000000000000000").expect("root run id");
+        let run_id = RunId::from_str("01J00000000000000000000001").expect("run id");
+        let lineage_path = LineagePath::root(root).child(run_id).expect("lineage path");
+        let context = RunContext::new(run_id, lineage_path).expect("run context");
 
         let env = ChildEnv::for_run(&context, None);
         let vars = env
@@ -1543,27 +1537,23 @@ mod tests {
 
         assert_eq!(
             vars.get("HILOOP_RUN_ID").map(String::as_str),
-            Some("01J00000000000000000000000")
-        );
-        assert_eq!(
-            vars.get("HILOOP_FORK_NODE_ID").map(String::as_str),
             Some("01J00000000000000000000001")
         );
         assert_eq!(
-            vars.get("HILOOP_FORK_PATH").map(String::as_str),
-            Some("/0/3")
+            vars.get("HILOOP_LINEAGE_PATH").map(String::as_str),
+            Some("01J00000000000000000000000.01J00000000000000000000001")
         );
         assert_eq!(
             vars.get("OTEL_RESOURCE_ATTRIBUTES").map(String::as_str),
             Some(
-                "hiloop.run.id=01J00000000000000000000000,hiloop.fork.node_id=01J00000000000000000000001,hiloop.fork.path=/0/3"
+                "hiloop.run.id=01J00000000000000000000001,hiloop.run.lineage_path=01J00000000000000000000000.01J00000000000000000000001"
             )
         );
     }
 
     #[test]
     fn child_env_stamps_execution_id_when_present() {
-        let env = ChildEnv::for_run(&ForkContext::new_local_root(), Some("execution-123"));
+        let env = ChildEnv::for_run(&RunContext::new_local_root(), Some("execution-123"));
         let vars = env
             .vars()
             .iter()
@@ -1680,7 +1670,7 @@ mod tests {
 
     fn base_options(command: Vec<String>) -> RunOptions {
         RunOptions::new(
-            ForkContext::new_local_root(),
+            RunContext::new_local_root(),
             command,
             Some(PathBuf::from("/tmp/never-created.jsonl")),
             None,
@@ -1769,7 +1759,7 @@ mod tests {
         let marker = temp.path().join("child-finished");
         let marker_arg = marker.to_string_lossy().into_owned();
         let options = RunOptions::new(
-            ForkContext::new_local_root(),
+            RunContext::new_local_root(),
             vec![
                 "sh".to_owned(),
                 "-c".to_owned(),

@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use hiloop_core::event::{AttributeKey, Event, EventName, SignalType};
-use hiloop_core::identity::{ForkContext, Hlc};
+use hiloop_core::identity::{Hlc, RunContext};
 use hiloop_interceptor::grpc_export::GrpcIngestExporter;
 use hiloop_interceptor::grpc_export::proto::telemetry_ingest_service_server::{
     TelemetryIngestService, TelemetryIngestServiceServer,
@@ -80,7 +80,7 @@ async fn serve(service: RecordingService) -> String {
 
 fn log_event(message: &str) -> Event {
     Event::new(
-        &ForkContext::new_local_root(),
+        &RunContext::new_local_root(),
         Hlc {
             wall_ns: 1,
             logical: 0,

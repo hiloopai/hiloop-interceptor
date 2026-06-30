@@ -222,7 +222,7 @@ fn span_to_event(context: &NormalizationContext, span: &Span) -> Result<Event, N
         logical: 0,
     };
 
-    let mut event = Event::new(context.fork_context(), ts, signal, name);
+    let mut event = Event::new(context.run_context(), ts, signal, name);
     if !span.trace_id.is_empty() {
         event = event.with_attribute(
             AttributeKey::from_static("otel.trace_id"),
@@ -297,7 +297,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hiloop_core::identity::ForkContext;
+    use hiloop_core::identity::RunContext;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -367,7 +367,7 @@ mod tests {
             },
             body,
         );
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
 
         let outcome = OtlpTraceNormalizer
             .normalize(&context, raw)
@@ -536,7 +536,7 @@ mod tests {
             },
             body,
         );
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
 
         let outcome = OtlpTraceNormalizer
             .normalize(&context, raw)
@@ -557,7 +557,7 @@ mod tests {
             },
             Bytes::from_static(b"\xff\xfe\xfd"),
         );
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
 
         let error = OtlpTraceNormalizer
             .normalize(&context, raw)
@@ -587,7 +587,7 @@ mod tests {
             },
             body,
         );
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
 
         let outcome = OtlpTraceNormalizer
             .normalize(&context, raw)
@@ -634,7 +634,7 @@ mod tests {
             },
             body,
         );
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
 
         let outcome = OtlpTraceNormalizer
             .normalize(&context, raw)

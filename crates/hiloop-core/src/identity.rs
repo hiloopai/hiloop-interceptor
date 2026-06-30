@@ -1,40 +1,44 @@
-//! Fork-tree identity: the join key for telemetry, snapshots, and state.
+//! Run-lineage identity: the join key for telemetry, snapshots, and state.
 //!
-//! IDs are minted locally so fork fan-out never hits the control plane. Paths
-//! are parent-owned and gap-free. Hybrid logical timestamps keep events causally
-//! ordered across skewed machines.
+//! IDs are minted locally so a run never has to round-trip the control plane to
+//! stamp telemetry. A run's lineage path is the materialized, prefix-addressable
+//! position of the run in its tree — the dotted sequence of run ULIDs from the
+//! root run to this run. Hybrid logical timestamps keep events causally ordered
+//! across skewed machines.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::{
-    fmt,
+    fmt::{self, Write as _},
     str::FromStr,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Maximum supported materialized-path depth.
+/// Maximum supported materialized-path depth, in run segments.
 ///
 /// This bounds storage and index key growth while leaving enough room for deep
-/// experimental fork trees.
-pub const MAX_FORK_PATH_DEPTH: usize = 128;
+/// experimental run trees.
+pub const MAX_LINEAGE_PATH_DEPTH: usize = 128;
+
+/// The run-segment separator in a serialized lineage path.
+///
+/// Dotted run ULIDs, matching the control plane's materialized lineage path.
+const LINEAGE_SEPARATOR: char = '.';
 
 /// Errors returned by identity parsing and allocation helpers.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IdentityError {
     #[error("invalid {field} ULID: {value}")]
     InvalidUlid { field: &'static str, value: String },
-    #[error("invalid fork path `{value}`: {reason}")]
-    InvalidForkPath { value: String, reason: &'static str },
-    #[error("fork path depth limit exceeded: {depth} > {max}")]
-    ForkPathTooDeep { depth: usize, max: usize },
+    #[error("invalid lineage path `{value}`: {reason}")]
+    InvalidLineagePath { value: String, reason: &'static str },
+    #[error("lineage path depth limit exceeded: {depth} > {max}")]
+    LineagePathTooDeep { depth: usize, max: usize },
 }
 
-/// Identifier shared by every node and event in one run tree.
+/// Identifier shared by every event in one run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RunId(Ulid);
@@ -127,150 +131,78 @@ impl FromStr for EventId {
     }
 }
 
-/// Opaque identifier for one fork-tree node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ForkNodeId(Ulid);
-
-impl ForkNodeId {
-    /// Mint a node-local fork node id.
-    pub fn new() -> Self {
-        Self(Ulid::new())
-    }
-
-    pub fn from_ulid(value: Ulid) -> Self {
-        Self(value)
-    }
-
-    pub fn as_ulid(self) -> Ulid {
-        self.0
-    }
-}
-
-impl Default for ForkNodeId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for ForkNodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl FromStr for ForkNodeId {
-    type Err = IdentityError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ulid::from_string(value)
-            .map(Self)
-            .map_err(|_| IdentityError::InvalidUlid {
-                field: "fork_node_id",
-                value: value.to_owned(),
-            })
-    }
-}
-
-/// Parent-assigned ordinal of a child fork.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ForkOrdinal(u64);
-
-impl ForkOrdinal {
-    /// The first child ordinal for a parent node.
-    pub const ZERO: Self = Self(0);
-
-    /// Convert from the storage and wire representation.
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Convert into the storage and wire representation.
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for ForkOrdinal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl From<u64> for ForkOrdinal {
-    fn from(value: u64) -> Self {
-        Self::new(value)
-    }
-}
-
-/// The materialized path of gap-free child ordinals, e.g. `/0/3/1`.
+/// The materialized lineage path of a run: the dotted run ULIDs from the root run
+/// to this run, e.g. `01ARZ….01BX5…`.
 ///
-/// Root is represented internally as an empty ordinal sequence and serialized
-/// as the empty string. Every non-root path serializes as slash-delimited
-/// ordinals.
+/// A root run's path is its own run ULID — never empty. Every segment is a valid
+/// run ULID, and the last segment is this run's own id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ForkPath(Vec<ForkOrdinal>);
+pub struct LineagePath(Vec<RunId>);
 
-impl ForkPath {
-    /// Depth-zero path.
-    pub fn root() -> Self {
-        Self(Vec::new())
+impl LineagePath {
+    /// The lineage path of a root run: a single segment, the run's own id.
+    pub fn root(run_id: RunId) -> Self {
+        Self(vec![run_id])
     }
 
-    /// Accepts `""` for root or slash-delimited decimal ordinals like `/0/3`.
+    /// Parse a dotted sequence of run ULIDs. Rejects an empty path: a run always
+    /// has at least its own id in the path.
     pub fn parse(value: impl Into<String>) -> Result<Self, IdentityError> {
         let value = value.into();
-        parse_fork_path(&value).map(Self)
+        parse_lineage_path(&value).map(Self)
     }
 
-    /// Appends a parent-assigned ordinal, unless that would exceed the depth limit.
-    pub fn child(&self, ordinal: ForkOrdinal) -> Result<Self, IdentityError> {
+    /// Append a child run, unless that would exceed the depth limit. The child's
+    /// path is this path plus the child's run id.
+    pub fn child(&self, child: RunId) -> Result<Self, IdentityError> {
         let depth = self.depth() + 1;
-        if depth > MAX_FORK_PATH_DEPTH {
-            return Err(IdentityError::ForkPathTooDeep {
+        if depth > MAX_LINEAGE_PATH_DEPTH {
+            return Err(IdentityError::LineagePathTooDeep {
                 depth,
-                max: MAX_FORK_PATH_DEPTH,
+                max: MAX_LINEAGE_PATH_DEPTH,
             });
         }
 
-        let mut ordinals = self.0.clone();
-        ordinals.push(ordinal);
-        Ok(Self(ordinals))
+        let mut segments = self.0.clone();
+        segments.push(child);
+        Ok(Self(segments))
     }
 
-    /// Root-to-leaf ordinal sequence.
-    pub fn ordinals(&self) -> &[ForkOrdinal] {
+    /// Root-to-leaf run-id sequence.
+    pub fn segments(&self) -> &[RunId] {
         &self.0
     }
 
-    /// Tree depth, with root = 0.
+    /// The run this path addresses — the last segment.
+    pub fn run_id(&self) -> RunId {
+        // Invariant: the constructors keep the vector non-empty.
+        *self.0.last().expect("lineage path is never empty")
+    }
+
+    /// Tree depth, with a root run = 1.
     pub fn depth(&self) -> usize {
         self.0.len()
     }
 
     /// True if `self` is an ancestor of, or equal to, `other`.
-    pub fn is_ancestor_of(&self, other: &ForkPath) -> bool {
+    pub fn is_ancestor_of(&self, other: &LineagePath) -> bool {
         other.0.starts_with(&self.0)
     }
 }
 
-impl Default for ForkPath {
-    fn default() -> Self {
-        Self::root()
-    }
-}
-
-impl fmt::Display for ForkPath {
+impl fmt::Display for LineagePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for ordinal in &self.0 {
-            write!(f, "/{ordinal}")?;
+        for (index, run_id) in self.0.iter().enumerate() {
+            if index > 0 {
+                f.write_char(LINEAGE_SEPARATOR)?;
+            }
+            fmt::Display::fmt(run_id, f)?;
         }
         Ok(())
     }
 }
 
-impl FromStr for ForkPath {
+impl FromStr for LineagePath {
     type Err = IdentityError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -278,7 +210,7 @@ impl FromStr for ForkPath {
     }
 }
 
-impl Serialize for ForkPath {
+impl Serialize for LineagePath {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -287,7 +219,7 @@ impl Serialize for ForkPath {
     }
 }
 
-impl<'de> Deserialize<'de> for ForkPath {
+impl<'de> Deserialize<'de> for LineagePath {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -297,85 +229,48 @@ impl<'de> Deserialize<'de> for ForkPath {
     }
 }
 
-/// Fully resolved fork context stamped onto child environment and telemetry.
+/// Fully resolved run context stamped onto child environment and telemetry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForkContext {
+pub struct RunContext {
     pub run_id: RunId,
-    pub fork_node_id: ForkNodeId,
-    pub fork_path: ForkPath,
+    pub lineage_path: LineagePath,
 }
 
-impl ForkContext {
-    /// Use when no upstream fork context was provided.
+impl RunContext {
+    /// Use when no upstream run context was provided: a fresh root run whose
+    /// lineage path is its own id.
     pub fn new_local_root() -> Self {
-        Self {
-            run_id: RunId::new(),
-            fork_node_id: ForkNodeId::new(),
-            fork_path: ForkPath::root(),
-        }
-    }
-
-    pub fn new(run_id: RunId, fork_node_id: ForkNodeId, fork_path: ForkPath) -> Self {
+        let run_id = RunId::new();
         Self {
             run_id,
-            fork_node_id,
-            fork_path,
+            lineage_path: LineagePath::root(run_id),
         }
     }
 
-    /// Derive a child fork node from this node.
-    ///
-    /// The child stays in the same run, mints a fresh [`ForkNodeId`], and
-    /// extends `fork_path` with the parent-assigned `ordinal`. Pair this with a
-    /// per-parent [`ChildOrdinalAllocator`] so sibling ordinals stay unique and
-    /// gap-free under concurrent forking. Fails only if the child would exceed
-    /// [`MAX_FORK_PATH_DEPTH`].
-    pub fn child(&self, ordinal: ForkOrdinal) -> Result<Self, IdentityError> {
+    /// Build a context from a resolved run id and its lineage path. The path's
+    /// leaf must be `run_id`, so they describe the same run.
+    pub fn new(run_id: RunId, lineage_path: LineagePath) -> Result<Self, IdentityError> {
+        if lineage_path.run_id() != run_id {
+            return Err(IdentityError::InvalidLineagePath {
+                value: lineage_path.to_string(),
+                reason: "lineage path leaf must equal run_id",
+            });
+        }
         Ok(Self {
-            run_id: self.run_id,
-            fork_node_id: ForkNodeId::new(),
-            fork_path: self.fork_path.child(ordinal)?,
+            run_id,
+            lineage_path,
         })
     }
-}
 
-/// Parent-owned atomic allocator for sibling fork ordinals.
-///
-/// This allocator is intentionally local to the process that owns the parent
-/// node. `Relaxed` ordering is sufficient because the contract is uniqueness and
-/// gap freedom of the counter itself, not synchronization of child metadata.
-#[derive(Debug)]
-pub struct ChildOrdinalAllocator {
-    next: AtomicU64,
-}
-
-impl ChildOrdinalAllocator {
-    /// Start at [`ForkOrdinal::ZERO`].
-    pub fn new() -> Self {
-        Self::with_next(ForkOrdinal::ZERO)
-    }
-
-    /// Resume from the next ordinal that has not been committed.
-    pub fn with_next(next: ForkOrdinal) -> Self {
-        Self {
-            next: AtomicU64::new(next.as_u64()),
-        }
-    }
-
-    /// Allocate one sibling ordinal.
-    pub fn next(&self) -> ForkOrdinal {
-        ForkOrdinal::new(self.next.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// Inspect the next ordinal without advancing the allocator.
-    pub fn peek(&self) -> ForkOrdinal {
-        ForkOrdinal::new(self.next.load(Ordering::Relaxed))
-    }
-}
-
-impl Default for ChildOrdinalAllocator {
-    fn default() -> Self {
-        Self::new()
+    /// Derive a child run from this run: a freshly minted [`RunId`] whose lineage
+    /// path extends this run's path. Fails only if the child would exceed
+    /// [`MAX_LINEAGE_PATH_DEPTH`].
+    pub fn child(&self) -> Result<Self, IdentityError> {
+        let run_id = RunId::new();
+        Ok(Self {
+            run_id,
+            lineage_path: self.lineage_path.child(run_id)?,
+        })
     }
 }
 
@@ -460,47 +355,43 @@ impl HlcClock {
     }
 }
 
-fn parse_fork_path(value: &str) -> Result<Vec<ForkOrdinal>, IdentityError> {
+fn parse_lineage_path(value: &str) -> Result<Vec<RunId>, IdentityError> {
     if value.is_empty() {
-        return Ok(Vec::new());
+        return invalid_path(value, "lineage path must not be empty");
     }
-    if !value.starts_with('/') {
-        return invalid_path(value, "non-root paths must start with `/`");
-    }
-    if value.ends_with('/') {
-        return invalid_path(value, "non-root paths must not end with `/`");
+    if value.starts_with(LINEAGE_SEPARATOR) || value.ends_with(LINEAGE_SEPARATOR) {
+        return invalid_path(
+            value,
+            "lineage path must not have leading or trailing separators",
+        );
     }
 
-    let mut ordinals = Vec::new();
-    for component in value[1..].split('/') {
-        let depth = ordinals.len() + 1;
-        if depth > MAX_FORK_PATH_DEPTH {
-            return Err(IdentityError::ForkPathTooDeep {
+    let mut segments = Vec::new();
+    for component in value.split(LINEAGE_SEPARATOR) {
+        let depth = segments.len() + 1;
+        if depth > MAX_LINEAGE_PATH_DEPTH {
+            return Err(IdentityError::LineagePathTooDeep {
                 depth,
-                max: MAX_FORK_PATH_DEPTH,
+                max: MAX_LINEAGE_PATH_DEPTH,
             });
         }
         if component.is_empty() {
-            return invalid_path(value, "path components must not be empty");
+            return invalid_path(value, "lineage path segments must not be empty");
         }
-        if component.len() > 1 && component.starts_with('0') {
-            return invalid_path(value, "path ordinals must be canonical decimals");
-        }
-        let ordinal = component
-            .parse::<u64>()
-            .map(ForkOrdinal::new)
-            .map_err(|_| IdentityError::InvalidForkPath {
+        let run_id = Ulid::from_string(component)
+            .map(RunId::from_ulid)
+            .map_err(|_| IdentityError::InvalidLineagePath {
                 value: value.to_owned(),
-                reason: "path components must be u64 ordinals",
+                reason: "lineage path segments must be run ULIDs",
             })?;
-        ordinals.push(ordinal);
+        segments.push(run_id);
     }
 
-    Ok(ordinals)
+    Ok(segments)
 }
 
 fn invalid_path<T>(value: &str, reason: &'static str) -> Result<T, IdentityError> {
-    Err(IdentityError::InvalidForkPath {
+    Err(IdentityError::InvalidLineagePath {
         value: value.to_owned(),
         reason,
     })
@@ -535,114 +426,97 @@ fn unix_time_ns() -> u64 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::{collections::BTreeSet, sync::Arc, thread};
+    use std::collections::BTreeSet;
 
-    const fn ordinal(value: u64) -> ForkOrdinal {
-        ForkOrdinal::new(value)
+    fn run(byte: u8) -> RunId {
+        RunId::from_ulid(Ulid::from_bytes([byte; 16]))
     }
 
     #[test]
-    fn fork_path_prefix_is_ancestor() {
-        let root = ForkPath::root();
-        let a = root.child(ordinal(0)).expect("child path");
-        let b = a.child(ordinal(3)).expect("child path");
+    fn lineage_path_prefix_is_ancestor() {
+        let root = LineagePath::root(run(1));
+        let a = root.child(run(2)).expect("child path");
+        let b = a.child(run(3)).expect("child path");
 
         assert!(root.is_ancestor_of(&b));
         assert!(a.is_ancestor_of(&b));
         assert!(!b.is_ancestor_of(&a));
-        assert_eq!(b.depth(), 2);
-        assert_eq!(b.ordinals(), &[ordinal(0), ordinal(3)]);
-        assert_eq!(b.to_string(), "/0/3");
+        assert_eq!(b.depth(), 3);
+        assert_eq!(b.segments(), &[run(1), run(2), run(3)]);
+        assert_eq!(b.run_id(), run(3));
+        assert_eq!(b.to_string(), format!("{}.{}.{}", run(1), run(2), run(3)));
     }
 
     #[test]
-    fn fork_path_serializes_as_canonical_string() {
-        let path = ForkPath::root()
-            .child(ordinal(0))
-            .and_then(|path| path.child(ordinal(3)))
-            .expect("child path");
+    fn lineage_path_serializes_as_dotted_run_ulids() {
+        let path = LineagePath::root(run(1)).child(run(2)).expect("child path");
         let serialized = serde_json::to_string(&path).expect("serialize path");
-        let deserialized: ForkPath = serde_json::from_str(&serialized).expect("deserialize path");
+        let deserialized: LineagePath =
+            serde_json::from_str(&serialized).expect("deserialize path");
 
-        assert_eq!(serialized, "\"/0/3\"");
+        assert_eq!(serialized, format!("\"{}.{}\"", run(1), run(2)));
         assert_eq!(deserialized, path);
     }
 
     #[test]
-    fn root_fork_path_serializes_as_empty_string() {
-        let path = ForkPath::root();
+    fn root_lineage_path_is_its_own_run_id() {
+        let path = LineagePath::root(run(7));
         let serialized = serde_json::to_string(&path).expect("serialize path");
-        let deserialized: ForkPath = serde_json::from_str(&serialized).expect("deserialize path");
+        let deserialized: LineagePath =
+            serde_json::from_str(&serialized).expect("deserialize path");
 
-        assert!(path.ordinals().is_empty());
-        assert_eq!(serialized, "\"\"");
+        assert_eq!(path.segments(), &[run(7)]);
+        assert_eq!(serialized, format!("\"{}\"", run(7)));
         assert_eq!(deserialized, path);
     }
 
     #[test]
     fn sibling_prefix_is_not_ancestor() {
-        let root = ForkPath::root();
-        let one = root
-            .child(ordinal(0))
-            .and_then(|path| path.child(ordinal(1)))
-            .expect("child path");
-        let ten = root
-            .child(ordinal(0))
-            .and_then(|path| path.child(ordinal(10)))
-            .expect("child path");
+        let root = LineagePath::root(run(1));
+        let one = root.child(run(2)).expect("child path");
+        let ten = root.child(run(3)).expect("child path");
 
         assert!(!one.is_ancestor_of(&ten));
     }
 
     #[test]
-    fn fork_path_parser_rejects_non_canonical_paths() {
-        for value in ["0", "/", "/01", "/0//1", "/x", "/0/"] {
-            assert!(ForkPath::parse(value).is_err(), "{value}");
+    fn lineage_path_parser_rejects_malformed_paths() {
+        for value in [
+            "",
+            ".",
+            "..",
+            "not-a-ulid",
+            &format!(".{}", run(1)),
+            &format!("{}.", run(1)),
+        ] {
+            assert!(LineagePath::parse(value).is_err(), "{value}");
         }
     }
 
     #[test]
-    fn fork_context_child_extends_path_and_keeps_run() {
-        let parent = ForkContext::new_local_root();
-        let child = parent.child(ordinal(2)).expect("child context");
+    fn run_context_child_extends_path_and_keeps_root() {
+        let parent = RunContext::new_local_root();
+        let child = parent.child().expect("child context");
 
-        assert_eq!(child.run_id, parent.run_id);
-        assert_ne!(child.fork_node_id, parent.fork_node_id);
-        assert!(parent.fork_path.is_ancestor_of(&child.fork_path));
-        assert_eq!(child.fork_path.depth(), parent.fork_path.depth() + 1);
-        assert_eq!(child.fork_path.ordinals().last(), Some(&ordinal(2)));
+        assert_ne!(child.run_id, parent.run_id);
+        assert!(parent.lineage_path.is_ancestor_of(&child.lineage_path));
+        assert_eq!(child.lineage_path.depth(), parent.lineage_path.depth() + 1);
+        assert_eq!(child.lineage_path.run_id(), child.run_id);
+        assert_eq!(child.lineage_path.segments().first(), Some(&parent.run_id));
     }
 
     #[test]
-    fn child_ordinals_are_gap_free_under_concurrency() {
-        const THREADS: u64 = 8;
-        const PER_THREAD: u64 = 256;
+    fn run_context_new_rejects_path_leaf_mismatch() {
+        let path = LineagePath::root(run(1));
+        assert!(RunContext::new(run(2), path).is_err());
+    }
 
-        let allocator = Arc::new(ChildOrdinalAllocator::new());
-        let handles = (0..THREADS)
-            .map(|_| {
-                let allocator = Arc::clone(&allocator);
-                thread::spawn(move || {
-                    (0..PER_THREAD)
-                        .map(|_| allocator.next())
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let mut ordinals = handles
-            .into_iter()
-            .flat_map(|handle| handle.join().expect("thread should finish"))
-            .collect::<Vec<_>>();
-        ordinals.sort_unstable();
-
-        assert_eq!(
-            ordinals,
-            (0..THREADS * PER_THREAD)
-                .map(ForkOrdinal::new)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(allocator.peek(), ForkOrdinal::new(THREADS * PER_THREAD));
+    #[test]
+    fn run_context_new_accepts_matching_leaf() {
+        let path = LineagePath::root(run(1)).child(run(2)).expect("child path");
+        let ctx = RunContext::new(run(2), path.clone()).expect("context");
+        assert_eq!(ctx.run_id, run(2));
+        assert_eq!(ctx.lineage_path, path);
     }
 
     #[test]
@@ -701,17 +575,17 @@ mod tests {
 
     proptest! {
         #[test]
-        fn parsed_child_paths_round_trip(ordinals in prop::collection::vec(0u64..1_000_000, 0..16)) {
-            let mut path = ForkPath::root();
+        fn parsed_child_paths_round_trip(depth in 0usize..16) {
+            let mut path = LineagePath::root(RunId::new());
             let mut seen = BTreeSet::new();
             seen.insert(path.to_string());
 
-            for ordinal in ordinals {
-                path = path.child(ForkOrdinal::new(ordinal))?;
-                let parsed = ForkPath::parse(path.to_string())?;
+            for _ in 0..depth {
+                path = path.child(RunId::new())?;
+                let parsed = LineagePath::parse(path.to_string())?;
                 prop_assert_eq!(&parsed, &path);
                 let ancestors_valid = seen.iter().all(|ancestor| {
-                    ForkPath::parse(ancestor).is_ok_and(|ancestor| ancestor.is_ancestor_of(&path))
+                    LineagePath::parse(ancestor).is_ok_and(|ancestor| ancestor.is_ancestor_of(&path))
                 });
                 prop_assert!(ancestors_valid);
                 seen.insert(path.to_string());
