@@ -212,7 +212,7 @@ impl Normalizer for StdioLogNormalizer {
         let stream_key = attribute_key("stream", &raw)?;
         let source_key = attribute_key("source", &raw)?;
         let mut event = Event::new(
-            context.fork_context(),
+            context.run_context(),
             raw.observed_at,
             SignalType::Log,
             event_name,
@@ -249,7 +249,7 @@ fn attribute_key(value: &'static str, raw: &RawSignal) -> Result<AttributeKey, N
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use hiloop_core::identity::{ForkContext, Hlc};
+    use hiloop_core::identity::{Hlc, RunContext};
 
     #[tokio::test]
     async fn normalizes_stdout_into_log_event() {
@@ -265,7 +265,7 @@ mod tests {
 
         let outcome = StdioLogNormalizer
             .normalize(
-                &NormalizationContext::new(ForkContext::new_local_root()),
+                &NormalizationContext::new(RunContext::new_local_root()),
                 raw,
             )
             .await
@@ -296,7 +296,7 @@ mod tests {
         assert!(
             StdioLogNormalizer
                 .normalize(
-                    &NormalizationContext::new(ForkContext::new_local_root()),
+                    &NormalizationContext::new(RunContext::new_local_root()),
                     raw
                 )
                 .await
@@ -318,7 +318,7 @@ mod tests {
 
         let outcome = StdioLogNormalizer
             .normalize(
-                &NormalizationContext::new(ForkContext::new_local_root()),
+                &NormalizationContext::new(RunContext::new_local_root()),
                 raw,
             )
             .await

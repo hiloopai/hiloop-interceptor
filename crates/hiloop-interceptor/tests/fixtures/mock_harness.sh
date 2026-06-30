@@ -10,8 +10,7 @@ case "$mode" in
     context)
         exit_code="${1:-0}"
         printf 'HILOOP_RUN_ID=%s\n' "${HILOOP_RUN_ID:-}"
-        printf 'HILOOP_FORK_NODE_ID=%s\n' "${HILOOP_FORK_NODE_ID:-}"
-        printf 'HILOOP_FORK_PATH=%s\n' "${HILOOP_FORK_PATH:-}"
+        printf 'HILOOP_LINEAGE_PATH=%s\n' "${HILOOP_LINEAGE_PATH:-}"
         printf 'OTEL_RESOURCE_ATTRIBUTES=%s\n' "${OTEL_RESOURCE_ATTRIBUTES:-}"
         printf 'context-stderr\n' >&2
         exit "$exit_code"

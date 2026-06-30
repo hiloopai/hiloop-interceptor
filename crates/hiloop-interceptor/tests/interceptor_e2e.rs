@@ -3,9 +3,8 @@ use serde_json::Value;
 use std::{collections::BTreeSet, path::PathBuf, process::Output, time::Duration};
 use tokio::process::Command;
 
-const RUN_ID: &str = "01J00000000000000000000000";
-const FORK_NODE_ID: &str = "01J00000000000000000000001";
-const FORK_PATH: &str = "/0/3";
+const RUN_ID: &str = "01J00000000000000000000001";
+const LINEAGE_PATH: &str = "01J00000000000000000000000.01J00000000000000000000001";
 const E2E_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
@@ -19,12 +18,10 @@ async fn pass_through_injects_context_and_returns_child_exit_code() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout"),
         concat!(
-            "HILOOP_RUN_ID=01J00000000000000000000000\n",
-            "HILOOP_FORK_NODE_ID=01J00000000000000000000001\n",
-            "HILOOP_FORK_PATH=/0/3\n",
-            "OTEL_RESOURCE_ATTRIBUTES=hiloop.run.id=01J00000000000000000000000,",
-            "hiloop.fork.node_id=01J00000000000000000000001,",
-            "hiloop.fork.path=/0/3\n",
+            "HILOOP_RUN_ID=01J00000000000000000000001\n",
+            "HILOOP_LINEAGE_PATH=01J00000000000000000000000.01J00000000000000000000001\n",
+            "OTEL_RESOURCE_ATTRIBUTES=hiloop.run.id=01J00000000000000000000001,",
+            "hiloop.run.lineage_path=01J00000000000000000000000.01J00000000000000000000001\n",
         )
     );
     assert_eq!(output.stderr, b"context-stderr\n");
@@ -431,7 +428,7 @@ async fn inspect_summarizes_captured_events() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(
-        stdout.contains("4 events across 1 fork path(s)"),
+        stdout.contains("4 events across 1 run lineage path(s)"),
         "summary header missing: {stdout}"
     );
     assert!(
@@ -475,7 +472,7 @@ async fn captures_otlp_traces_from_child_export() {
         .find(|event| event["signal"] == "llm")
         .expect("an llm event from the OTLP export");
     assert_eq!(llm["name"], "chat");
-    assert_eq!(llm["fork_path"], FORK_PATH);
+    assert_eq!(llm["lineage_path"], LINEAGE_PATH);
     assert_eq!(llm["attributes"]["gen_ai.system"], "anthropic");
     assert_eq!(
         llm["attributes"][provenance_keys::NORMALIZER_NAME],
@@ -560,7 +557,7 @@ async fn proxy_mitm_captures_decrypted_https_request() {
         })
         .expect("a captured https request proves TLS interception");
     assert_eq!(request["signal"], "net");
-    assert_eq!(request["fork_path"], FORK_PATH);
+    assert_eq!(request["lineage_path"], LINEAGE_PATH);
     assert!(
         request["attributes"]["http.host"]
             .as_str()
@@ -730,15 +727,7 @@ async fn wait_for_path(path: &std::path::Path) {
 fn interceptor_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hiloop-interceptor"));
     command.kill_on_drop(true);
-    command.args([
-        "run",
-        "--run-id",
-        RUN_ID,
-        "--node",
-        FORK_NODE_ID,
-        "--fork-path",
-        FORK_PATH,
-    ]);
+    command.args(["run", "--run-id", RUN_ID, "--lineage-path", LINEAGE_PATH]);
     command
 }
 
@@ -772,8 +761,7 @@ fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
 
 fn assert_common_event_provenance(event: &Value, raw_retention: &str) {
     assert_eq!(event["run_id"], RUN_ID);
-    assert_eq!(event["fork_node_id"], FORK_NODE_ID);
-    assert_eq!(event["fork_path"], FORK_PATH);
+    assert_eq!(event["lineage_path"], LINEAGE_PATH);
     assert_eq!(event["signal"], "log");
     assert_eq!(event["attributes"]["source"], "stdio");
     assert_eq!(

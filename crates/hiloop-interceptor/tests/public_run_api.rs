@@ -1,17 +1,17 @@
 //! The embeddable `run` library surface: a downstream crate
-//! like the product CLI builds a `ForkContext`, optional `GrpcExportOptions`, and a
+//! like the product CLI builds a `RunContext`, optional `GrpcExportOptions`, and a
 //! `RunOptions`, then awaits `hiloop_interceptor::run`. These tests pin that surface
 //! through the crate-root re-exports and assert the child's exit code passes through.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
-use hiloop_core::identity::ForkContext;
+use hiloop_core::identity::RunContext;
 use hiloop_interceptor::{GrpcExportOptions, RunOptions, run};
 
 fn options_for(command: Vec<String>, export_grpc: Option<GrpcExportOptions>) -> RunOptions {
     RunOptions::new(
-        ForkContext::new_local_root(),
+        RunContext::new_local_root(),
         command,
         None,
         None,

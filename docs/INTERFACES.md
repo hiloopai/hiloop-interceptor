@@ -8,7 +8,7 @@ style rules live in [`RUST_STYLE.md`](RUST_STYLE.md).
 
 `hiloop-core` owns shared contracts, not orchestration. Keep it dependency-light and stable:
 
-- fork identity types;
+- run-lineage identity types;
 - telemetry event data types;
 - parsing and validation helpers for those data types;
 - future protobuf/schema contracts that public and private components both consume.
@@ -33,7 +33,7 @@ taxonomy is stable.
 
 `hiloop_core::event::Event` and the `hiloop_core::identity` types are **persisted and wire
 contracts**. Treat their serialized shape as frozen at v1: a change to the field set, field
-names, enum discriminants, or the fork-path / HLC encoding is a coordinated schema decision
+names, enum discriminants, or the lineage-path / HLC encoding is a coordinated schema decision
 plus a migration, never an incidental edit.
 
 This policy is enforced executably by

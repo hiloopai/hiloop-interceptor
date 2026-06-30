@@ -1,7 +1,7 @@
 //! Read-side inspection of captured events.
 //!
-//! Groups a run's events by fork-tree node so a dogfooding session can see what
-//! was captured per branch, and compares two branches' event-name distributions
+//! Groups a run's events by run-lineage path so a dogfooding session can see what
+//! was captured per run in the tree, and compares two runs' event-name distributions
 //! — the first taste of the branch-diff observability the system is built for.
 //!
 //! This module is pure analysis over already-parsed [`Event`]s. File IO and
@@ -11,11 +11,11 @@ use std::collections::BTreeMap;
 
 use hiloop_core::event::{Event, SignalType};
 
-/// Per-fork-path rollup of captured events.
+/// Per-lineage-path rollup of captured events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathSummary {
-    /// Fork path as serialized; the empty string is the run root.
-    pub fork_path: String,
+    /// Run lineage path as serialized (dotted run ULIDs).
+    pub lineage_path: String,
     pub events: usize,
     /// Event count per signal family, keyed by the family's canonical label.
     pub by_signal: BTreeMap<&'static str, usize>,
@@ -24,9 +24,9 @@ pub struct PathSummary {
 }
 
 impl PathSummary {
-    fn new(fork_path: String) -> Self {
+    fn new(lineage_path: String) -> Self {
         Self {
-            fork_path,
+            lineage_path,
             events: 0,
             by_signal: BTreeMap::new(),
             by_name: BTreeMap::new(),
@@ -34,22 +34,24 @@ impl PathSummary {
     }
 }
 
-/// A captured event set summarized and grouped by fork path.
+/// A captured event set summarized and grouped by lineage path.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InspectSummary {
     pub total_events: usize,
-    /// Per-path summaries, ordered by fork path.
+    /// Per-path summaries, ordered by lineage path.
     pub paths: Vec<PathSummary>,
 }
 
 impl InspectSummary {
-    /// Find the summary for one fork path, if it has any events.
-    pub fn path(&self, fork_path: &str) -> Option<&PathSummary> {
-        self.paths.iter().find(|path| path.fork_path == fork_path)
+    /// Find the summary for one lineage path, if it has any events.
+    pub fn path(&self, lineage_path: &str) -> Option<&PathSummary> {
+        self.paths
+            .iter()
+            .find(|path| path.lineage_path == lineage_path)
     }
 }
 
-/// One event name's count in each of two compared fork paths.
+/// One event name's count in each of two compared lineage paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameDelta {
     pub name: String,
@@ -57,12 +59,12 @@ pub struct NameDelta {
     pub b: usize,
 }
 
-/// Roll events up by fork path. Paths and names are ordered deterministically.
+/// Roll events up by lineage path. Paths and names are ordered deterministically.
 #[must_use]
 pub fn summarize(events: &[Event]) -> InspectSummary {
     let mut by_path: BTreeMap<String, PathSummary> = BTreeMap::new();
     for event in events {
-        let key = event.fork_path.to_string();
+        let key = event.lineage_path.to_string();
         let summary = by_path
             .entry(key.clone())
             .or_insert_with(|| PathSummary::new(key));
@@ -80,11 +82,11 @@ pub fn summarize(events: &[Event]) -> InspectSummary {
     }
 }
 
-/// Compare event-name counts between two fork paths.
+/// Compare event-name counts between two lineage paths.
 ///
 /// Returns one [`NameDelta`] per event name that appears in either path with a
 /// different count, ordered by name. Names that occur equally in both are
-/// omitted, so the result is exactly where the two branches diverged.
+/// omitted, so the result is exactly where the two runs diverged.
 #[must_use]
 pub fn diff_event_names(summary: &InspectSummary, path_a: &str, path_b: &str) -> Vec<NameDelta> {
     let empty = BTreeMap::new();
@@ -123,9 +125,9 @@ const fn signal_label(signal: SignalType) -> &'static str {
 mod tests {
     use super::*;
     use hiloop_core::event::{EventName, SignalType};
-    use hiloop_core::identity::{ForkContext, ForkOrdinal, Hlc};
+    use hiloop_core::identity::{Hlc, RunContext};
 
-    fn event(context: &ForkContext, signal: SignalType, name: &str) -> Event {
+    fn event(context: &RunContext, signal: SignalType, name: &str) -> Event {
         Event::new(
             context,
             Hlc {
@@ -138,9 +140,11 @@ mod tests {
     }
 
     #[test]
-    fn summarize_groups_events_by_fork_path() {
-        let root = ForkContext::new_local_root();
-        let child = root.child(ForkOrdinal::new(0)).expect("child");
+    fn summarize_groups_events_by_lineage_path() {
+        let root = RunContext::new_local_root();
+        let child = root.child().expect("child");
+        let root_path = root.lineage_path.to_string();
+        let child_path = child.lineage_path.to_string();
         let events = vec![
             event(&root, SignalType::Log, "process.stdout"),
             event(&root, SignalType::Log, "process.stdout"),
@@ -153,20 +157,22 @@ mod tests {
         assert_eq!(summary.total_events, 4);
         assert_eq!(summary.paths.len(), 2);
 
-        let root_summary = summary.path("").expect("root summary");
+        let root_summary = summary.path(&root_path).expect("root summary");
         assert_eq!(root_summary.events, 3);
         assert_eq!(root_summary.by_signal.get("log"), Some(&2));
         assert_eq!(root_summary.by_signal.get("net"), Some(&1));
         assert_eq!(root_summary.by_name.get("process.stdout"), Some(&2));
 
-        let child_summary = summary.path("/0").expect("child summary");
+        let child_summary = summary.path(&child_path).expect("child summary");
         assert_eq!(child_summary.events, 1);
     }
 
     #[test]
     fn diff_reports_only_diverging_event_names() {
-        let a = ForkContext::new_local_root();
-        let b = a.child(ForkOrdinal::new(0)).expect("child");
+        let a = RunContext::new_local_root();
+        let b = a.child().expect("child");
+        let a_path = a.lineage_path.to_string();
+        let b_path = b.lineage_path.to_string();
         let events = vec![
             // Shared name with equal counts is omitted from the diff.
             event(&a, SignalType::Log, "process.stdout"),
@@ -178,7 +184,7 @@ mod tests {
         ];
         let summary = summarize(&events);
 
-        let deltas = diff_event_names(&summary, "", "/0");
+        let deltas = diff_event_names(&summary, &a_path, &b_path);
 
         assert_eq!(
             deltas,
@@ -201,6 +207,6 @@ mod tests {
     fn summarize_handles_no_events() {
         let summary = summarize(&[]);
         assert_eq!(summary, InspectSummary::default());
-        assert!(diff_event_names(&summary, "", "/0").is_empty());
+        assert!(diff_event_names(&summary, "a", "b").is_empty());
     }
 }

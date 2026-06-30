@@ -948,7 +948,7 @@ impl Normalizer for ProxyNormalizer {
             message: error.to_string(),
         })?;
 
-        let mut event = Event::new(context.fork_context(), raw.observed_at, signal, name);
+        let mut event = Event::new(context.run_context(), raw.observed_at, signal, name);
         for (key, value) in &raw.attributes {
             let key = AttributeKey::new(key.as_str()).map_err(|error| NormalizeError::Decode {
                 source_name: raw.source.clone(),
@@ -979,7 +979,7 @@ mod tests {
     use super::*;
     use crate::blob::testing::MemoryBlobStore;
     use hiloop_core::event::{AttributeValue, PayloadDigest};
-    use hiloop_core::identity::{ForkContext, Hlc};
+    use hiloop_core::identity::{Hlc, RunContext};
     use hudsucker::hyper::body::Frame;
 
     fn handler() -> (
@@ -1094,7 +1094,7 @@ mod tests {
             ],
         )
         .with_payload_ref(PayloadRef::new(digest));
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
 
         let outcome = ProxyNormalizer
             .normalize(&context, raw)
@@ -1131,7 +1131,7 @@ mod tests {
                 ("http.status_code", "200"),
             ],
         );
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
 
         let outcome = ProxyNormalizer
             .normalize(&context, raw)
@@ -1486,7 +1486,7 @@ mod tests {
                 ("custom.attr", "value"),
             ],
         );
-        let context = NormalizationContext::new(ForkContext::new_local_root());
+        let context = NormalizationContext::new(RunContext::new_local_root());
 
         let outcome = ProxyNormalizer
             .normalize(&context, raw)

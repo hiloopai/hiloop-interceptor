@@ -12,7 +12,7 @@ thresholds.
 
 | ID | Required behavior | Primary proof |
 |---|---|---|
-| B1 | The wrapped command receives the requested argv and fork context. | Mock-harness E2E |
+| B1 | The wrapped command receives the requested argv and run context. | Mock-harness E2E |
 | B2 | Without capture enabled, stdout/stderr and the child exit code pass through unchanged. | Mock-harness E2E |
 | B3 | With capture enabled, stdout/stderr are teed byte-for-byte while normalized events are emitted. | Mock-harness E2E |
 | B4 | Every normalized event carries the requested run/node/path plus normalizer, wrapper, raw-source, and process provenance. | Pipeline tests + E2E |
@@ -26,8 +26,8 @@ thresholds.
 | B12 | A telemetry pipeline failure does not abruptly kill a still-running child; the wrapper drains the child and then reports telemetry failure. | Supervisor unit test |
 | B13 | The child leads its own process group; on SIGINT/SIGTERM the wrapper forwards the signal to that group, then still drains the child and reports its exit. | Mock-harness E2E |
 | B14 | A normal child exit passes its code through; a child terminated by a signal is reported as `128 + signo`. | Supervisor unit test + E2E |
-| B15 | With `--otlp`, the wrapper injects `OTEL_EXPORTER_OTLP_ENDPOINT`, receives the child's OTLP trace export, and emits fork-stamped events; LLM spans become `llm`. | Mock-harness E2E + normalizer tests |
-| B16 | With `--proxy`, the wrapper injects `HTTPS_PROXY` + a child-scoped CA bundle, decrypts the child's HTTPS, and emits fork-stamped `net`/`llm` events; bodies stream frame-by-frame into a content-addressed blob store (`--blob-dir`) and events carry a `payload_ref`. | Mock-harness MITM E2E + blob/handler/normalizer tests |
+| B15 | With `--otlp`, the wrapper injects `OTEL_EXPORTER_OTLP_ENDPOINT`, receives the child's OTLP trace export, and emits run-lineage-stamped events; LLM spans become `llm`. | Mock-harness E2E + normalizer tests |
+| B16 | With `--proxy`, the wrapper injects `HTTPS_PROXY` + a child-scoped CA bundle, decrypts the child's HTTPS, and emits run-lineage-stamped `net`/`llm` events; bodies stream frame-by-frame into a content-addressed blob store (`--blob-dir`) and events carry a `payload_ref`. | Mock-harness MITM E2E + blob/handler/normalizer tests |
 
 These are desired contracts, not incidental implementation details. Changing one requires an
 explicit design decision and updated tests.
@@ -99,7 +99,7 @@ Pre-release testing should use real integrations:
 ## E2E Review Rules
 
 - Assert observable behavior at the binary boundary, not private implementation details.
-- Use fixed fork identity in E2E tests so provenance assertions are deterministic.
+- Use fixed run-lineage identity in E2E tests so provenance assertions are deterministic.
 - Assert exact bytes at the tee boundary and parsed values at JSONL boundaries.
 - Assert per-stream order only; scheduling makes stdout/stderr total order nondeterministic.
 - Keep PR scenarios deterministic and small. Throughput measurements belong in benchmarks, not
