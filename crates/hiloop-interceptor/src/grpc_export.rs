@@ -59,7 +59,7 @@ impl GrpcIngestExporter {
     /// Build a lazily-connected exporter for `endpoint` (e.g.
     /// `https://telemetry.example.com:443`). The channel connects on first export, not here,
     /// so a gateway that is briefly unreachable at startup doesn't abort the run (and any local
-    /// JSONL sink keeps capturing). TLS (native trust roots) is used unless `insecure` is set (h2c,
+    /// JSONL sink keeps capturing). TLS (native + webpki trust roots) is used unless `insecure` is set (h2c,
     /// local dev only). The Bearer token is read from `HILOOP_API_KEY`; absent/empty means no auth
     /// header (an unauthenticated dev gateway). Pass `None` for `tenant_id` against an authenticated
     /// gateway (it derives the tenant from the token); pass `Some(tenant)` only against a no-auth
@@ -75,8 +75,14 @@ impl GrpcIngestExporter {
             ExportError::with_source("grpc", format!("invalid endpoint `{endpoint}`"), e)
         })?;
         if !insecure {
+            // `with_enabled_roots()` trusts BOTH the OS store (native roots — for an on-prem gateway
+            // behind a private CA) AND the compiled-in webpki/Mozilla bundle. Native roots alone fail
+            // to auto-discover the trust store in a minimal container (the sandbox base, where
+            // `hiloop run` embeds this interceptor: `with_native_roots()` yielded an empty set →
+            // `UnknownIssuer` even though the public chain's anchor was installed); the webpki bundle
+            // anchors the public chain regardless. This matches the HTTP capture path's rustls trust.
             builder = builder
-                .tls_config(ClientTlsConfig::new().with_native_roots())
+                .tls_config(ClientTlsConfig::new().with_enabled_roots())
                 .map_err(|e| ExportError::with_source("grpc", "TLS configuration failed", e))?;
         }
         let channel = builder.connect_lazy();
