@@ -877,7 +877,12 @@ fn set_child_controlling_terminal(command: &mut Command) {
             if nix::libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if nix::libc::ioctl(nix::libc::STDIN_FILENO, nix::libc::TIOCSCTTY, 0) == -1 {
+            if nix::libc::ioctl(
+                nix::libc::STDIN_FILENO,
+                nix::libc::TIOCSCTTY as nix::libc::c_ulong,
+                0,
+            ) == -1
+            {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
