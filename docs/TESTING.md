@@ -15,7 +15,7 @@ thresholds.
 | B1 | The wrapped command receives the requested argv and run context. | Mock-harness E2E |
 | B2 | Without capture enabled, stdout/stderr and the child exit code pass through unchanged. | Mock-harness E2E |
 | B3 | With capture enabled, stdout/stderr are teed byte-for-byte while normalized events are emitted. | Mock-harness E2E |
-| B4 | Every normalized event carries the requested run/node/path plus normalizer, wrapper, raw-source, and process provenance. | Pipeline tests + E2E |
+| B4 | Every normalized event carries the requested run id and lineage path plus normalizer, wrapper, raw-source, and process provenance. | Pipeline tests + E2E |
 | B5 | Each source stream preserves observation order. No total order between independent sources such as stdout and stderr is promised. | Load E2E |
 | B6 | LF and CRLF delimit records; a final partial line is emitted; empty lines are events; lines over 64 KiB are emitted in bounded chunks. | Supervisor unit tests + E2E |
 | B7 | Non-UTF-8 bodies are preserved losslessly as base64 rather than replaced or decoded lossily. | Normalizer unit test + E2E |

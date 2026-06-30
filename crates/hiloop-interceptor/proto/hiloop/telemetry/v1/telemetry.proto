@@ -48,7 +48,8 @@ message Event {
   // stamps it; the backend then derives a deterministic blake3 fallback so dedup stays correct.
   string event_id = 9;
   // The run's lineage path: the materialized, prefix-addressable position of the event's run in its
-  // tree. The store derives it from the run at ingest; the per-event payload never sets it.
+  // tree (dotted run ULIDs from the root run to this run). The interceptor stamps it on every
+  // exported event from its resolved run context.
   string lineage_path = 10;
 }
 
