@@ -368,10 +368,6 @@ fn parse_secret_binding(raw: &str) -> Result<SecretBinding, String> {
 /// Returns the disabled default when `--detect-anomalies` is absent (so a run that
 /// doesn't opt in pays nothing). `--block-anomalies` without `--detect-anomalies` is a
 /// configuration error rather than a silent no-op.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each flag is an independent anomaly threshold; grouping them into a struct would just duplicate AnomalyConfig's own surface"
-)]
 fn build_anomaly_config(
     detect: bool,
     block: bool,
