@@ -37,6 +37,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode, Uri};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -112,6 +113,8 @@ pub enum SecretConfigError {
     BrokerUrl { url: String },
     #[error("two secret bindings target the same host `{host}`")]
     DuplicateHost { host: String },
+    #[error("broker TLS configuration failed: {0}")]
+    Tls(String),
 }
 
 /// Why resolving an injected credential failed (request is failed closed).
@@ -232,13 +235,18 @@ impl SecretInjector {
     }
 }
 
-/// HTTP client for the credential broker.
+/// HTTP client for the credential broker (`ResolveSandboxSecret`).
 ///
-/// The broker is a localhost/in-cluster plaintext-HTTP service (`ResolveSandboxSecret`):
-/// the client POSTs `{"name": <binding.name>}` with `Authorization: Bearer <token>`
-/// and expects `{"value": <plaintext>}`.
+/// The client POSTs `{"name": <binding.name>}` with `Authorization: Bearer <token>`
+/// and expects `{"value": <plaintext>}`. The broker endpoint scheme is
+/// deployment-dependent — a plaintext in-cluster service (`http://…`) or the public
+/// API edge (`https://…`) — so the connector speaks HTTPS **or** HTTP. A plaintext-only
+/// connector would reject an `https://` URL before connecting (surfacing as a
+/// `client error (Connect)`), which is why TLS is wired here. Trust anchors come from
+/// the compiled-in webpki bundle: native roots are empty in the minimal sandbox base
+/// where the interceptor runs, so the webpki bundle is what anchors the public chain.
 struct BrokerClient {
-    client: Client<HttpConnector, Full<Bytes>>,
+    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     uri: Uri,
     /// Bearer token, kept in `Zeroizing` so it is wiped from memory on drop.
     token: Zeroizing<String>,
@@ -255,15 +263,44 @@ impl std::fmt::Debug for BrokerClient {
     }
 }
 
+/// Build the rustls client config the broker connector uses: the compiled-in webpki
+/// trust anchors and an explicit `aws-lc-rs` provider (matching the proxy's crypto
+/// backend, so no process-wide default provider need be installed).
+fn broker_tls_config() -> Result<rustls::ClientConfig, SecretConfigError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| SecretConfigError::Tls(error.to_string()))
+    .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
+}
+
 impl BrokerClient {
     fn new(config: &BrokerConfig) -> Result<Self, SecretConfigError> {
+        Self::with_tls_config(config, broker_tls_config()?)
+    }
+
+    /// Construct the client from a specific rustls config. The connector accepts both
+    /// `https://` and `http://` broker URLs so the same build works against the public
+    /// API edge and a plaintext in-cluster broker.
+    fn with_tls_config(
+        config: &BrokerConfig,
+        tls: rustls::ClientConfig,
+    ) -> Result<Self, SecretConfigError> {
         let uri: Uri = config
             .url
             .parse()
             .map_err(|_| SecretConfigError::BrokerUrl {
                 url: config.url.clone(),
             })?;
-        let client = Client::builder(TokioExecutor::new()).build_http();
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .build();
+        let client = Client::builder(TokioExecutor::new()).build(connector);
         Ok(Self {
             client,
             uri,
@@ -390,6 +427,102 @@ mod tests {
             }
         });
         (format!("http://{addr}/resolve"), log, handle)
+    }
+
+    /// Spin a stub broker behind TLS with a self-signed cert for `localhost`, returning the
+    /// `https://` URL and the trust anchor a client must add to reach it. This exercises the
+    /// broker client's TLS path — the plaintext connector regression (an `https://` broker URL
+    /// rejected before connecting) is caught here.
+    async fn stub_broker_tls(
+        response: &'static str,
+    ) -> (
+        String,
+        rustls::pki_types::CertificateDer<'static>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use hudsucker::rcgen::{CertificateParams, KeyPair};
+        use tokio_rustls::TlsAcceptor;
+
+        let key_pair = KeyPair::generate().expect("key");
+        let params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        let cert = params.self_signed(&key_pair).expect("self-signed");
+        let cert_der = cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        );
+
+        let server_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("server versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], key_der)
+        .expect("server cert");
+        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let service = service_fn(move |_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from_static(response.as_bytes())))
+                                .expect("response"),
+                        )
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        // `localhost` (not `127.0.0.1`) so the URL host matches the cert SAN.
+        (
+            format!("https://localhost:{port}/resolve"),
+            cert_der,
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn resolves_over_https_broker() {
+        let (url, cert_der, _task) = stub_broker_tls(r#"{"value":"sk-https-secret"}"#).await;
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).expect("trust the stub cert");
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("client versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let client = BrokerClient::with_tls_config(
+            &BrokerConfig {
+                url,
+                token: "broker-token".to_owned(),
+            },
+            tls,
+        )
+        .expect("broker client");
+
+        let value = client
+            .resolve("openai-prod")
+            .await
+            .expect("resolve over https");
+        assert_eq!(value.as_str(), "sk-https-secret");
     }
 
     fn injector(url: &str, host: &str) -> SecretInjector {
