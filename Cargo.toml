@@ -25,6 +25,17 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 # `client-legacy`/`http1` power the credential-broker HTTP client; `tokio` the proxy.
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+# The credential broker on the hosted path is the public HTTPS API edge, so the broker client needs
+# TLS: a plaintext `HttpConnector` rejects an `https://` URL before it ever connects (surfacing as a
+# `client error (Connect)`). `hyper-rustls` gives the legacy client an HTTPS-or-HTTP connector, and
+# `webpki-roots` anchors the public chain in the minimal sandbox base where native roots are empty
+# (same reason the gRPC exporter enables the webpki bundle — see the tonic note below).
+hyper-rustls = "0.27"
+rustls = "0.23"
+webpki-roots = "1"
+# Dev-only: the credential-broker regression test serves an HTTPS stub so the client's TLS path is
+# exercised end to end (a self-signed cert the test client trusts).
+tokio-rustls = "0.26"
 # IDNA/host canonicalization for egress policy matching (NFC + IDN→punycode + IP-literal
 # detection in every notation, via the WHATWG URL host parser). MSRV 1.63.
 url = "2.5"

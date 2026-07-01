@@ -27,7 +27,10 @@ hiloop-core.workspace = true
 http-body-util.workspace = true
 hudsucker.workspace = true
 hyper.workspace = true
+hyper-rustls.workspace = true
 hyper-util.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
 ipnet.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
@@ -56,6 +59,7 @@ tonic-prost-build.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+tokio-rustls.workspace = true
 
 [[bench]]
 name = "stdio_path"
