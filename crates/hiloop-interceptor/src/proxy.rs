@@ -47,6 +47,7 @@ use hiloop_core::event::{AttributeKey, Event, EventName, MediaType, PayloadRef, 
 use hiloop_core::identity::HlcClock;
 use thiserror::Error;
 
+use crate::anomaly::{AnomalyConfig, AnomalyFlag};
 use crate::blob::BlobStore;
 use crate::egress::{CanonicalHost, Destination, EgressPolicy, canonicalize_host};
 use crate::redact::RedactionPolicy;
@@ -69,6 +70,11 @@ const RESPONSE_KIND: &str = "http.response";
 const EGRESS_DENIED_KIND: &str = "egress.denied";
 const EXCHANGE_ID_ATTR: &str = "http.exchange_id";
 const TRUNCATED_ATTR: &str = "http.capture.truncated";
+/// Attribute stamped with a comma-separated list of matched anomaly rule names when a
+/// captured request trips one or more [`AnomalyConfig`] rules.
+const FLAGGED_ATTR: &str = "anomaly.flagged";
+/// Attribute stamped with `true` when a flagged request was rejected (block mode).
+const BLOCKED_ATTR: &str = "anomaly.blocked";
 const CA_CACHE_SIZE: u64 = 1_000;
 const DESCRIPTOR: NormalizerDescriptor =
     NormalizerDescriptor::new("proxy-http", env!("CARGO_PKG_VERSION"), "hiloop.event.v1");
@@ -162,11 +168,12 @@ impl ProxyServer {
     /// Run the proxy until `shutdown` resolves, capturing traffic to `signal_tx`
     /// and streaming bodies to `blob_store`.
     ///
-    /// `egress` enforces the run's egress policy (default allow-all is a no-op) and
+    /// `egress` enforces the run's egress policy (default allow-all is a no-op),
+    /// `anomaly` inspects original request bodies (default disabled is a no-op), and
     /// `injector`, when set, injects bound credentials into matching requests.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the proxy's capture, redaction, egress, and injection seams are all configured per run; a config struct is deferred while there is a single in-tree caller (the supervisor)"
+        reason = "the proxy's capture, redaction, egress, anomaly, and injection seams are all configured per run; a config struct is deferred while there is a single in-tree caller (the supervisor)"
     )]
     pub async fn serve<F>(
         self,
@@ -176,6 +183,7 @@ impl ProxyServer {
         max_capture_bytes: Option<u64>,
         redaction: RedactionPolicy,
         egress: Arc<EgressPolicy>,
+        anomaly: Arc<AnomalyConfig>,
         injector: Option<SecretInjector>,
         shutdown: F,
     ) -> Result<(), ProxyError>
@@ -189,6 +197,7 @@ impl ProxyServer {
             max_capture_bytes,
             redaction,
             egress,
+            anomaly,
             injector,
         );
         let proxy = Proxy::builder()
@@ -241,6 +250,9 @@ struct CaptureHandler {
     /// Egress policy enforced at CONNECT and at the decrypted request. Allow-all by
     /// default (a no-op).
     egress: Arc<EgressPolicy>,
+    /// Request-body anomaly detection run over the original request body (not the
+    /// truncated/redacted captured copy). Disabled by default (a no-op).
+    anomaly: Arc<AnomalyConfig>,
     /// Credential injector, when the run binds secrets to hosts.
     injector: Option<SecretInjector>,
     /// The canonicalized host from this clone's CONNECT (the SNI host), stashed so the
@@ -256,6 +268,10 @@ struct CaptureHandler {
 }
 
 impl CaptureHandler {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the handler's capture, redaction, egress, anomaly, and injection seams are each configured per run; a config struct is deferred while the only caller is the supervisor via ProxyServer::serve"
+    )]
     fn new(
         signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
         clock: Arc<HlcClock>,
@@ -263,6 +279,7 @@ impl CaptureHandler {
         max_capture_bytes: Option<u64>,
         redaction: RedactionPolicy,
         egress: Arc<EgressPolicy>,
+        anomaly: Arc<AnomalyConfig>,
         injector: Option<SecretInjector>,
     ) -> Self {
         Self {
@@ -272,6 +289,7 @@ impl CaptureHandler {
             max_capture_bytes,
             redaction,
             egress,
+            anomaly,
             injector,
             connect_host: None,
             injected_secret: None,
@@ -323,7 +341,7 @@ impl CaptureHandler {
         let Some(destination) = destination else {
             if self.egress.is_allow_all() {
                 // No policy to enforce; capture and forward as before.
-                return self.capture_request(request).await.into();
+                return self.capture_request(request).await;
             }
             self.emit_egress_unparseable("request");
             return forbidden().into();
@@ -363,14 +381,21 @@ impl CaptureHandler {
                     return bad_gateway().into();
                 }
             }
-            return self.capture_request(request).await.into();
+            return self.capture_request(request).await;
         }
 
-        self.capture_request(request).await.into()
+        self.capture_request(request).await
     }
 
     /// Buffer, capture, and forward a (post-egress, post-injection) request.
-    async fn capture_request(&mut self, request: Request<Body>) -> Request<Body> {
+    ///
+    /// Anomaly detection runs over the original request body (so a capture cap cannot
+    /// truncate an upload out of detection); matches are flagged onto the request signal,
+    /// while only the truncated+redacted copy is captured/offloaded. Under
+    /// [`AnomalyConfig::blocks_on_match`] a match short-circuits with a `403` and the
+    /// request is never forwarded (the signal still records the flagged, blocked
+    /// exchange).
+    async fn capture_request(&mut self, request: Request<Body>) -> RequestOrResponse {
         let exchange_id = next_exchange_id();
         self.exchange_id = Some(exchange_id.clone());
 
@@ -391,6 +416,18 @@ impl CaptureHandler {
         let captured = self.redact_capture(captured);
 
         let content_type = header_str(&parts.headers, &CONTENT_TYPE);
+
+        // Inspect the ORIGINAL body (full pre-truncation length, unredacted bytes) for
+        // exfiltration-shaped anomalies, so a capture cap below a threshold cannot
+        // truncate a large upload out of detection. Inspection is read-only; only the
+        // truncated+redacted `captured` copy is ever emitted or offloaded. The flags
+        // carry only rule names and sizes (never body content), safe to stamp onto
+        // telemetry.
+        let flags = self
+            .anomaly
+            .inspect(parts.method.as_str(), content_type.as_deref(), &bytes);
+        let blocked = !flags.is_empty() && self.anomaly.blocks_on_match();
+
         let mut attributes = vec![
             (EXCHANGE_ID_ATTR, exchange_id),
             ("http.method", parts.method.as_str().to_owned()),
@@ -401,6 +438,12 @@ impl CaptureHandler {
         }
         if let Some(content_type) = &content_type {
             attributes.push(("http.request.content_type", content_type.clone()));
+        }
+        if !flags.is_empty() {
+            attributes.push((FLAGGED_ATTR, join_flag_names(&flags)));
+        }
+        if blocked {
+            attributes.push((BLOCKED_ATTR, "true".to_owned()));
         }
 
         // Offload the buffered body to the blob store; on any failure fall back to
@@ -426,7 +469,10 @@ impl CaptureHandler {
         );
         let _ = self.signal_tx.send(Ok(raw)).await;
 
-        Request::from_parts(parts, Body::from(bytes))
+        if blocked {
+            return forbidden().into();
+        }
+        Request::from_parts(parts, Body::from(bytes)).into()
     }
 
     /// Evaluate `destination` against the egress policy at `layer`; on a deny, emit the
@@ -824,6 +870,16 @@ async fn collect_body(body: Body) -> (Bytes, bool) {
     }
 }
 
+/// Render matched anomaly flags as a stable, comma-separated list of rule names for the
+/// `anomaly.flagged` attribute.
+fn join_flag_names(flags: &[AnomalyFlag]) -> String {
+    flags
+        .iter()
+        .map(|flag| flag.rule.name())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn next_exchange_id() -> String {
     let id = EXCHANGE_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("xchg-{id:016x}")
@@ -1026,6 +1082,26 @@ mod tests {
         mpsc::Receiver<Result<RawSignal, SourceError>>,
         Arc<MemoryBlobStore>,
     ) {
+        handler_with_anomaly(
+            max_capture_bytes,
+            redaction,
+            egress,
+            Arc::new(AnomalyConfig::default()),
+            injector,
+        )
+    }
+
+    fn handler_with_anomaly(
+        max_capture_bytes: Option<u64>,
+        redaction: RedactionPolicy,
+        egress: Arc<EgressPolicy>,
+        anomaly: Arc<AnomalyConfig>,
+        injector: Option<SecretInjector>,
+    ) -> (
+        CaptureHandler,
+        mpsc::Receiver<Result<RawSignal, SourceError>>,
+        Arc<MemoryBlobStore>,
+    ) {
         let (tx, rx) = mpsc::channel(8);
         let store = Arc::new(MemoryBlobStore::default());
         let handler = CaptureHandler::new(
@@ -1035,6 +1111,7 @@ mod tests {
             max_capture_bytes,
             redaction,
             egress,
+            anomaly,
             injector,
         );
         (handler, rx, store)
@@ -1450,6 +1527,170 @@ mod tests {
                 .get("http.request.body_size")
                 .map(String::as_str),
             Some("3")
+        );
+    }
+
+    #[tokio::test]
+    async fn anomalous_request_is_flagged_but_forwarded_in_audit_mode() {
+        let anomaly = Arc::new(
+            AnomalyConfig::enabled()
+                .with_suspicious_content_types(["application/octet-stream".to_owned()]),
+        );
+        let (mut handler, mut rx, _store) = handler_with_anomaly(
+            None,
+            RedactionPolicy::default(),
+            Arc::new(EgressPolicy::default()),
+            anomaly,
+            None,
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/upload")
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(Bytes::from_static(b"payload")))
+            .expect("request");
+
+        // Audit mode: the request is still forwarded with its full body.
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        let chunks = drain_body(forwarded.into_body()).await;
+        assert_eq!(chunks.concat(), b"payload");
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get(FLAGGED_ATTR).map(String::as_str),
+            Some("suspicious_content_type")
+        );
+        assert!(
+            !signal.attributes.contains_key(BLOCKED_ATTR),
+            "audit mode must not mark the exchange blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn anomalous_request_is_blocked_in_block_mode() {
+        let anomaly = Arc::new(
+            AnomalyConfig::enabled()
+                .with_suspicious_content_types(["application/octet-stream".to_owned()])
+                .with_block_on_match(true),
+        );
+        let (mut handler, mut rx, _store) = handler_with_anomaly(
+            None,
+            RedactionPolicy::default(),
+            Arc::new(EgressPolicy::default()),
+            anomaly,
+            None,
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/upload")
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(Bytes::from_static(b"payload")))
+            .expect("request");
+
+        // Block mode: the request is rejected with a 403 and never forwarded.
+        let response = expect_response(handler.on_request(request).await);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The flagged, blocked exchange is still recorded.
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get(FLAGGED_ATTR).map(String::as_str),
+            Some("suspicious_content_type")
+        );
+        assert_eq!(
+            signal.attributes.get(BLOCKED_ATTR).map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_request_is_not_flagged_when_anomaly_enabled() {
+        let anomaly = Arc::new(AnomalyConfig::enabled().with_block_on_match(true));
+        let (mut handler, mut rx, _store) = handler_with_anomaly(
+            None,
+            RedactionPolicy::default(),
+            Arc::new(EgressPolicy::default()),
+            anomaly,
+            None,
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/v1/chat")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(Bytes::from_static(b"{\"prompt\":\"hi\"}")))
+            .expect("request");
+
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        drain_body(forwarded.into_body()).await;
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert!(
+            !signal.attributes.contains_key(FLAGGED_ATTR),
+            "an ordinary JSON request must not be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn anomaly_inspects_original_body_not_the_truncated_capture() {
+        // A capture cap set BELOW both the upload threshold and the base64 floor must not
+        // truncate a large upload out of detection: inspection runs on the original body.
+        let upload_threshold: u64 = 4096;
+        let base64_floor: u64 = 4096;
+        let anomaly = Arc::new(
+            AnomalyConfig::enabled()
+                .with_max_upload_bytes(upload_threshold)
+                .with_min_base64_bytes(base64_floor),
+        );
+        // Cap capture at 64 bytes — far below both thresholds.
+        let (mut handler, mut rx, store) = handler_with_anomaly(
+            Some(64),
+            RedactionPolicy::default(),
+            Arc::new(EgressPolicy::default()),
+            anomaly,
+            None,
+        );
+        // A large, all-base64-alphabet body: without inspecting the original it would be
+        // truncated to 64 bytes and evade both the upload and base64 rules.
+        let original_len = 8192usize;
+        let payload = Bytes::from(vec![b'A'; original_len]);
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/upload")
+            .body(Body::from(payload.clone()))
+            .expect("request");
+
+        // The full body is still forwarded upstream untouched.
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        let chunks = drain_body(forwarded.into_body()).await;
+        assert_eq!(chunks.concat().len(), original_len);
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        let flagged = signal
+            .attributes
+            .get(FLAGGED_ATTR)
+            .map(String::as_str)
+            .expect("a large upload must still be flagged despite the tiny capture cap");
+        assert!(
+            flagged.contains("upload_shaped_request"),
+            "upload rule must evaluate the original length, got: {flagged}"
+        );
+        assert!(
+            flagged.contains("large_base64_blob"),
+            "base64 floor must evaluate the original body, got: {flagged}"
+        );
+
+        // The captured/offloaded copy stays truncated to the cap — inspection is
+        // read-only and never widens what reaches telemetry.
+        let stored = store.blobs();
+        assert_eq!(
+            stored.len(),
+            1,
+            "exactly one request body should be offloaded"
+        );
+        assert_eq!(
+            stored[0].1.len(),
+            64,
+            "the captured copy stays truncated to max_capture_bytes"
         );
     }
 

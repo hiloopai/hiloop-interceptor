@@ -1,5 +1,6 @@
 //! Wrapper extension contracts for `hiloop-interceptor`.
 
+pub mod anomaly;
 pub mod blob;
 pub mod egress;
 pub mod exporters;
@@ -17,6 +18,7 @@ pub mod secret;
 pub mod stdio;
 pub mod supervisor;
 
+pub use anomaly::AnomalyConfig;
 pub use egress::{EgressMode, EgressPolicy};
 pub use proxy::DEFAULT_MAX_CAPTURE_BYTES;
 pub use redact::RedactionPolicy;
