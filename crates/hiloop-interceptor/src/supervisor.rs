@@ -5,6 +5,7 @@
 //! A downstream CLI can embed this crate to provide a `run -- <agent>` command.
 
 use crate::{
+    anomaly::AnomalyConfig,
     blob::DirBlobStore,
     egress::EgressPolicy,
     exporters::{FanOutExporter, JsonlExporter},
@@ -92,6 +93,7 @@ pub struct RunOptions {
     attributes: Attributes,
     redaction: RedactionPolicy,
     egress: EgressPolicy,
+    anomaly: AnomalyConfig,
     secret_bindings: Vec<SecretBinding>,
     secret_broker: Option<BrokerConfig>,
     verbose_diagnostics: bool,
@@ -142,6 +144,7 @@ impl RunOptions {
             attributes: Attributes::new(),
             redaction: RedactionPolicy::default(),
             egress: EgressPolicy::default(),
+            anomaly: AnomalyConfig::default(),
             secret_bindings: Vec::new(),
             secret_broker: None,
             verbose_diagnostics: false,
@@ -169,6 +172,21 @@ impl RunOptions {
     /// The configured egress policy (default allow-all).
     pub fn egress_policy(&self) -> &EgressPolicy {
         &self.egress
+    }
+
+    /// Set the request-body anomaly-detection policy the proxy applies. The default
+    /// ([`AnomalyConfig::default`]) is disabled (a no-op). Detection runs only on
+    /// traffic that flows through the proxy (`proxy` must be enabled) and is a
+    /// cooperative detection layer — the un-bypassable boundary is host-side.
+    #[must_use]
+    pub fn with_anomaly_detection(mut self, anomaly: AnomalyConfig) -> Self {
+        self.anomaly = anomaly;
+        self
+    }
+
+    /// The configured anomaly-detection policy (default disabled).
+    pub fn anomaly_config(&self) -> &AnomalyConfig {
+        &self.anomaly
     }
 
     /// Bind named secrets to destination hosts and configure the credential broker the
@@ -370,6 +388,12 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
     if !options.egress.is_allow_all() && !options.proxy {
         bail!(
             "an egress policy requires --proxy: egress is enforced on intercepted HTTP(S) traffic"
+        );
+    }
+
+    if options.anomaly.is_enabled() && !options.proxy {
+        bail!(
+            "anomaly detection requires --proxy: request bodies are inspected on intercepted HTTP(S) traffic"
         );
     }
 
@@ -583,6 +607,7 @@ where
         None => (None, None),
     };
     let egress = Arc::new(options.egress.clone());
+    let anomaly = Arc::new(options.anomaly.clone());
     let injector = match (&options.secret_broker, options.secret_bindings.is_empty()) {
         (Some(broker), false) => Some(
             SecretInjector::new(options.secret_bindings.clone(), broker)
@@ -600,6 +625,7 @@ where
                 options.max_capture_bytes,
                 options.redaction,
                 Arc::clone(&egress),
+                Arc::clone(&anomaly),
                 injector,
                 async move {
                     let _ = shutdown_rx.await;
@@ -1733,6 +1759,20 @@ mod tests {
         let options = base_options(vec!["echo".to_owned(), "hi".to_owned()]).with_egress(egress);
         let error = run(&options).await.expect_err("egress needs proxy");
         assert!(error.to_string().contains("egress policy requires --proxy"));
+    }
+
+    #[tokio::test]
+    async fn anomaly_detection_without_proxy_is_rejected() {
+        let options = base_options(vec!["echo".to_owned(), "hi".to_owned()])
+            .with_anomaly_detection(AnomalyConfig::enabled());
+        let error = run(&options)
+            .await
+            .expect_err("anomaly detection needs proxy");
+        assert!(
+            error
+                .to_string()
+                .contains("anomaly detection requires --proxy")
+        );
     }
 
     #[tokio::test]

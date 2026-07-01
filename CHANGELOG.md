@@ -18,6 +18,16 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   `Host` that disagrees with the CONNECT's SNI host — short-circuits with `403` and emits a structured
   `egress.denied` event. This is a **cooperative** control over proxied traffic; the un-bypassable
   egress boundary is host-side.
+- Request-body anomaly detection over intercepted traffic (`--detect-anomalies`, optional
+  `--block-anomalies`, and the `RunOptions::with_anomaly_detection` builder). Three config-driven
+  heuristics run on the redacted captured request body: a large base64-dominated blob
+  (`--anomaly-min-base64-bytes` size floor + `--anomaly-base64-ratio` character ratio), a suspicious
+  `Content-Type` (`--anomaly-suspicious-content-type`, defaulting to binary/archive types), and an
+  upload-shaped write (`--anomaly-max-upload-bytes` on `POST`/`PUT`/`PATCH`). Each match stamps an
+  `anomaly.flagged` attribute (rule names only, never body content) on the exchange; block mode
+  additionally short-circuits the request with `403` and stamps `anomaly.blocked`. This is a
+  **cooperative** defense-in-depth detection layer over proxied traffic; the un-bypassable boundary is
+  host-side. Off by default.
 - Credential injection: bind a named secret to a destination host and request header
   (`--secret-binding`, broker via `--secret-broker-url` + `HILOOP_SECRET_BROKER_TOKEN`, and the
   `RunOptions::with_secret_bindings` builder). On a request to the bound host the proxy resolves the

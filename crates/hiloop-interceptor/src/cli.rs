@@ -3,6 +3,9 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use hiloop_core::identity::{LineagePath, RunContext, RunId};
+use hiloop_interceptor::anomaly::{
+    AnomalyConfig, DEFAULT_BASE64_RATIO, DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_MIN_BASE64_BYTES,
+};
 use hiloop_interceptor::egress::{EgressMode, EgressPolicy};
 use hiloop_interceptor::pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL_MS};
 use hiloop_interceptor::proxy::DEFAULT_MAX_CAPTURE_BYTES;
@@ -124,6 +127,37 @@ struct RunArgs {
     #[arg(long = "egress-cidr")]
     egress_cidr: Vec<String>,
 
+    /// Inspect captured request bodies for exfiltration-shaped anomalies (large
+    /// base64 blobs, suspicious content-types, upload-shaped writes) and flag matches
+    /// on the telemetry exchange. Cooperative detection over intercepted traffic only;
+    /// requires `--proxy`. Off by default.
+    #[arg(long = "detect-anomalies")]
+    detect_anomalies: bool,
+
+    /// Reject a request when an anomaly rule matches, instead of only flagging it.
+    /// Requires `--detect-anomalies`. Audit-only (flag, don't block) by default.
+    #[arg(long = "block-anomalies")]
+    block_anomalies: bool,
+
+    /// Body size (bytes) at or above which a base64-dominated body is flagged.
+    #[arg(long = "anomaly-min-base64-bytes", default_value_t = DEFAULT_MIN_BASE64_BYTES)]
+    anomaly_min_base64_bytes: u64,
+
+    /// Fraction (0.0–1.0) of a body's bytes that must be base64-alphabet characters for
+    /// it to count as a base64 blob.
+    #[arg(long = "anomaly-base64-ratio", default_value_t = DEFAULT_BASE64_RATIO)]
+    anomaly_base64_ratio: f64,
+
+    /// Write-request body size (bytes) at or above which a request is flagged as
+    /// upload-shaped.
+    #[arg(long = "anomaly-max-upload-bytes", default_value_t = DEFAULT_MAX_UPLOAD_BYTES)]
+    anomaly_max_upload_bytes: u64,
+
+    /// Content-Type value treated as suspicious (repeatable). Overrides the built-in
+    /// list when any are given.
+    #[arg(long = "anomaly-suspicious-content-type")]
+    anomaly_suspicious_content_type: Vec<String>,
+
     /// Bind a named secret to a destination host and header (repeatable), as
     /// `name=<name>,placeholder=<token>,host=<host>,header=<header>[,scheme=<scheme>]`.
     /// On a request to the bound host the proxy resolves the secret from the broker and
@@ -226,6 +260,15 @@ impl RunArgs {
             self.egress_cidr,
         )?;
 
+        let anomaly = build_anomaly_config(
+            self.detect_anomalies,
+            self.block_anomalies,
+            self.anomaly_min_base64_bytes,
+            self.anomaly_base64_ratio,
+            self.anomaly_max_upload_bytes,
+            self.anomaly_suspicious_content_type,
+        )?;
+
         let mut options = RunOptions::new(
             context,
             self.command,
@@ -241,6 +284,7 @@ impl RunArgs {
         .with_export_flush_interval(export_flush_interval)
         .with_redaction(redaction)
         .with_egress(egress)
+        .with_anomaly_detection(anomaly)
         .with_verbose_diagnostics(self.verbose);
 
         if !self.secret_binding.is_empty() {
@@ -317,6 +361,40 @@ fn parse_secret_binding(raw: &str) -> Result<SecretBinding, String> {
         header: header.ok_or("secret-binding is missing `header`")?,
         scheme: scheme.unwrap_or_default(),
     })
+}
+
+/// Build the anomaly-detection policy from the CLI flags.
+///
+/// Returns the disabled default when `--detect-anomalies` is absent (so a run that
+/// doesn't opt in pays nothing). `--block-anomalies` without `--detect-anomalies` is a
+/// configuration error rather than a silent no-op.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each flag is an independent anomaly threshold; grouping them into a struct would just duplicate AnomalyConfig's own surface"
+)]
+fn build_anomaly_config(
+    detect: bool,
+    block: bool,
+    min_base64_bytes: u64,
+    base64_ratio: f64,
+    max_upload_bytes: u64,
+    suspicious_content_types: Vec<String>,
+) -> Result<AnomalyConfig> {
+    if !detect {
+        if block {
+            bail!("--block-anomalies requires --detect-anomalies");
+        }
+        return Ok(AnomalyConfig::default());
+    }
+    let mut config = AnomalyConfig::enabled()
+        .with_block_on_match(block)
+        .with_min_base64_bytes(min_base64_bytes)
+        .with_base64_ratio(base64_ratio)
+        .with_max_upload_bytes(max_upload_bytes);
+    if !suspicious_content_types.is_empty() {
+        config = config.with_suspicious_content_types(suspicious_content_types);
+    }
+    Ok(config)
 }
 
 /// Resolve the run context from the optional `--run-id` and `--lineage-path` flags.
@@ -470,6 +548,88 @@ mod tests {
         let options = args.into_run_options().expect("options");
         assert!(!options.egress_policy().is_allow_all());
         assert_eq!(options.egress_policy().mode(), EgressMode::Deny);
+    }
+
+    #[test]
+    fn anomaly_disabled_by_default() {
+        let config = build_anomaly_config(
+            false,
+            false,
+            DEFAULT_MIN_BASE64_BYTES,
+            DEFAULT_BASE64_RATIO,
+            DEFAULT_MAX_UPLOAD_BYTES,
+            Vec::new(),
+        )
+        .expect("config");
+        assert!(!config.is_enabled());
+    }
+
+    #[test]
+    fn detect_flag_enables_audit_mode() {
+        let config = build_anomaly_config(
+            true,
+            false,
+            DEFAULT_MIN_BASE64_BYTES,
+            DEFAULT_BASE64_RATIO,
+            DEFAULT_MAX_UPLOAD_BYTES,
+            Vec::new(),
+        )
+        .expect("config");
+        assert!(config.is_enabled());
+        assert!(!config.blocks_on_match(), "audit-only by default");
+    }
+
+    #[test]
+    fn block_flag_requires_detect_flag() {
+        let err = build_anomaly_config(
+            false,
+            true,
+            DEFAULT_MIN_BASE64_BYTES,
+            DEFAULT_BASE64_RATIO,
+            DEFAULT_MAX_UPLOAD_BYTES,
+            Vec::new(),
+        )
+        .expect_err("block without detect must error");
+        assert!(err.to_string().contains("requires --detect-anomalies"));
+    }
+
+    #[test]
+    fn detect_and_block_flags_enable_block_mode() {
+        let config = build_anomaly_config(
+            true,
+            true,
+            DEFAULT_MIN_BASE64_BYTES,
+            DEFAULT_BASE64_RATIO,
+            DEFAULT_MAX_UPLOAD_BYTES,
+            Vec::new(),
+        )
+        .expect("config");
+        assert!(config.blocks_on_match());
+    }
+
+    #[test]
+    fn anomaly_flags_parse_through_run_args() {
+        let cli = Cli::try_parse_from([
+            "hiloop-interceptor",
+            "run",
+            "--proxy",
+            "--events-jsonl",
+            "/tmp/does-not-matter.jsonl",
+            "--blob-dir",
+            "/tmp/blob",
+            "--detect-anomalies",
+            "--block-anomalies",
+            "--",
+            "echo",
+            "hi",
+        ])
+        .expect("parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected run subcommand");
+        };
+        let options = args.into_run_options().expect("options");
+        assert!(options.anomaly_config().is_enabled());
+        assert!(options.anomaly_config().blocks_on_match());
     }
 
     #[test]
