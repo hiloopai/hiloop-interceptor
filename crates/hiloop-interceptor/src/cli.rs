@@ -145,7 +145,11 @@ struct RunArgs {
 
     /// Fraction (0.0–1.0) of a body's bytes that must be base64-alphabet characters for
     /// it to count as a base64 blob.
-    #[arg(long = "anomaly-base64-ratio", default_value_t = DEFAULT_BASE64_RATIO)]
+    #[arg(
+        long = "anomaly-base64-ratio",
+        default_value_t = DEFAULT_BASE64_RATIO,
+        value_parser = parse_base64_ratio,
+    )]
     anomaly_base64_ratio: f64,
 
     /// Write-request body size (bytes) at or above which a request is flagged as
@@ -361,6 +365,25 @@ fn parse_secret_binding(raw: &str) -> Result<SecretBinding, String> {
         header: header.ok_or("secret-binding is missing `header`")?,
         scheme: scheme.unwrap_or_default(),
     })
+}
+
+/// Parse and validate `--anomaly-base64-ratio`: a finite fraction within `0.0..=1.0`.
+///
+/// Rejecting non-finite (`NaN`, `inf`) and out-of-range values here — rather than
+/// silently clamping — keeps the threshold meaningful. `NaN` in particular survives a
+/// clamp and drives the base64 threshold to zero, which would flag (and, under
+/// `--block-anomalies`, block) every body at or above the size floor.
+fn parse_base64_ratio(raw: &str) -> Result<f64, String> {
+    let ratio: f64 = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a number"))?;
+    if !ratio.is_finite() {
+        return Err(format!("must be a finite number, got `{raw}`"));
+    }
+    if !(0.0..=1.0).contains(&ratio) {
+        return Err(format!("must be within 0.0..=1.0, got `{raw}`"));
+    }
+    Ok(ratio)
 }
 
 /// Build the anomaly-detection policy from the CLI flags.
@@ -626,6 +649,48 @@ mod tests {
         let options = args.into_run_options().expect("options");
         assert!(options.anomaly_config().is_enabled());
         assert!(options.anomaly_config().blocks_on_match());
+    }
+
+    #[test]
+    fn base64_ratio_accepts_valid_fractions() {
+        assert_eq!(parse_base64_ratio("0.0"), Ok(0.0));
+        assert_eq!(parse_base64_ratio("0.95"), Ok(0.95));
+        assert_eq!(parse_base64_ratio("1.0"), Ok(1.0));
+        // The default must round-trip through the parser (clap re-parses `default_value_t`).
+        assert_eq!(
+            parse_base64_ratio(&DEFAULT_BASE64_RATIO.to_string()),
+            Ok(DEFAULT_BASE64_RATIO)
+        );
+    }
+
+    #[test]
+    fn base64_ratio_rejects_non_finite_and_out_of_range() {
+        assert!(parse_base64_ratio("NaN").is_err());
+        assert!(parse_base64_ratio("nan").is_err());
+        assert!(parse_base64_ratio("inf").is_err());
+        assert!(parse_base64_ratio("-1.0").is_err());
+        assert!(parse_base64_ratio("1.5").is_err());
+        assert!(parse_base64_ratio("not-a-number").is_err());
+    }
+
+    #[test]
+    fn base64_ratio_flag_rejects_nan_through_run_args() {
+        let result = Cli::try_parse_from([
+            "hiloop-interceptor",
+            "run",
+            "--proxy",
+            "--events-jsonl",
+            "/tmp/does-not-matter.jsonl",
+            "--blob-dir",
+            "/tmp/blob",
+            "--detect-anomalies",
+            "--anomaly-base64-ratio",
+            "NaN",
+            "--",
+            "echo",
+            "hi",
+        ]);
+        assert!(result.is_err(), "NaN ratio must be rejected at parse time");
     }
 
     #[test]

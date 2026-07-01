@@ -169,7 +169,7 @@ impl ProxyServer {
     /// and streaming bodies to `blob_store`.
     ///
     /// `egress` enforces the run's egress policy (default allow-all is a no-op),
-    /// `anomaly` inspects captured request bodies (default disabled is a no-op), and
+    /// `anomaly` inspects original request bodies (default disabled is a no-op), and
     /// `injector`, when set, injects bound credentials into matching requests.
     #[expect(
         clippy::too_many_arguments,
@@ -250,8 +250,8 @@ struct CaptureHandler {
     /// Egress policy enforced at CONNECT and at the decrypted request. Allow-all by
     /// default (a no-op).
     egress: Arc<EgressPolicy>,
-    /// Request-body anomaly detection run over the redacted captured copy. Disabled by
-    /// default (a no-op).
+    /// Request-body anomaly detection run over the original request body (not the
+    /// truncated/redacted captured copy). Disabled by default (a no-op).
     anomaly: Arc<AnomalyConfig>,
     /// Credential injector, when the run binds secrets to hosts.
     injector: Option<SecretInjector>,
@@ -389,10 +389,12 @@ impl CaptureHandler {
 
     /// Buffer, capture, and forward a (post-egress, post-injection) request.
     ///
-    /// Anomaly detection runs over the redacted captured copy; matches are flagged onto
-    /// the request signal. Under [`AnomalyConfig::blocks_on_match`] a match short-circuits
-    /// with a `403` and the request is never forwarded (the signal still records the
-    /// flagged, blocked exchange).
+    /// Anomaly detection runs over the original request body (so a capture cap cannot
+    /// truncate an upload out of detection); matches are flagged onto the request signal,
+    /// while only the truncated+redacted copy is captured/offloaded. Under
+    /// [`AnomalyConfig::blocks_on_match`] a match short-circuits with a `403` and the
+    /// request is never forwarded (the signal still records the flagged, blocked
+    /// exchange).
     async fn capture_request(&mut self, request: Request<Body>) -> RequestOrResponse {
         let exchange_id = next_exchange_id();
         self.exchange_id = Some(exchange_id.clone());
@@ -415,12 +417,15 @@ impl CaptureHandler {
 
         let content_type = header_str(&parts.headers, &CONTENT_TYPE);
 
-        // Inspect the redacted captured copy for exfiltration-shaped anomalies. The
-        // flags carry only rule names and sizes (never body content), so they are safe
-        // to stamp onto telemetry.
+        // Inspect the ORIGINAL body (full pre-truncation length, unredacted bytes) for
+        // exfiltration-shaped anomalies, so a capture cap below a threshold cannot
+        // truncate a large upload out of detection. Inspection is read-only; only the
+        // truncated+redacted `captured` copy is ever emitted or offloaded. The flags
+        // carry only rule names and sizes (never body content), safe to stamp onto
+        // telemetry.
         let flags = self
             .anomaly
-            .inspect(parts.method.as_str(), content_type.as_deref(), &captured);
+            .inspect(parts.method.as_str(), content_type.as_deref(), &bytes);
         let blocked = !flags.is_empty() && self.anomaly.blocks_on_match();
 
         let mut attributes = vec![
@@ -1622,6 +1627,70 @@ mod tests {
         assert!(
             !signal.attributes.contains_key(FLAGGED_ATTR),
             "an ordinary JSON request must not be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn anomaly_inspects_original_body_not_the_truncated_capture() {
+        // A capture cap set BELOW both the upload threshold and the base64 floor must not
+        // truncate a large upload out of detection: inspection runs on the original body.
+        let upload_threshold: u64 = 4096;
+        let base64_floor: u64 = 4096;
+        let anomaly = Arc::new(
+            AnomalyConfig::enabled()
+                .with_max_upload_bytes(upload_threshold)
+                .with_min_base64_bytes(base64_floor),
+        );
+        // Cap capture at 64 bytes — far below both thresholds.
+        let (mut handler, mut rx, store) = handler_with_anomaly(
+            Some(64),
+            RedactionPolicy::default(),
+            Arc::new(EgressPolicy::default()),
+            anomaly,
+            None,
+        );
+        // A large, all-base64-alphabet body: without inspecting the original it would be
+        // truncated to 64 bytes and evade both the upload and base64 rules.
+        let original_len = 8192usize;
+        let payload = Bytes::from(vec![b'A'; original_len]);
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/upload")
+            .body(Body::from(payload.clone()))
+            .expect("request");
+
+        // The full body is still forwarded upstream untouched.
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        let chunks = drain_body(forwarded.into_body()).await;
+        assert_eq!(chunks.concat().len(), original_len);
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        let flagged = signal
+            .attributes
+            .get(FLAGGED_ATTR)
+            .map(String::as_str)
+            .expect("a large upload must still be flagged despite the tiny capture cap");
+        assert!(
+            flagged.contains("upload_shaped_request"),
+            "upload rule must evaluate the original length, got: {flagged}"
+        );
+        assert!(
+            flagged.contains("large_base64_blob"),
+            "base64 floor must evaluate the original body, got: {flagged}"
+        );
+
+        // The captured/offloaded copy stays truncated to the cap — inspection is
+        // read-only and never widens what reaches telemetry.
+        let stored = store.blobs();
+        assert_eq!(
+            stored.len(),
+            1,
+            "exactly one request body should be offloaded"
+        );
+        assert_eq!(
+            stored[0].1.len(),
+            64,
+            "the captured copy stays truncated to max_capture_bytes"
         );
     }
 

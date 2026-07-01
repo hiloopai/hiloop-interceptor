@@ -2,10 +2,12 @@
 //!
 //! The proxy already terminates TLS and sees plaintext request bodies, so this is
 //! the layer that inspects those bodies for exfiltration-shaped patterns before they
-//! leave the guest. It runs on the *redacted captured copy* (see [`crate::redact`]),
-//! so a matched anomaly never carries the secret it fired on into telemetry; each
-//! match is reported as low-cardinality metadata (a rule name and a size), never body
-//! content.
+//! leave the guest. Rules evaluate the *original* request body — its true length and
+//! unredacted bytes — so a capture cap set below a threshold cannot truncate a large
+//! upload out of detection. Inspection is read-only: it never emits the body, so a
+//! matched anomaly never carries the secret it fired on into telemetry; each match is
+//! reported as low-cardinality metadata (a rule name and a size), never body content.
+//! The truncated+redacted copy is what continues on to capture/telemetry.
 //!
 //! # Threat model — cooperative detection, not a boundary
 //!
@@ -96,7 +98,9 @@ impl AnomalyRule {
 pub struct AnomalyFlag {
     /// The rule that matched.
     pub rule: AnomalyRule,
-    /// The captured body size that drove the match, in bytes.
+    /// The original (pre-truncation) body size that drove the match, in bytes. This is
+    /// the true request-body length, not the truncated captured copy — a size-based rule
+    /// evaluates the real upload, so a capture cap set below a threshold cannot hide it.
     pub observed_bytes: u64,
 }
 
@@ -197,10 +201,16 @@ impl AnomalyConfig {
         self
     }
 
-    /// Inspect one captured request body against every rule, returning each match.
+    /// Inspect one request against every rule, returning each match.
     ///
     /// `method` is the request method (upper- or lower-case), `content_type` the raw
-    /// `Content-Type` header value if present, and `body` the redacted captured copy.
+    /// `Content-Type` header value if present, and `body` the **original** request body —
+    /// its full pre-truncation length and unredacted bytes. Rules deliberately evaluate
+    /// the original body, never the truncated/redacted captured copy, so a capture cap
+    /// (`max_capture_bytes`) set below a threshold cannot truncate a large upload out of
+    /// detection. Inspection is read-only: it never emits or logs body content — only the
+    /// low-cardinality [`AnomalyFlag`]s (a rule name and a size) reach telemetry.
+    ///
     /// Returns an empty vec when the policy is disabled or nothing matches; the common
     /// clean-body case allocates nothing.
     pub fn inspect(
