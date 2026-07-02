@@ -124,13 +124,7 @@ impl Exporter for GrpcIngestExporter {
                 project_id: self.project_id.clone(),
             }))
             .await
-            .map_err(|status| {
-                ExportError::with_source(
-                    "grpc",
-                    format!("ingest rejected: {}", status.message()),
-                    status,
-                )
-            })?
+            .map_err(|status| ExportError::other("grpc", ingest_rejection_message(&status)))?
             .into_inner()
             .accepted;
         if accepted != expected {
@@ -141,6 +135,52 @@ impl Exporter for GrpcIngestExporter {
         }
         Ok(())
     }
+}
+
+/// Render a rejected ingest RPC as one human-readable line.
+///
+/// `tonic::Status` can carry an empty gRPC message and noisy sources — its own `Display` embeds
+/// the `Debug` of its transport source (`tonic::transport::Error(Transport, hyper::Error(..))`),
+/// which would leak internals into a wrapping CLI's stderr. Fold the readable pieces into one
+/// compact diagnostic instead: the status message (or the code description when the message is
+/// empty) followed by each source's `Display`. Hops in the chain routinely restate each other
+/// (tonic stamps the root cause into the status message), so a hop that appears verbatim inside
+/// another hop is dropped rather than repeated. The `Status` is deliberately not kept as a
+/// structured `source` — any wrapper that renders an error chain (`anyhow`'s `{err:#}`) would
+/// hit `Status`'s leaky `Display` again.
+fn ingest_rejection_message(status: &Status) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |part: &str| {
+        let part = part.trim();
+        if !part.is_empty() {
+            parts.push(part.to_owned());
+        }
+    };
+    if status.message().is_empty() {
+        push(status.code().description());
+    } else {
+        push(status.message());
+    }
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        push(&error.to_string());
+        source = error.source();
+    }
+
+    // Keep a hop only if no other hop subsumes it: a strictly longer hop that contains it, or an
+    // identical earlier hop (so exact repeats keep their first occurrence).
+    let kept: Vec<&str> = parts
+        .iter()
+        .enumerate()
+        .filter(|(i, part)| {
+            !parts.iter().enumerate().any(|(j, other)| {
+                j != *i && other.contains(part.as_str()) && (other.len() > part.len() || j < *i)
+            })
+        })
+        .map(|(_, part)| part.as_str())
+        .collect();
+
+    format!("ingest rejected: {}", kept.join(": "))
 }
 
 fn to_proto_event(event: &Event) -> proto::Event {
@@ -418,5 +458,79 @@ mod tests {
         let mut no_token = AuthInterceptor { bearer: None };
         let request = no_token.call(Request::new(())).expect("intercept");
         assert!(request.metadata().get("authorization").is_none());
+    }
+
+    #[test]
+    fn ingest_rejection_uses_the_status_message() {
+        let status = Status::unavailable("gateway draining");
+        assert_eq!(
+            ingest_rejection_message(&status),
+            "ingest rejected: gateway draining"
+        );
+    }
+
+    #[test]
+    fn ingest_rejection_falls_back_to_the_code_description_for_an_empty_message() {
+        let status = Status::new(tonic::Code::Unavailable, "");
+        assert_eq!(
+            ingest_rejection_message(&status),
+            format!(
+                "ingest rejected: {}",
+                tonic::Code::Unavailable.description()
+            )
+        );
+    }
+
+    /// A `Display`-only error chain fake: each hop renders its text and points at the next.
+    #[derive(Debug)]
+    struct ChainError(&'static str, Option<Box<ChainError>>);
+
+    impl std::fmt::Display for ChainError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for ChainError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1
+                .as_deref()
+                .map(|error| error as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn ingest_rejection_folds_the_source_chain_without_debug_noise() {
+        let mut status = Status::new(tonic::Code::Unknown, "transport error");
+        status.set_source(std::sync::Arc::new(ChainError(
+            "transport error",
+            Some(Box::new(ChainError("connection refused", None))),
+        )));
+
+        // The repeated "transport error" hop collapses and the chain stays `Display`-only —
+        // no `tonic::transport::Error(..)` debug internals.
+        assert_eq!(
+            ingest_rejection_message(&status),
+            "ingest rejected: transport error: connection refused"
+        );
+    }
+
+    #[test]
+    fn ingest_rejection_drops_hops_subsumed_by_a_more_specific_hop() {
+        // Real-world shape: tonic stamps the root cause ("tcp connect error") into the status
+        // message, and the deepest hop restates it with the OS detail.
+        let mut status = Status::new(tonic::Code::Unavailable, "tcp connect error");
+        status.set_source(std::sync::Arc::new(ChainError(
+            "transport error",
+            Some(Box::new(ChainError(
+                "tcp connect error: Connection refused (os error 61)",
+                None,
+            ))),
+        )));
+
+        assert_eq!(
+            ingest_rejection_message(&status),
+            "ingest rejected: transport error: tcp connect error: Connection refused (os error 61)"
+        );
     }
 }
