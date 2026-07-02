@@ -23,7 +23,8 @@
 //! Request and response events are linked by an `http.exchange_id` attribute — see the
 //! `CaptureHandler` docs for the correlation mechanism and its reliability limits.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -31,17 +32,22 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
-use hudsucker::certificate_authority::RcgenAuthority;
+use hudsucker::certificate_authority::CertificateAuthority;
 use hudsucker::hyper::header::{CONTENT_TYPE, HOST};
+use hudsucker::hyper::http::uri::Authority;
 use hudsucker::hyper::{Method, Request, Response, StatusCode};
 use hudsucker::rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose,
+    KeyUsagePurpose, SanType, string::Ia5String,
 };
-use hudsucker::rustls::crypto::aws_lc_rs;
+use hudsucker::rustls::{
+    ServerConfig,
+    crypto::{CryptoProvider, aws_lc_rs},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+};
 use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use hiloop_core::event::{AttributeKey, Event, EventName, MediaType, PayloadRef, SignalType};
 use hiloop_core::identity::HlcClock;
@@ -83,6 +89,7 @@ const DESCRIPTOR: NormalizerDescriptor =
 /// a ULID) keeps the proxy dependency-free; uniqueness only needs to hold within
 /// a single wrapper run, and `u64` will not wrap in any realistic run.
 static EXCHANGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static CERT_SERIAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Known LLM API hosts whose traffic is tagged as `llm` rather than `net`.
 const LLM_HOSTS: &[&str] = &[
@@ -103,10 +110,10 @@ pub enum ProxyError {
 
 /// An ephemeral per-run certificate authority for TLS interception.
 ///
-/// The CA private key stays in memory inside the [`RcgenAuthority`]; only the
+/// The CA private key stays in memory inside the proxy authority; only the
 /// public cert PEM is exposed, to be written to a child-scoped trust bundle.
 pub struct ProxyCa {
-    authority: RcgenAuthority,
+    authority: ProxyAuthority,
     cert_pem: String,
 }
 
@@ -134,7 +141,7 @@ impl ProxyCa {
         let issuer = Issuer::from_ca_cert_pem(&cert_pem, issuer_key)
             .map_err(|error| ProxyError::Ca(error.to_string()))?;
 
-        let authority = RcgenAuthority::new(issuer, CA_CACHE_SIZE, aws_lc_rs::default_provider());
+        let authority = ProxyAuthority::new(issuer, aws_lc_rs::default_provider());
         Ok(Self {
             authority,
             cert_pem,
@@ -144,6 +151,93 @@ impl ProxyCa {
     /// The CA certificate PEM to install as the child's trust anchor.
     pub fn cert_pem(&self) -> &str {
         &self.cert_pem
+    }
+}
+
+struct ProxyAuthority {
+    issuer: Issuer<'static, KeyPair>,
+    private_key: PrivateKeyDer<'static>,
+    cache: Mutex<HashMap<Authority, Arc<ServerConfig>>>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ProxyAuthority {
+    fn new(issuer: Issuer<'static, KeyPair>, provider: CryptoProvider) -> Self {
+        let private_key =
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(issuer.key().serialize_der()));
+
+        Self {
+            issuer,
+            private_key,
+            cache: Mutex::new(HashMap::new()),
+            provider: Arc::new(provider),
+        }
+    }
+
+    fn gen_cert(&self, authority: &Authority) -> CertificateDer<'static> {
+        let mut params = CertificateParams::default();
+        params.serial_number = Some(CERT_SERIAL_COUNTER.fetch_add(1, Ordering::Relaxed).into());
+        params.use_authority_key_identifier_extension = true;
+
+        let mut distinguished_name = DistinguishedName::new();
+        distinguished_name.push(DnType::CommonName, authority.host());
+        params.distinguished_name = distinguished_name;
+
+        params
+            .subject_alt_names
+            .push(subject_alt_name(authority.host()));
+
+        params
+            .signed_by(self.issuer.key(), &self.issuer)
+            .expect("sign proxy certificate")
+            .into()
+    }
+
+    fn server_config(&self, authority: &Authority) -> Arc<ServerConfig> {
+        let certs = vec![self.gen_cert(authority)];
+
+        let mut server_cfg = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
+            .with_safe_default_protocol_versions()
+            .expect("specify TLS protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, self.private_key.clone_key())
+            .expect("build proxy ServerConfig");
+
+        server_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        Arc::new(server_cfg)
+    }
+}
+
+fn subject_alt_name(host: &str) -> SanType {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return SanType::IpAddress(ip);
+    }
+
+    if let Some(bracketed_host) = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        && let Ok(ip) = bracketed_host.parse::<IpAddr>()
+    {
+        return SanType::IpAddress(ip);
+    }
+
+    SanType::DnsName(Ia5String::try_from(host).expect("create Ia5String"))
+}
+
+impl CertificateAuthority for ProxyAuthority {
+    async fn gen_server_config(&self, authority: &Authority) -> Arc<ServerConfig> {
+        if let Some(server_cfg) = self.cache.lock().await.get(authority).cloned() {
+            return server_cfg;
+        }
+
+        let server_cfg = self.server_config(authority);
+        let mut cache = self.cache.lock().await;
+        if cache.len() >= CA_CACHE_SIZE as usize {
+            cache.clear();
+        }
+        cache.insert(authority.clone(), Arc::clone(&server_cfg));
+        server_cfg
     }
 }
 
@@ -1303,6 +1397,78 @@ mod tests {
     fn ca_generation_produces_a_cert_pem() {
         let ca = ProxyCa::generate().expect("generate CA");
         assert!(ca.cert_pem().contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn generated_server_cert_contains_authority_key_identifier() {
+        let ca = ProxyCa::generate().expect("generate CA");
+        let cert = ca
+            .authority
+            .gen_cert(&Authority::from_static("api.openai.com"));
+        let (_, parsed) =
+            x509_parser::parse_x509_certificate(cert.as_ref()).expect("parse generated cert");
+
+        let authority_key_identifier = parsed.extensions().iter().find_map(|extension| {
+            if let x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(identifier) =
+                extension.parsed_extension()
+            {
+                Some(identifier)
+            } else {
+                None
+            }
+        });
+
+        assert!(
+            authority_key_identifier
+                .and_then(|identifier| identifier.key_identifier.as_ref())
+                .is_some(),
+            "generated server cert must include Authority Key Identifier"
+        );
+    }
+
+    #[test]
+    fn generated_server_cert_uses_ip_san_for_ip_literal_authorities() {
+        let ca = ProxyCa::generate().expect("generate CA");
+        let cert = ca.authority.gen_cert(&Authority::from_static("127.0.0.1"));
+        let (_, parsed) =
+            x509_parser::parse_x509_certificate(cert.as_ref()).expect("parse generated cert");
+
+        let subject_alt_names = parsed
+            .extensions()
+            .iter()
+            .find_map(|extension| {
+                if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+                    extension.parsed_extension()
+                {
+                    Some(&san.general_names)
+                } else {
+                    None
+                }
+            })
+            .expect("generated server cert has SAN extension");
+
+        let has_ip_san = subject_alt_names.iter().any(|name| {
+            matches!(
+                name,
+                x509_parser::extensions::GeneralName::IPAddress(bytes)
+                    if *bytes == [127, 0, 0, 1].as_slice()
+            )
+        });
+        let has_dns_ip_san = subject_alt_names.iter().any(|name| {
+            matches!(
+                name,
+                x509_parser::extensions::GeneralName::DNSName(value) if *value == "127.0.0.1"
+            )
+        });
+
+        assert!(
+            has_ip_san,
+            "generated server cert must encode IP literals as iPAddress SANs"
+        );
+        assert!(
+            !has_dns_ip_san,
+            "generated server cert must not encode IP literals as dNSName SANs"
+        );
     }
 
     #[tokio::test]

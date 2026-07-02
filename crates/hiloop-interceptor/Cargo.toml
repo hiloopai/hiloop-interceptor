@@ -60,6 +60,7 @@ tonic-prost-build.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 tokio-rustls.workspace = true
+x509-parser.workspace = true
 
 [[bench]]
 name = "stdio_path"
