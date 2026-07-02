@@ -346,7 +346,9 @@ fn encode_otel_resource_value(value: &str) -> String {
 /// target), wires up the configured capture sinks, spawns the child in its own
 /// process group with the run context stamped into its environment, forwards
 /// terminating signals, and drains telemetry until the child exits. Telemetry
-/// export is best effort and never kills the child; a missing/failed-to-spawn
+/// export is best effort: it never kills the child, and once the child has
+/// exited a capture/export failure is reported on stderr as a warning rather
+/// than overriding the child's exit code. Only a missing/failed-to-spawn
 /// child or a misconfiguration returns `Err`.
 pub async fn run(options: &RunOptions) -> Result<ExitCode> {
     if options.command.is_empty() {
@@ -431,9 +433,13 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
                     raw_path.display()
                 )
             })?;
-            return Box::pin(run_captured(options, &exporter, Some(&raw_store))).await;
+            return Box::pin(run_captured(options, &exporter, Some(&raw_store)))
+                .await
+                .map(CapturedRun::into_exit_code);
         }
-        return Box::pin(run_captured(options, &exporter, None)).await;
+        return Box::pin(run_captured(options, &exporter, None))
+            .await
+            .map(CapturedRun::into_exit_code);
     }
 
     let mut command = Command::new(&options.command[0]);
@@ -450,11 +456,29 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
     Ok(exit_code_from_status(status))
 }
 
+/// Outcome of a supervised, captured run: the child's exit byte plus any telemetry
+/// drain failures that happened after the child ran (best-effort capture — reported,
+/// never allowed to override the child's exit code).
+struct CapturedRun {
+    exit_code: u8,
+    drain_warnings: Vec<anyhow::Error>,
+}
+
+impl CapturedRun {
+    /// Report drain warnings on stderr and yield the child's exit code.
+    fn into_exit_code(self) -> ExitCode {
+        for warning in &self.drain_warnings {
+            eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
+        }
+        ExitCode::from(self.exit_code)
+    }
+}
+
 async fn run_captured<E>(
     options: &RunOptions,
     exporter: &E,
     raw_store: Option<&dyn RawStore>,
-) -> Result<ExitCode>
+) -> Result<CapturedRun>
 where
     E: Exporter,
 {
@@ -705,12 +729,23 @@ where
         .await;
 
     let status = status_result?;
-    pipeline_result?;
-    stdin_result.context("failed to capture child stdin")?;
-    stdout_result.context("failed to capture child stdout")?;
-    stderr_result.context("failed to capture child stderr")?;
 
-    Ok(exit_code_from_status(status))
+    // The child has exited: capture/export is best effort from here, so drain failures
+    // become warnings instead of clobbering the child's exit code (exit-code transparency).
+    let drain_warnings = [
+        pipeline_result.map(|_| ()),
+        stdin_result.context("failed to capture child stdin"),
+        stdout_result.context("failed to capture child stdout"),
+        stderr_result.context("failed to capture child stderr"),
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .collect();
+
+    Ok(CapturedRun {
+        exit_code: exit_u8_from_status(status),
+        drain_warnings,
+    })
 }
 
 fn child_process_context(options: &RunOptions, pid: Option<u32>) -> ProcessContext {
@@ -1799,7 +1834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telemetry_export_failure_does_not_kill_child() {
+    async fn telemetry_export_failure_does_not_kill_child_or_clobber_exit_zero() {
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join("child-finished");
         let marker_arg = marker.to_string_lossy().into_owned();
@@ -1820,14 +1855,50 @@ mod tests {
             None,
         );
 
-        let error = Box::pin(run_captured(&options, &FailingExporter, None))
+        let captured = Box::pin(run_captured(&options, &FailingExporter, None))
             .await
-            .expect_err("export should fail");
+            .expect("a successful child's exit code wins over an export failure");
 
-        assert!(error.to_string().contains("stdio event pipeline failed"));
+        assert_eq!(captured.exit_code, 0);
+        assert!(
+            captured
+                .drain_warnings
+                .iter()
+                .any(|warning| format!("{warning:#}").contains("stdio event pipeline failed")),
+            "the export failure is surfaced as a drain warning"
+        );
         assert!(
             marker.exists(),
             "child should finish despite export failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_export_failure_preserves_nonzero_child_exit() {
+        let options = RunOptions::new(
+            RunContext::new_local_root(),
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf 'hello\\n'; exit 7".to_owned(),
+            ],
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+        );
+
+        let captured = Box::pin(run_captured(&options, &FailingExporter, None))
+            .await
+            .expect("the child's own exit code wins over an export failure");
+
+        assert_eq!(captured.exit_code, 7);
+        assert!(
+            !captured.drain_warnings.is_empty(),
+            "the export failure is surfaced as a drain warning"
         );
     }
 }

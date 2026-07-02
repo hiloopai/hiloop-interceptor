@@ -40,6 +40,16 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   Both knobs are also configurable via `HILOOP_EXPORT_FLUSH_INTERVAL_MS` / `HILOOP_EXPORT_BATCH_SIZE`
   and on the embeddable `RunOptions` builder.
 
+### Fixed
+
+- A telemetry capture/export failure no longer overrides the exit code of a child that already
+  ran: `run` is exit-code transparent, and post-exit drain failures are reported on stderr as
+  `warning:` diagnostics instead of failing the wrapper. Only a missing/failed-to-spawn child or a
+  misconfiguration still exits nonzero on the wrapper's behalf.
+- Rejected ingest RPCs now render as one human-readable line (status message or code description
+  plus the deduplicated source chain) instead of leaking `tonic` transport `Debug` internals or a
+  mangled empty message (`ingest rejected: `).
+
 ### Changed
 
 - **Breaking:** the telemetry spine is now keyed on a run and its **lineage path** (the dotted
