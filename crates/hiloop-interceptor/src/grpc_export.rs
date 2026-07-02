@@ -139,13 +139,15 @@ impl Exporter for GrpcIngestExporter {
 
 /// Render a rejected ingest RPC as one human-readable line.
 ///
-/// `tonic::Status`'s own `Display` embeds the `Debug` of its transport source
-/// (`tonic::transport::Error(Transport, hyper::Error(..))`), which would leak internals into a
-/// wrapping CLI's stderr — and a transport failure carries an empty gRPC message, which used to
-/// render as a bare `ingest rejected: `. Fold the readable pieces instead: the status message (or
-/// the code description when the message is empty) followed by each source's `Display`. Hops in
-/// the chain routinely restate each other (tonic stamps the root cause into the status message),
-/// so a hop that appears verbatim inside another hop is dropped rather than repeated.
+/// `tonic::Status` can carry an empty gRPC message and noisy sources — its own `Display` embeds
+/// the `Debug` of its transport source (`tonic::transport::Error(Transport, hyper::Error(..))`),
+/// which would leak internals into a wrapping CLI's stderr. Fold the readable pieces into one
+/// compact diagnostic instead: the status message (or the code description when the message is
+/// empty) followed by each source's `Display`. Hops in the chain routinely restate each other
+/// (tonic stamps the root cause into the status message), so a hop that appears verbatim inside
+/// another hop is dropped rather than repeated. The `Status` is deliberately not kept as a
+/// structured `source` — any wrapper that renders an error chain (`anyhow`'s `{err:#}`) would
+/// hit `Status`'s leaky `Display` again.
 fn ingest_rejection_message(status: &Status) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut push = |part: &str| {
