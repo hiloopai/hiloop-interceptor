@@ -46,6 +46,7 @@ use hudsucker::rustls::{
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 
@@ -75,6 +76,9 @@ const REQUEST_KIND: &str = "http.request";
 const RESPONSE_KIND: &str = "http.response";
 const EGRESS_DENIED_KIND: &str = "egress.denied";
 const EXCHANGE_ID_ATTR: &str = "http.exchange_id";
+const GEN_AI_REQUEST_MODEL_ATTR: &str = "gen_ai.request.model";
+const GEN_AI_RESPONSE_MODEL_ATTR: &str = "gen_ai.response.model";
+const TOOL_CALL_ATTR: &str = "tool_call";
 const TRUNCATED_ATTR: &str = "http.capture.truncated";
 /// Attribute stamped with a comma-separated list of matched anomaly rule names when a
 /// captured request trips one or more [`AnomalyConfig`] rules.
@@ -99,6 +103,7 @@ const LLM_HOSTS: &[&str] = &[
     "api.cohere.ai",
     "api.mistral.ai",
 ];
+const MAX_LLM_METADATA_VALUE_BYTES: usize = 128;
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
@@ -359,6 +364,9 @@ struct CaptureHandler {
     /// Exchange id for the request currently being handled by this clone,
     /// minted in `on_request` and read back in `on_response`.
     exchange_id: Option<String>,
+    /// Request host for the current exchange, carried onto the matching response so
+    /// response telemetry can be classified and queried by the same host dimension.
+    exchange_host: Option<String>,
 }
 
 impl CaptureHandler {
@@ -388,6 +396,7 @@ impl CaptureHandler {
             connect_host: None,
             injected_secret: None,
             exchange_id: None,
+            exchange_host: None,
         }
     }
 
@@ -527,12 +536,21 @@ impl CaptureHandler {
             ("http.method", parts.method.as_str().to_owned()),
             ("http.target", parts.uri.to_string()),
         ];
-        if let Some(host) = request_host(&parts.uri, &parts.headers) {
-            attributes.push(("http.host", host));
+        let host = request_host(&parts.uri, &parts.headers).map(|host| telemetry_host(&host));
+        self.exchange_host.clone_from(&host);
+        if let Some(host) = &host {
+            attributes.push(("http.host", host.clone()));
         }
         if let Some(content_type) = &content_type {
             attributes.push(("http.request.content_type", content_type.clone()));
         }
+        append_llm_capture_attributes(
+            &mut attributes,
+            host.as_deref(),
+            content_type.as_deref(),
+            &captured,
+            LlmCaptureDirection::Request,
+        );
         if !flags.is_empty() {
             attributes.push((FLAGGED_ATTR, join_flag_names(&flags)));
         }
@@ -653,6 +671,9 @@ impl CaptureHandler {
         let mut attributes = vec![("http.status_code", parts.status.as_u16().to_string())];
         if let Some(exchange_id) = self.exchange_id.take() {
             attributes.push((EXCHANGE_ID_ATTR, exchange_id));
+        }
+        if let Some(host) = self.exchange_host.take() {
+            attributes.push(("http.host", host));
         }
         if let Some(content_type) = &content_type {
             attributes.push(("http.response.content_type", content_type.clone()));
@@ -865,7 +886,7 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         clock,
         kind,
         size_attr,
-        attributes,
+        mut attributes,
         blob_store,
         captured,
         redaction,
@@ -879,6 +900,16 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         Some(secret) => redaction.redact_body_with_literals(captured, &[secret.as_bytes()]),
         None => redaction.redact_body(captured),
     };
+    let host = attributes
+        .iter()
+        .find_map(|(key, value)| (*key == "http.host").then(|| value.clone()));
+    append_llm_capture_attributes(
+        &mut attributes,
+        host.as_deref(),
+        media_type.as_deref(),
+        &stored,
+        LlmCaptureDirection::Response,
+    );
     let size = stored.len() as u64;
     let payload_ref = match offload_bytes(blob_store, &stored, media_type.as_deref()).await {
         Ok(payload_ref) => Some(payload_ref),
@@ -1060,6 +1091,229 @@ fn header_str(
         .map(ToOwned::to_owned)
 }
 
+fn telemetry_host(host: &str) -> String {
+    canonicalize_host(host).map_or_else(|_| host.to_owned(), |destination| destination.host_str())
+}
+
+#[derive(Clone, Copy)]
+enum LlmCaptureDirection {
+    Request,
+    Response,
+}
+
+#[derive(Default)]
+struct LlmCaptureMetadata {
+    model: Option<String>,
+    tool_call: Option<String>,
+}
+
+impl LlmCaptureMetadata {
+    fn is_complete(&self) -> bool {
+        self.model.is_some() && self.tool_call.is_some()
+    }
+
+    fn merge(&mut self, other: LlmCaptureMetadata) {
+        if self.model.is_none() {
+            self.model = other.model;
+        }
+        if self.tool_call.is_none() {
+            self.tool_call = other.tool_call;
+        }
+    }
+}
+
+fn append_llm_capture_attributes(
+    attributes: &mut Vec<(&'static str, String)>,
+    host: Option<&str>,
+    content_type: Option<&str>,
+    body: &[u8],
+    direction: LlmCaptureDirection,
+) {
+    let Some(host) = host else {
+        return;
+    };
+    if !is_llm_host(host) {
+        return;
+    }
+
+    let metadata = llm_capture_metadata(content_type, body, direction);
+    let model_attr = match direction {
+        LlmCaptureDirection::Request => GEN_AI_REQUEST_MODEL_ATTR,
+        LlmCaptureDirection::Response => GEN_AI_RESPONSE_MODEL_ATTR,
+    };
+    if let Some(model) = metadata.model {
+        push_attribute_once(attributes, model_attr, model);
+    }
+    if let Some(tool_call) = metadata.tool_call {
+        push_attribute_once(attributes, TOOL_CALL_ATTR, tool_call);
+    }
+}
+
+fn push_attribute_once(
+    attributes: &mut Vec<(&'static str, String)>,
+    key: &'static str,
+    value: String,
+) {
+    if attributes.iter().any(|(existing, _)| *existing == key) {
+        return;
+    }
+    attributes.push((key, value));
+}
+
+fn llm_capture_metadata(
+    content_type: Option<&str>,
+    body: &[u8],
+    direction: LlmCaptureDirection,
+) -> LlmCaptureMetadata {
+    if body.is_empty() {
+        return LlmCaptureMetadata::default();
+    }
+    if is_event_stream_media_type(content_type) {
+        return llm_metadata_from_event_stream(body, direction);
+    }
+    if is_json_media_type(content_type) || body_looks_json(body) {
+        return llm_metadata_from_json_bytes(body, direction);
+    }
+    LlmCaptureMetadata::default()
+}
+
+fn llm_metadata_from_event_stream(
+    body: &[u8],
+    direction: LlmCaptureDirection,
+) -> LlmCaptureMetadata {
+    let mut metadata = LlmCaptureMetadata::default();
+    for line in body.split(|byte| *byte == b'\n') {
+        let line = trim_ascii(line);
+        let Some(data) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let data = trim_ascii(data);
+        if data.is_empty() || data == b"[DONE]" {
+            continue;
+        }
+        metadata.merge(llm_metadata_from_json_bytes(data, direction));
+        if metadata.is_complete() {
+            break;
+        }
+    }
+    metadata
+}
+
+fn llm_metadata_from_json_bytes(body: &[u8], direction: LlmCaptureDirection) -> LlmCaptureMetadata {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return LlmCaptureMetadata::default();
+    };
+    llm_metadata_from_json_value(&value, direction)
+}
+
+fn llm_metadata_from_json_value(
+    value: &Value,
+    _direction: LlmCaptureDirection,
+) -> LlmCaptureMetadata {
+    let tool_count = count_tool_calls(value, 0);
+    LlmCaptureMetadata {
+        model: value
+            .get("model")
+            .and_then(Value::as_str)
+            .and_then(safe_llm_metadata_value),
+        tool_call: (tool_count > 0).then(|| tool_count.min(999).to_string()),
+    }
+}
+
+fn count_tool_calls(value: &Value, depth: usize) -> usize {
+    if depth > 8 {
+        return 0;
+    }
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| count_tool_calls(item, depth + 1))
+            .sum(),
+        Value::Object(map) => {
+            let mut count = 0;
+            for key in ["tools", "functions", "tool_calls"] {
+                if let Some(child) = map.get(key) {
+                    count += count_named_tools(child);
+                }
+            }
+            if matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("function_call" | "tool_use")
+            ) {
+                count += 1;
+            }
+            for key in [
+                "choices", "message", "messages", "content", "output", "delta",
+            ] {
+                if let Some(child) = map.get(key) {
+                    count += count_tool_calls(child, depth + 1);
+                }
+            }
+            count
+        }
+        _ => 0,
+    }
+}
+
+fn count_named_tools(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => items.len(),
+        Value::Object(map) if map.contains_key("name") || map.contains_key("function") => 1,
+        Value::Object(map) => map.values().map(count_named_tools).sum(),
+        Value::String(_) => 1,
+        _ => 0,
+    }
+}
+
+fn safe_llm_metadata_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_LLM_METADATA_VALUE_BYTES {
+        return None;
+    }
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+    }) {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn is_json_media_type(content_type: Option<&str>) -> bool {
+    media_type(content_type)
+        .is_some_and(|value| value == "application/json" || value.ends_with("+json"))
+}
+
+fn is_event_stream_media_type(content_type: Option<&str>) -> bool {
+    media_type(content_type).is_some_and(|value| value == "text/event-stream")
+}
+
+fn media_type(content_type: Option<&str>) -> Option<String> {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn body_looks_json(body: &[u8]) -> bool {
+    matches!(trim_ascii(body).first().copied(), Some(b'{' | b'['))
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = value.split_first()
+        && first.is_ascii_whitespace()
+    {
+        value = rest;
+    }
+    while let Some((last, rest)) = value.split_last()
+        && last.is_ascii_whitespace()
+    {
+        value = rest;
+    }
+    value
+}
+
 /// Turns captured proxy request/response signals into fork-stamped events.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProxyNormalizer;
@@ -1119,6 +1373,7 @@ impl Normalizer for ProxyNormalizer {
 }
 
 fn is_llm_host(host: &str) -> bool {
+    let host = telemetry_host(host);
     LLM_HOSTS
         .iter()
         .any(|known| host == *known || host.ends_with(&format!(".{known}")))
@@ -1316,7 +1571,9 @@ mod tests {
     #[test]
     fn llm_host_matches_domain_and_subdomain() {
         assert!(is_llm_host("api.openai.com"));
+        assert!(is_llm_host("api.openai.com:443"));
         assert!(is_llm_host("eu.api.openai.com"));
+        assert!(is_llm_host("eu.api.openai.com:443"));
         assert!(!is_llm_host("example.com"));
         assert!(!is_llm_host("notapi.openai.com.evil.com"));
     }
@@ -1956,6 +2213,163 @@ mod tests {
         assert_eq!(
             signal.attributes.get("http.host").map(String::as_str),
             Some("fallback.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn brokered_llm_request_records_safe_model_and_tool_metadata() {
+        let url = stub_broker("sk-real-secret-value").await;
+        let injector = injector_for(&url, "api.openai.com");
+        let (mut handler, mut rx, store) = handler_with_egress(
+            None,
+            RedactionPolicy::default(),
+            Arc::new(EgressPolicy::default()),
+            Some(injector),
+        );
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-5-codex","messages":[{"role":"user","content":"do not leak this prompt"}],"tools":[{"type":"function","function":{"name":"run_shell","description":"do not leak this description"}}],"metadata":{"echo":"sk-real-secret-value"}}"#,
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .header(HOST, "api.openai.com:443")
+            .header("authorization", "Bearer hil-secret://openai-prod")
+            .body(Body::from(body.clone()))
+            .expect("request");
+
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        assert_eq!(
+            forwarded
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-real-secret-value")
+        );
+        assert_eq!(drain_body(forwarded.into_body()).await.concat(), body);
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get("http.host").map(String::as_str),
+            Some("api.openai.com")
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get(GEN_AI_REQUEST_MODEL_ATTR)
+                .map(String::as_str),
+            Some("gpt-5-codex")
+        );
+        assert_eq!(
+            signal.attributes.get(TOOL_CALL_ATTR).map(String::as_str),
+            Some("1")
+        );
+        for forbidden in [
+            "do not leak this prompt",
+            "do not leak this description",
+            "run_shell",
+            "sk-real-secret-value",
+        ] {
+            assert!(
+                signal
+                    .attributes
+                    .values()
+                    .all(|value| !value.contains(forbidden)),
+                "attributes must not include {forbidden}"
+            );
+        }
+        let blob = &store.blobs()[0].1;
+        assert!(
+            !blob
+                .windows(20)
+                .any(|window| window == b"sk-real-secret-value"),
+            "captured blob must redact the brokered credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_metadata_is_not_extracted_for_non_llm_hosts() {
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://example.com/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(Bytes::from_static(
+                br#"{"model":"gpt-5-codex","tools":[{"type":"function","function":{"name":"run_shell"}}]}"#,
+            )))
+            .expect("request");
+
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        drain_body(forwarded.into_body()).await;
+
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert!(!signal.attributes.contains_key(GEN_AI_REQUEST_MODEL_ATTR));
+        assert!(!signal.attributes.contains_key(TOOL_CALL_ATTR));
+    }
+
+    #[tokio::test]
+    async fn llm_response_records_safe_metadata_and_normalizes_as_llm() {
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(HOST, "api.openai.com:443")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(Bytes::from_static(
+                br#"{"model":"gpt-5-codex","input":"hi"}"#,
+            )))
+            .expect("request");
+        drain_body(expect_forwarded(handler.on_request(request).await).into_body()).await;
+        let _request_signal = rx.recv().await.expect("request signal").expect("raw");
+
+        let response = Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(Bytes::from_static(
+                br#"{"model":"gpt-5-codex","choices":[{"message":{"tool_calls":[{"function":{"name":"run_shell","arguments":"{\"prompt\":\"do not leak\"}"}}]}}]}"#,
+            )))
+            .expect("response");
+        let forwarded = handler.on_response(response);
+        drain_body(forwarded.into_body()).await;
+
+        let signal = rx.recv().await.expect("response signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get("http.host").map(String::as_str),
+            Some("api.openai.com")
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get(GEN_AI_RESPONSE_MODEL_ATTR)
+                .map(String::as_str),
+            Some("gpt-5-codex")
+        );
+        assert_eq!(
+            signal.attributes.get(TOOL_CALL_ATTR).map(String::as_str),
+            Some("1")
+        );
+        for forbidden in ["run_shell", "do not leak"] {
+            assert!(
+                signal
+                    .attributes
+                    .values()
+                    .all(|value| !value.contains(forbidden)),
+                "attributes must not include {forbidden}"
+            );
+        }
+
+        let context = NormalizationContext::new(RunContext::new_local_root());
+        let outcome = ProxyNormalizer
+            .normalize(&context, signal)
+            .await
+            .expect("normalize");
+        let events = outcome.into_events();
+        assert_eq!(events[0].signal, SignalType::Llm);
+        assert_eq!(
+            events[0]
+                .attributes
+                .get(&AttributeKey::new(GEN_AI_RESPONSE_MODEL_ATTR).expect("key")),
+            Some(&AttributeValue::String("gpt-5-codex".to_owned()))
         );
     }
 
