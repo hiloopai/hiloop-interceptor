@@ -53,6 +53,52 @@ const OTEL_RUN_ID: &str = "hiloop.run.id";
 const OTEL_LINEAGE_PATH: &str = "hiloop.run.lineage_path";
 const OTEL_EXECUTION_ID: &str = "hiloop.execution.id";
 
+/// Locations of the OS public-root CA bundle, most-common first. The wrapped child
+/// would normally trust these; the interception bundle must *preserve* that trust,
+/// not replace it — pointing a CA env at a MITM-only file strips public-root trust
+/// for any tool that honors `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`.
+const SYSTEM_CA_BUNDLE_CANDIDATES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/distroless
+    "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/Fedora/CentOS
+    "/etc/ssl/cert.pem",                  // Alpine/macOS/OpenBSD
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+];
+
+/// Read the OS public-root CA bundle the wrapped child would otherwise trust, honoring
+/// an explicit `SSL_CERT_FILE` first, then the well-known paths. `None` if none exist.
+fn read_system_ca_roots() -> Option<Vec<u8>> {
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if !bytes.is_empty() {
+                return Some(bytes);
+            }
+        }
+    }
+    for candidate in SYSTEM_CA_BUNDLE_CANDIDATES {
+        if let Ok(bytes) = std::fs::read(candidate) {
+            if !bytes.is_empty() {
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
+/// Build the child-scoped trust bundle: the OS public roots unioned with the interception
+/// CA, so the child validates both public hosts and the TLS-terminating proxy. The public
+/// roots come first, newline-separated from the appended interception CA.
+fn union_ca_bundle(system_roots: Option<&[u8]>, interception_ca_pem: &str) -> Vec<u8> {
+    let mut bundle = Vec::new();
+    if let Some(roots) = system_roots {
+        bundle.extend_from_slice(roots);
+        if !roots.ends_with(b"\n") {
+            bundle.push(b'\n');
+        }
+    }
+    bundle.extend_from_slice(interception_ca_pem.as_bytes());
+    bundle
+}
+
 type CaptureFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 
 /// gRPC export target for captured events.
@@ -306,14 +352,17 @@ impl ChildEnv {
         for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
             self.vars.push((var.into(), proxy_url.clone()));
         }
-        // Child-scoped trust for the proxy CA across common runtimes; never the
-        // system trust store.
+        // Child-scoped trust across common runtimes: point each CA env at the
+        // interception bundle (OS public roots unioned with the proxy CA — see
+        // `union_ca_bundle`), so the child trusts both public hosts and the proxy
+        // without us mutating the on-disk system trust store.
         let ca = ca_path.as_os_str().to_owned();
         for var in [
             "SSL_CERT_FILE",
             "REQUESTS_CA_BUNDLE",
             "NODE_EXTRA_CA_CERTS",
             "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
         ] {
             self.vars.push((var.into(), ca.clone()));
         }
@@ -505,7 +554,8 @@ where
         Some(ca) => {
             let mut file =
                 tempfile::NamedTempFile::new().context("failed to create proxy CA bundle file")?;
-            file.write_all(ca.cert_pem().as_bytes())
+            let bundle = union_ca_bundle(read_system_ca_roots().as_deref(), ca.cert_pem());
+            file.write_all(&bundle)
                 .context("failed to write proxy CA bundle")?;
             Some(file)
         }
@@ -1547,6 +1597,66 @@ mod tests {
         assert_eq!(
             vars.get("OTEL_EXPORTER_OTLP_PROTOCOL").map(String::as_str),
             Some("http/protobuf")
+        );
+    }
+
+    #[test]
+    fn set_proxy_points_every_trust_store_env_at_the_bundle() {
+        let mut env = ChildEnv::for_run(&RunContext::new_local_root(), None);
+        env.set_proxy(
+            "127.0.0.1:8080".parse().expect("addr"),
+            Path::new("/tmp/hiloop-ca.pem"),
+        );
+
+        let vars = env
+            .vars()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        // git honors GIT_SSL_CAINFO, not the other CA envs, so it must be set too or
+        // `git clone`/`pip install git+https` fail against the proxy.
+        for key in [
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ] {
+            assert_eq!(
+                vars.get(key).map(String::as_str),
+                Some("/tmp/hiloop-ca.pem"),
+                "{key} must point at the interception bundle"
+            );
+        }
+        assert_eq!(
+            vars.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:8080")
+        );
+    }
+
+    #[test]
+    fn union_ca_bundle_preserves_public_roots_and_appends_interception_ca() {
+        let mitm = "-----BEGIN CERTIFICATE-----\nMITM\n-----END CERTIFICATE-----\n";
+
+        // No system roots → the bundle is exactly the interception CA.
+        assert_eq!(union_ca_bundle(None, mitm), mitm.as_bytes());
+
+        // System roots without a trailing newline: a separator is inserted, and BOTH
+        // the public root and the interception CA survive (no public-root loss — the
+        // bug this fixes was a MITM-only bundle that stripped public trust).
+        let roots = b"-----BEGIN CERTIFICATE-----\nPUBLICROOT\n-----END CERTIFICATE-----";
+        let text = String::from_utf8(union_ca_bundle(Some(roots), mitm)).expect("utf8");
+        assert!(text.contains("PUBLICROOT"), "public roots preserved");
+        assert!(text.contains("MITM"), "interception CA appended");
+        assert!(
+            text.contains("-END CERTIFICATE-----\n-----BEGIN"),
+            "a newline separates the two PEM blocks"
         );
     }
 
