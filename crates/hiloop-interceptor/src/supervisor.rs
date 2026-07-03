@@ -8,6 +8,7 @@ use crate::{
     anomaly::AnomalyConfig,
     blob::DirBlobStore,
     egress::EgressPolicy,
+    exec_events::{ExecLifecycleEmitter, ExecLifecycleNormalizer},
     exporters::{FanOutExporter, JsonlExporter},
     framing::LineFramer,
     grpc_export::GrpcIngestExporter,
@@ -40,7 +41,7 @@ use std::{
     pin::Pin,
     process::{ExitCode, ExitStatus, Stdio},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -97,6 +98,7 @@ pub struct RunOptions {
     secret_bindings: Vec<SecretBinding>,
     secret_broker: Option<BrokerConfig>,
     verbose_diagnostics: bool,
+    env_allowlist: Vec<String>,
 }
 
 impl RunOptions {
@@ -148,6 +150,7 @@ impl RunOptions {
             secret_bindings: Vec::new(),
             secret_broker: None,
             verbose_diagnostics: false,
+            env_allowlist: Vec::new(),
         }
     }
 
@@ -245,6 +248,16 @@ impl RunOptions {
     #[must_use]
     pub fn with_verbose_diagnostics(mut self, verbose: bool) -> Self {
         self.verbose_diagnostics = verbose;
+        self
+    }
+
+    /// Record these environment variable *names* on the run's `process.start`
+    /// event (`process.env_allowlist`). Names only — values are never captured,
+    /// so secrets can't leak through the process record. Empty (the default)
+    /// omits the attribute.
+    #[must_use]
+    pub fn with_env_allowlist(mut self, env_allowlist: Vec<String>) -> Self {
+        self.env_allowlist = env_allowlist;
         self
     }
 }
@@ -450,7 +463,7 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
-    let status = with_signal_forwarding(child.id(), None, child.wait())
+    let status = with_signal_forwarding(child.id(), None, None, child.wait())
         .await
         .with_context(|| format!("failed to run child command `{}`", options.command[0]))?;
     Ok(exit_code_from_status(status))
@@ -563,6 +576,8 @@ where
         .spawn()
         .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
     drop(command);
+    let child_started = Instant::now();
+    let spawn_ts = clock.tick();
     let child_pid = child.id();
     let process = child_process_context(options, child_pid);
     #[cfg(unix)]
@@ -581,6 +596,13 @@ where
             options_pipeline.with_raw_retention_override(RawRetentionPolicy::Preserve);
     }
     let (signal_tx, signal_rx) = mpsc::channel(options_pipeline.raw_queue_capacity());
+
+    // Process-boundary lifecycle capture: `process.start` now, `process.signal`
+    // on each forwarded terminating signal, `process.exit` once the child exits.
+    let exec_emitter = ExecLifecycleEmitter::new(signal_tx.clone(), Arc::clone(&clock));
+    exec_emitter
+        .emit_start(spawn_ts, &options.env_allowlist)
+        .await;
 
     let (stdin_shutdown_tx, stdin_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     #[cfg(unix)]
@@ -662,9 +684,10 @@ where
     drop(signal_tx);
 
     let stdio_normalizer = StdioLogNormalizer;
+    let exec_normalizer = ExecLifecycleNormalizer;
     let otlp_normalizer = OtlpTraceNormalizer;
     let proxy_normalizer = ProxyNormalizer;
-    let mut normalizers: Vec<&dyn Normalizer> = vec![&stdio_normalizer];
+    let mut normalizers: Vec<&dyn Normalizer> = vec![&stdio_normalizer, &exec_normalizer];
     if options.otlp {
         normalizers.push(&otlp_normalizer);
     }
@@ -687,11 +710,25 @@ where
     // The child exiting is the cue to stop the capture servers: dropping their
     // senders lets the pipeline drain and finish.
     let child_and_shutdown = async {
-        let status = with_signal_forwarding(child_pid, pty_resize_fd, child.wait())
-            .await
-            .with_context(|| format!("failed to wait for child command `{}`", options.command[0]));
-        // Stop the stdin pump (its source may never EOF) and the capture servers; dropping their
-        // senders lets the pipeline drain and finish.
+        let status =
+            with_signal_forwarding(child_pid, pty_resize_fd, Some(&exec_emitter), child.wait())
+                .await
+                .with_context(|| {
+                    format!("failed to wait for child command `{}`", options.command[0])
+                });
+        if let Ok(status) = &status {
+            exec_emitter
+                .emit_exit(
+                    exit_u8_from_status(*status),
+                    term_signal_name(*status),
+                    child_started.elapsed(),
+                )
+                .await;
+        }
+        // Release the lifecycle sender, then stop the stdin pump (its source may
+        // never EOF) and the capture servers; dropping their senders lets the
+        // pipeline drain and finish.
+        drop(exec_emitter);
         let _ = stdin_shutdown_tx.send(());
         for shutdown_tx in [otlp_shutdown_tx, proxy_shutdown_tx].into_iter().flatten() {
             let _ = shutdown_tx.send(());
@@ -1398,6 +1435,22 @@ fn exit_u8_from_status(status: ExitStatus) -> u8 {
     1
 }
 
+/// The name of the signal that terminated the child (e.g. `SIGKILL`), when the
+/// child was signal-killed rather than exiting on its own.
+#[cfg(unix)]
+fn term_signal_name(status: ExitStatus) -> Option<&'static str> {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .signal()
+        .and_then(|signo| nix::sys::signal::Signal::try_from(signo).ok())
+        .map(nix::sys::signal::Signal::as_str)
+}
+
+#[cfg(not(unix))]
+fn term_signal_name(_status: ExitStatus) -> Option<&'static str> {
+    None
+}
+
 /// Put the child at the head of its own process group.
 ///
 /// This lets the wrapper signal the whole harness subtree at once, and means
@@ -1425,6 +1478,7 @@ fn set_child_process_group(command: &mut Command) {
 async fn with_signal_forwarding<F, T>(
     child_pid: Option<u32>,
     pty_resize_fd: Option<std::fs::File>,
+    emitter: Option<&ExecLifecycleEmitter>,
     work: F,
 ) -> T
 where
@@ -1448,8 +1502,12 @@ where
     loop {
         tokio::select! {
             output = &mut work => return output,
-            _ = sigint.recv() => forward_signal(child_pid, nix::sys::signal::Signal::SIGINT),
-            _ = sigterm.recv() => forward_signal(child_pid, nix::sys::signal::Signal::SIGTERM),
+            _ = sigint.recv() => {
+                forward_and_record(child_pid, nix::sys::signal::Signal::SIGINT, emitter).await;
+            }
+            _ = sigterm.recv() => {
+                forward_and_record(child_pid, nix::sys::signal::Signal::SIGTERM, emitter).await;
+            }
             () = async {
                 match sigwinch.as_mut() {
                     Some(sigwinch) => {
@@ -1469,7 +1527,12 @@ where
 }
 
 #[cfg(not(unix))]
-async fn with_signal_forwarding<F, T>(_child_pid: Option<u32>, _pty_resize_fd: (), work: F) -> T
+async fn with_signal_forwarding<F, T>(
+    _child_pid: Option<u32>,
+    _pty_resize_fd: (),
+    _emitter: Option<&ExecLifecycleEmitter>,
+    work: F,
+) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -1482,6 +1545,20 @@ fn resize_pty_to_current_terminal(pty: &std::fs::File) {
 
     if let Some(winsize) = current_terminal_winsize() {
         let _ = set_pty_winsize(pty.as_raw_fd(), &winsize);
+    }
+}
+
+/// Forward `signal` to the child's process group and, when capture is active,
+/// record the steering fact as a `process.signal` event.
+#[cfg(unix)]
+async fn forward_and_record(
+    child_pid: Option<u32>,
+    signal: nix::sys::signal::Signal,
+    emitter: Option<&ExecLifecycleEmitter>,
+) {
+    forward_signal(child_pid, signal);
+    if let Some(emitter) = emitter {
+        emitter.emit_signal(signal.as_str()).await;
     }
 }
 
