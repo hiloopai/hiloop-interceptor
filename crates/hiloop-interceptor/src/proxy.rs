@@ -1208,9 +1208,12 @@ fn llm_metadata_from_json_bytes(body: &[u8], direction: LlmCaptureDirection) -> 
 
 fn llm_metadata_from_json_value(
     value: &Value,
-    _direction: LlmCaptureDirection,
+    direction: LlmCaptureDirection,
 ) -> LlmCaptureMetadata {
-    let tool_count = count_tool_calls(value, 0);
+    let tool_count = match direction {
+        LlmCaptureDirection::Request => 0,
+        LlmCaptureDirection::Response => count_tool_calls(value, 0),
+    };
     LlmCaptureMetadata {
         model: value
             .get("model")
@@ -1231,10 +1234,11 @@ fn count_tool_calls(value: &Value, depth: usize) -> usize {
             .sum(),
         Value::Object(map) => {
             let mut count = 0;
-            for key in ["tools", "functions", "tool_calls"] {
-                if let Some(child) = map.get(key) {
-                    count += count_named_tools(child);
-                }
+            if let Some(child) = map.get("tool_calls") {
+                count += count_actual_tool_call_entries(child);
+            }
+            if matches!(map.get("function_call"), Some(child) if !child.is_null()) {
+                count += 1;
             }
             if matches!(
                 map.get("type").and_then(Value::as_str),
@@ -1255,12 +1259,10 @@ fn count_tool_calls(value: &Value, depth: usize) -> usize {
     }
 }
 
-fn count_named_tools(value: &Value) -> usize {
+fn count_actual_tool_call_entries(value: &Value) -> usize {
     match value {
         Value::Array(items) => items.len(),
-        Value::Object(map) if map.contains_key("name") || map.contains_key("function") => 1,
-        Value::Object(map) => map.values().map(count_named_tools).sum(),
-        Value::String(_) => 1,
+        Value::Object(map) if !map.is_empty() => 1,
         _ => 0,
     }
 }
@@ -2217,7 +2219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn brokered_llm_request_records_safe_model_and_tool_metadata() {
+    async fn brokered_llm_request_records_safe_model_without_tool_definition_metadata() {
         let url = stub_broker("sk-real-secret-value").await;
         let injector = injector_for(&url, "api.openai.com");
         let (mut handler, mut rx, store) = handler_with_egress(
@@ -2260,10 +2262,7 @@ mod tests {
                 .map(String::as_str),
             Some("gpt-5-codex")
         );
-        assert_eq!(
-            signal.attributes.get(TOOL_CALL_ATTR).map(String::as_str),
-            Some("1")
-        );
+        assert!(!signal.attributes.contains_key(TOOL_CALL_ATTR));
         for forbidden in [
             "do not leak this prompt",
             "do not leak this description",
