@@ -536,7 +536,7 @@ impl CaptureHandler {
             ("http.method", parts.method.as_str().to_owned()),
             ("http.target", parts.uri.to_string()),
         ];
-        let host = request_host(&parts.uri, &parts.headers);
+        let host = request_host(&parts.uri, &parts.headers).map(|host| telemetry_host(&host));
         self.exchange_host.clone_from(&host);
         if let Some(host) = &host {
             attributes.push(("http.host", host.clone()));
@@ -1091,6 +1091,10 @@ fn header_str(
         .map(ToOwned::to_owned)
 }
 
+fn telemetry_host(host: &str) -> String {
+    canonicalize_host(host).map_or_else(|_| host.to_owned(), |destination| destination.host_str())
+}
+
 #[derive(Clone, Copy)]
 enum LlmCaptureDirection {
     Request,
@@ -1369,6 +1373,7 @@ impl Normalizer for ProxyNormalizer {
 }
 
 fn is_llm_host(host: &str) -> bool {
+    let host = telemetry_host(host);
     LLM_HOSTS
         .iter()
         .any(|known| host == *known || host.ends_with(&format!(".{known}")))
@@ -1566,7 +1571,9 @@ mod tests {
     #[test]
     fn llm_host_matches_domain_and_subdomain() {
         assert!(is_llm_host("api.openai.com"));
+        assert!(is_llm_host("api.openai.com:443"));
         assert!(is_llm_host("eu.api.openai.com"));
+        assert!(is_llm_host("eu.api.openai.com:443"));
         assert!(!is_llm_host("example.com"));
         assert!(!is_llm_host("notapi.openai.com.evil.com"));
     }
@@ -2224,8 +2231,9 @@ mod tests {
         );
         let request = Request::builder()
             .method("POST")
-            .uri("http://api.openai.com/v1/responses")
+            .uri("/v1/responses")
             .header(CONTENT_TYPE, "application/json")
+            .header(HOST, "api.openai.com:443")
             .header("authorization", "Bearer hil-secret://openai-prod")
             .body(Body::from(body.clone()))
             .expect("request");
@@ -2241,6 +2249,10 @@ mod tests {
         assert_eq!(drain_body(forwarded.into_body()).await.concat(), body);
 
         let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get("http.host").map(String::as_str),
+            Some("api.openai.com")
+        );
         assert_eq!(
             signal
                 .attributes
@@ -2300,7 +2312,8 @@ mod tests {
         let (mut handler, mut rx, _store) = handler();
         let request = Request::builder()
             .method("POST")
-            .uri("http://api.openai.com/v1/responses")
+            .uri("/v1/responses")
+            .header(HOST, "api.openai.com:443")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(Bytes::from_static(
                 br#"{"model":"gpt-5-codex","input":"hi"}"#,
