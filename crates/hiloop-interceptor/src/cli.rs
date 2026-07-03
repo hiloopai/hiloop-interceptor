@@ -227,6 +227,16 @@ struct RunArgs {
     )]
     export_flush_interval_ms: u64,
 
+    /// Environment variable names to record on the run's `process.start` event
+    /// (comma-separated, e.g. `PATH,HOME,PYTHONPATH`). Names only — values are
+    /// never captured.
+    #[arg(
+        long = "env-allowlist",
+        env = "HILOOP_ENV_ALLOWLIST",
+        value_delimiter = ','
+    )]
+    env_allowlist: Vec<String>,
+
     /// Print wrapper diagnostics to stderr.
     #[arg(long = "verbose")]
     verbose: bool,
@@ -289,7 +299,8 @@ impl RunArgs {
         .with_redaction(redaction)
         .with_egress(egress)
         .with_anomaly_detection(anomaly)
-        .with_verbose_diagnostics(self.verbose);
+        .with_verbose_diagnostics(self.verbose)
+        .with_env_allowlist(self.env_allowlist);
 
         if !self.secret_binding.is_empty() {
             let url = self

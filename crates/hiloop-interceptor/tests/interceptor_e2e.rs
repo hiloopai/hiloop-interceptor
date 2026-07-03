@@ -47,7 +47,7 @@ async fn capture_tees_mixed_stdio_and_links_raw_observations() {
     assert_eq!(output.stderr, b"err1\nerr-partial");
 
     let events = read_jsonl(&events_path);
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 6, "4 stdio lines + process.start/exit");
     for event in &events {
         assert_common_event_provenance(event, "preserve");
         assert!(
@@ -57,8 +57,14 @@ async fn capture_tees_mixed_stdio_and_links_raw_observations() {
                 .starts_with("raw-jsonl-")
         );
     }
+    let stdio_events = log_events(&events);
+    assert_eq!(stdio_events.len(), 4);
+    for event in &stdio_events {
+        assert_stdio_event(event);
+    }
+    assert_process_lifecycle(&events, 0);
 
-    let messages = events
+    let messages = stdio_events
         .iter()
         .map(|event| {
             (
@@ -84,7 +90,7 @@ async fn capture_tees_mixed_stdio_and_links_raw_observations() {
     );
 
     let raw_records = read_jsonl(&raw_path);
-    assert_eq!(raw_records.len(), 4);
+    assert_eq!(raw_records.len(), 6);
     let raw_ids = raw_records
         .iter()
         .map(|record| record["id"].as_str().expect("raw id"))
@@ -105,7 +111,14 @@ async fn capture_tees_mixed_stdio_and_links_raw_observations() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         raw_bodies,
-        BTreeSet::from(["ZXJyLXBhcnRpYWw=", "ZXJyMQ==", "b3V0MQ==", "cGFydGlhbA=="])
+        // The two process lifecycle observations carry empty bodies.
+        BTreeSet::from([
+            "",
+            "ZXJyLXBhcnRpYWw=",
+            "ZXJyMQ==",
+            "b3V0MQ==",
+            "cGFydGlhbA=="
+        ])
     );
 }
 
@@ -271,7 +284,11 @@ async fn capture_is_lossless_and_ordered_per_stream_under_load() {
     );
 
     let events = read_jsonl(&events_path);
-    assert_eq!(events.len(), LINE_COUNT * 2);
+    assert_eq!(
+        events.len(),
+        LINE_COUNT * 2 + 2,
+        "stdio + process.start/exit"
+    );
     assert_eq!(
         event_messages(&events, "stdout"),
         expected_lines("stdout", LINE_COUNT)
@@ -288,6 +305,10 @@ async fn capture_is_lossless_and_ordered_per_stream_under_load() {
                 .is_none()
         );
     }
+    for event in log_events(&events) {
+        assert_stdio_event(event);
+    }
+    assert_process_lifecycle(&events, 0);
 }
 
 #[tokio::test]
@@ -305,11 +326,13 @@ async fn capture_preserves_non_utf8_and_empty_lines() {
     assert!(output.stderr.is_empty());
 
     let events = read_jsonl(&events_path);
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0]["attributes"]["message_base64"], "/wBB");
-    assert_eq!(events[0]["attributes"]["message_encoding"], "base64");
-    assert!(events[0]["attributes"].get("message").is_none());
-    assert_eq!(events[1]["attributes"]["message"], "");
+    assert_eq!(events.len(), 4, "2 stdio lines + process.start/exit");
+    let stdio = log_events(&events);
+    assert_eq!(stdio.len(), 2);
+    assert_eq!(stdio[0]["attributes"]["message_base64"], "/wBB");
+    assert_eq!(stdio[0]["attributes"]["message_encoding"], "base64");
+    assert!(stdio[0]["attributes"].get("message").is_none());
+    assert_eq!(stdio[1]["attributes"]["message"], "");
 }
 
 #[tokio::test]
@@ -345,14 +368,123 @@ async fn capture_flushes_telemetry_before_returning_nonzero_child_exit() {
     assert_eq!(output.stdout, b"stdout-before-exit\n");
     assert_eq!(output.stderr, b"stderr-before-exit\n");
     let events = read_jsonl(&events_path);
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 4, "2 stdio lines + process.start/exit");
     assert_eq!(
         events
             .iter()
             .map(|event| event["name"].as_str().expect("event name"))
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["process.stderr", "process.stdout"])
+        BTreeSet::from([
+            "process.exit",
+            "process.start",
+            "process.stderr",
+            "process.stdout",
+        ])
     );
+    assert_process_lifecycle(&events, 23);
+}
+
+#[tokio::test]
+async fn process_start_leads_the_stream_and_records_the_env_allowlist() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let mut command = interceptor_command();
+    command
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--env-allowlist")
+        .arg("PATH,HOME");
+    append_mock_harness(&mut command, "mixed", &[]);
+
+    let output = run(command).await;
+
+    assert!(output.status.success());
+    let events = read_jsonl(&events_path);
+    assert_process_lifecycle(&events, 0);
+    assert_eq!(
+        events[0]["name"], "process.start",
+        "process.start opens the run's event stream"
+    );
+
+    let start = &events[0];
+    assert_eq!(start["attributes"]["process.env_allowlist"], "PATH,HOME");
+    // Process identity arrives via the shared provenance pass.
+    assert!(
+        start["attributes"][provenance_keys::PROCESS_PID]
+            .as_i64()
+            .expect("process pid")
+            > 0
+    );
+    let argv = serde_json::from_str::<Vec<String>>(
+        start["attributes"][provenance_keys::PROCESS_ARGV]
+            .as_str()
+            .expect("process argv"),
+    )
+    .expect("process argv json");
+    assert_eq!(argv[0], "sh");
+    assert!(start["attributes"][provenance_keys::PROCESS_CWD].is_string());
+
+    // Without the flag the attribute is omitted (names are opt-in; values never captured).
+    let bare_events_path = temp.path().join("bare-events.jsonl");
+    let mut bare = interceptor_command();
+    bare.arg("--events-jsonl").arg(&bare_events_path);
+    append_mock_harness(&mut bare, "mixed", &[]);
+    assert!(run(bare).await.status.success());
+    let bare_start = read_jsonl(&bare_events_path)
+        .into_iter()
+        .find(|event| event["name"] == "process.start")
+        .expect("process.start event");
+    assert!(
+        bare_start["attributes"]
+            .get("process.env_allowlist")
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn captures_forwarded_signal_as_a_process_signal_event() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let started = temp.path().join("started");
+    let terminated = temp.path().join("terminated");
+
+    let mut command = interceptor_command();
+    command.arg("--events-jsonl").arg(&events_path);
+    append_mock_harness(
+        &mut command,
+        "trap",
+        &[
+            started.to_str().expect("started path"),
+            terminated.to_str().expect("terminated path"),
+        ],
+    );
+    let mut child = command.spawn().expect("spawn interceptor");
+    wait_for_path(&started).await;
+
+    let pid =
+        i32::try_from(child.id().expect("interceptor pid")).expect("interceptor pid fits i32");
+    kill(Pid::from_raw(pid), Signal::SIGTERM).expect("send SIGTERM to interceptor");
+
+    let status = tokio::time::timeout(E2E_TIMEOUT, child.wait())
+        .await
+        .expect("interceptor should exit after SIGTERM")
+        .expect("wait interceptor");
+    assert_eq!(status.code(), Some(143));
+
+    let events = read_jsonl(&events_path);
+    let signal_event = events
+        .iter()
+        .find(|event| event["name"] == "process.signal")
+        .expect("process.signal event");
+    assert_eq!(signal_event["signal"], "exec");
+    assert_eq!(signal_event["attributes"]["signal"], "SIGTERM");
+    // The harness's trap handler exits 143 itself, so this is a normal
+    // (non-signal) child exit carrying the conventional 128 + SIGTERM code.
+    assert_process_lifecycle(&events, 143);
 }
 
 #[tokio::test]
@@ -428,7 +560,7 @@ async fn inspect_summarizes_captured_events() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(
-        stdout.contains("4 events across 1 run lineage path(s)"),
+        stdout.contains("6 events across 1 run lineage path(s)"),
         "summary header missing: {stdout}"
     );
     assert!(
@@ -438,6 +570,14 @@ async fn inspect_summarizes_captured_events() {
     assert!(
         stdout.contains("process.stderr: 2"),
         "stderr count: {stdout}"
+    );
+    assert!(
+        stdout.contains("process.start: 1"),
+        "process.start count: {stdout}"
+    );
+    assert!(
+        stdout.contains("process.exit: 1"),
+        "process.exit count: {stdout}"
     );
 }
 
@@ -759,11 +899,54 @@ fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
         .collect()
 }
 
+/// The stdio (`signal == "log"`) subset of `events`, in file order.
+fn log_events(events: &[Value]) -> Vec<&Value> {
+    events
+        .iter()
+        .filter(|event| event["signal"] == "log")
+        .collect()
+}
+
+fn assert_stdio_event(event: &Value) {
+    assert_eq!(event["signal"], "log");
+    assert_eq!(event["attributes"]["source"], "stdio");
+}
+
+/// Assert exactly one `process.start` and one `process.exit` event, the latter
+/// carrying `exit_code` and a non-negative duration.
+fn assert_process_lifecycle(events: &[Value], exit_code: i64) {
+    let starts = events
+        .iter()
+        .filter(|event| event["name"] == "process.start")
+        .collect::<Vec<_>>();
+    let [start] = starts.as_slice() else {
+        panic!("expected exactly one process.start, got {starts:?}");
+    };
+    assert_eq!(start["signal"], "exec");
+
+    let exits = events
+        .iter()
+        .filter(|event| event["name"] == "process.exit")
+        .collect::<Vec<_>>();
+    let [exit] = exits.as_slice() else {
+        panic!("expected exactly one process.exit, got {exits:?}");
+    };
+    assert_eq!(exit["signal"], "exec");
+    assert_eq!(
+        exit["attributes"]["process.exit_code"].as_i64(),
+        Some(exit_code)
+    );
+    assert!(
+        exit["attributes"]["process.duration_ms"]
+            .as_i64()
+            .expect("process.duration_ms")
+            >= 0
+    );
+}
+
 fn assert_common_event_provenance(event: &Value, raw_retention: &str) {
     assert_eq!(event["run_id"], RUN_ID);
     assert_eq!(event["lineage_path"], LINEAGE_PATH);
-    assert_eq!(event["signal"], "log");
-    assert_eq!(event["attributes"]["source"], "stdio");
     assert_eq!(
         event["attributes"][provenance_keys::RAW_RETENTION],
         raw_retention

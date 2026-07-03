@@ -10,6 +10,12 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- Process-boundary lifecycle events on the `exec` signal (previously declared but never emitted):
+  every captured run now records `process.start` at spawn, `process.exit` with the child's exit byte
+  and wall-clock duration (plus `process.term_signal` when the child was signal-killed), and one
+  `process.signal` per forwarded terminating signal. A new `--env-allowlist` flag (or
+  `RunOptions::with_env_allowlist`) records the listed environment variable *names* on
+  `process.start` — values are never captured.
 - Egress policy enforcement for intercepted HTTP(S) traffic (`--egress-mode allow|deny` with
   repeatable `--egress-domain` / `--egress-cidr` rules, and the `RunOptions::with_egress` builder).
   Hosts are canonicalized (control-char/percent/userinfo rejection, IDNA→punycode, IP-literal

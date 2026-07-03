@@ -3,6 +3,7 @@
 pub mod anomaly;
 pub mod blob;
 pub mod egress;
+pub mod exec_events;
 pub mod exporters;
 pub mod framing;
 pub mod grpc_export;
