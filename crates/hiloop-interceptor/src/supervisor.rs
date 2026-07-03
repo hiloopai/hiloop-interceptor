@@ -68,18 +68,17 @@ const SYSTEM_CA_BUNDLE_CANDIDATES: &[&str] = &[
 /// Read the OS public-root CA bundle the wrapped child would otherwise trust, honoring
 /// an explicit `SSL_CERT_FILE` first, then the well-known paths. `None` if none exist.
 fn read_system_ca_roots() -> Option<Vec<u8>> {
-    if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
-        if let Ok(bytes) = std::fs::read(&path) {
-            if !bytes.is_empty() {
-                return Some(bytes);
-            }
-        }
+    if let Some(path) = std::env::var_os("SSL_CERT_FILE")
+        && let Ok(bytes) = std::fs::read(&path)
+        && !bytes.is_empty()
+    {
+        return Some(bytes);
     }
     for candidate in SYSTEM_CA_BUNDLE_CANDIDATES {
-        if let Ok(bytes) = std::fs::read(candidate) {
-            if !bytes.is_empty() {
-                return Some(bytes);
-            }
+        if let Ok(bytes) = std::fs::read(candidate)
+            && !bytes.is_empty()
+        {
+            return Some(bytes);
         }
     }
     None
