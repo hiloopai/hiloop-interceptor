@@ -86,7 +86,8 @@ struct RunArgs {
     /// Directory for the content-addressed blob store the proxy streams bodies to.
     /// Created if absent. Required by `--proxy` unless `--export-grpc` is set, in
     /// which case captured bodies default to a per-run scratch store that is uploaded
-    /// to the gateway and removed at run end.
+    /// to the gateway and removed once every blob has shipped (kept, and reported,
+    /// if any upload fails).
     #[arg(long = "blob-dir", env = "HILOOP_BLOB_DIR")]
     blob_dir: Option<PathBuf>,
 

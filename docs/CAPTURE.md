@@ -225,9 +225,10 @@ those are uploaded as chunked client-streams (1 MiB frames, ≤ 64 MiB per blob)
 re-hashes before storing, so a corrupt or mislabeled upload is rejected, and re-running against
 already-present content sends nothing. Without a gRPC export (`--events-jsonl` only) blobs stay
 local in `--blob-dir` (`NoopUploader`, the standalone/air-gapped default); with a gRPC export and
-no `--blob-dir`, bodies stage in a per-run scratch store that is removed after the upload. The
-drain is best-effort like the rest of telemetry: a failure is a stderr warning, never the child's
-exit code. Capture size is bounded by `--max-capture-bytes` (default 8 MiB, `0` for unlimited):
+no `--blob-dir`, bodies stage in a per-run scratch store that is removed once every blob has
+shipped — an incomplete drain (upload failure, over-cap blob) keeps the store and names its path
+in the warning, so captured bodies are never silently destroyed. The drain is best-effort like
+the rest of telemetry: a failure is a stderr warning, never the child's exit code. Capture size is bounded by `--max-capture-bytes` (default 8 MiB, `0` for unlimited):
 bodies over the cap are captured up to it, marked `http.capture.truncated`, and still forwarded in
 full to the client.
 
