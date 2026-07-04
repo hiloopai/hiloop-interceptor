@@ -703,9 +703,6 @@ where
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            // Full capture includes failed attempts: no process ever started, so the
-            // attempt itself is the recorded fact — without it the run's timeline would
-            // be empty and the failure reconstructable only from wrapper stderr.
             let event = spawn_failure_event(options, clock.tick(), &error);
             if let Err(warning) = export_supervisor_record(exporter, event, "spawn-failure").await {
                 eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
