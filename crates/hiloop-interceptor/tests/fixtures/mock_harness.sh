@@ -80,6 +80,22 @@ case "$mode" in
         command -v curl >/dev/null 2>&1 || { printf 'curl not found\n' >&2; exit 69; }
         curl -s -o /dev/null --max-time 5 "$url" || true
         ;;
+    proxy-http-hang)
+        # Like `proxy-http`, then linger: fetch the URL, mark completion, and stay
+        # alive (bounded, so a hard-killed wrapper cannot leak it forever) while a
+        # test kills the wrapper mid-run.
+        url="${1:?proxy-http-hang requires a url}"
+        marker="${2:?proxy-http-hang requires a marker path}"
+        : "${HTTP_PROXY:?proxy-http-hang mode needs HTTP_PROXY}"
+        command -v curl >/dev/null 2>&1 || { printf 'curl not found\n' >&2; exit 69; }
+        curl -s -o /dev/null --max-time 5 "$url" || true
+        : > "$marker"
+        index=0
+        while [ "$index" -lt 300 ]; do
+            sleep 0.1
+            index=$((index + 1))
+        done
+        ;;
     *)
         printf 'unknown mock harness mode: %s\n' "$mode" >&2
         exit 64

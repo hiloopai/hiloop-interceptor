@@ -1,14 +1,15 @@
 //! End-to-end round trip for the gRPC blob uploader: stand up an in-process
 //! `TelemetryBlobService` that mirrors the gateway's production contract (digest-first `HasBlobs`,
 //! client-streaming `UploadBlob` with first-frame identity and verify-before-store), then drive it
-//! through `GrpcBlobUploader` and `DirBlobStore::upload_missing` — exercising the generated client,
-//! the chunked frame protocol, and the dedup probe.
+//! through `GrpcBlobUploader` and `BlobDrainer` — exercising the generated client, the chunked
+//! frame protocol, and the dedup probe.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use hiloop_core::event::PayloadDigest;
 use hiloop_interceptor::blob::{BlobStore, BlobUploader, DirBlobStore};
+use hiloop_interceptor::blob_drain::{BlobDrainer, DrainRetryPolicy};
 use hiloop_interceptor::blob_upload::GrpcBlobUploader;
 use hiloop_interceptor::grpc_client::proto::telemetry_blob_service_server::{
     TelemetryBlobService, TelemetryBlobServiceServer,
@@ -271,7 +272,7 @@ async fn stored_size_mismatch_is_an_error() {
 #[tokio::test]
 async fn dir_store_drains_only_missing_blobs_to_the_gateway() {
     // The production shape end to end: bodies land in a DirBlobStore during capture, then
-    // upload_missing ships exactly what the gateway lacks.
+    // the drainer ships exactly what the gateway lacks.
     let temp = tempfile::tempdir().expect("tempdir");
     let store = DirBlobStore::create(temp.path())
         .await
@@ -288,11 +289,15 @@ async fn dir_store_drains_only_missing_blobs_to_the_gateway() {
     let endpoint = serve(service).await;
     let uploader = GrpcBlobUploader::connect(endpoint, None, true).expect("connect");
 
-    let report = store.upload_missing(&uploader).await.expect("drain");
+    let outcome = BlobDrainer::new(store, Arc::new(uploader))
+        .finish(&DrainRetryPolicy::default())
+        .await;
 
-    assert_eq!(report.found, 2);
-    assert_eq!(report.uploaded, 1);
-    assert_eq!(report.oversize_skipped, 0);
+    assert!(outcome.is_complete(), "outcome: {outcome:?}");
+    assert_eq!(outcome.report.found, 2);
+    assert_eq!(outcome.report.landed, 2);
+    assert_eq!(outcome.report.uploaded, 1);
+    assert_eq!(outcome.report.oversize_skipped, 0);
     let rec = recorded.lock().expect("lock");
     assert_eq!(rec.uploads.len(), 1);
     assert_eq!(rec.uploads[0].digest, fresh.as_str());

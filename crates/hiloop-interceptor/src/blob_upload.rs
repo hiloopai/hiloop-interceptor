@@ -23,6 +23,14 @@ const STORE_NAME: &str = "grpc-blob";
 /// message cap and tonic's 4 MiB default, so a frame never trips a transport limit.
 const UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
 
+/// Deadline on one `HasBlobs` probe. The channel itself has no timeout, and a black-holed
+/// gateway would otherwise hang the run-end drain (and with it the wrapper's exit) forever.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Deadline on one `UploadBlob` stream — generous enough for a cap-sized (64 MiB) blob on a
+/// slow link, small enough that a wedged transfer cannot hang the drain unbounded.
+const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
 type AuthedClient = TelemetryBlobServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 
 /// Uploads content-addressed payload blobs to a telemetry gateway.
@@ -69,15 +77,21 @@ impl BlobUploader for GrpcBlobUploader {
             return Ok(Vec::new());
         }
         let mut client = self.client.clone();
-        let response = client
-            .has_blobs(Request::new(HasBlobsRequest {
-                digests: digests
-                    .iter()
-                    .map(|digest| digest.as_str().to_owned())
-                    .collect(),
-                tenant_id: self.tenant_wire_value(),
-            }))
+        let request = Request::new(HasBlobsRequest {
+            digests: digests
+                .iter()
+                .map(|digest| digest.as_str().to_owned())
+                .collect(),
+            tenant_id: self.tenant_wire_value(),
+        });
+        let response = tokio::time::timeout(PROBE_TIMEOUT, client.has_blobs(request))
             .await
+            .map_err(|_elapsed| {
+                BlobStoreError::other(
+                    STORE_NAME,
+                    format!("blob probe timed out after {}s", PROBE_TIMEOUT.as_secs()),
+                )
+            })?
             .map_err(|status| {
                 BlobStoreError::other(
                     STORE_NAME,
@@ -121,20 +135,31 @@ impl BlobUploader for GrpcBlobUploader {
         }
         let frames = upload_frames(digest, &self.tenant_wire_value(), bytes);
         let mut client = self.client.clone();
-        let stored = client
-            .upload_blob(tokio_stream::iter(frames))
-            .await
-            .map_err(|status| {
-                BlobStoreError::other(
-                    STORE_NAME,
-                    format!(
-                        "blob upload of {digest} rejected: {}",
-                        fold_status_message(&status)
-                    ),
-                )
-            })?
-            .into_inner()
-            .size_bytes;
+        let stored = tokio::time::timeout(
+            UPLOAD_TIMEOUT,
+            client.upload_blob(tokio_stream::iter(frames)),
+        )
+        .await
+        .map_err(|_elapsed| {
+            BlobStoreError::other(
+                STORE_NAME,
+                format!(
+                    "blob upload of {digest} timed out after {}s",
+                    UPLOAD_TIMEOUT.as_secs()
+                ),
+            )
+        })?
+        .map_err(|status| {
+            BlobStoreError::other(
+                STORE_NAME,
+                format!(
+                    "blob upload of {digest} rejected: {}",
+                    fold_status_message(&status)
+                ),
+            )
+        })?
+        .into_inner()
+        .size_bytes;
         if stored != size {
             return Err(BlobStoreError::other(
                 STORE_NAME,

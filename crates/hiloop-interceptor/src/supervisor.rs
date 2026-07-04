@@ -6,7 +6,8 @@
 
 use crate::{
     anomaly::AnomalyConfig,
-    blob::DirBlobStore,
+    blob::{BlobUploader, DirBlobStore, UnavailableUploader},
+    blob_drain::{BlobDrainOutcome, BlobDrainer, DrainRetryPolicy},
     blob_upload::GrpcBlobUploader,
     egress::EgressPolicy,
     exec_events::{ExecLifecycleEmitter, ExecLifecycleNormalizer},
@@ -30,8 +31,8 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use hiloop_core::{
-    event::{AttributeKey, AttributeValue, Attributes},
-    identity::RunContext,
+    event::{AttributeKey, AttributeValue, Attributes, Event, EventName, SignalType},
+    identity::{Hlc, RunContext},
 };
 use std::{
     ffi::OsString,
@@ -54,6 +55,29 @@ const MAX_STDIO_LINE_BYTES: usize = 64 * 1024;
 const OTEL_RUN_ID: &str = "hiloop.run.id";
 const OTEL_LINEAGE_PATH: &str = "hiloop.run.lineage_path";
 const OTEL_EXECUTION_ID: &str = "hiloop.execution.id";
+
+/// Default cadence of the incremental blob drain — the event pipeline's flush default, so
+/// captured bodies are roughly as durable as the events referencing them: a run killed
+/// without grace loses at most the last interval's blobs.
+const DEFAULT_BLOB_DRAIN_INTERVAL: Duration = DEFAULT_EXPORT_FLUSH_INTERVAL;
+
+/// Bound on exporting the run-end capture-health event: it shares the drain's best-effort
+/// contract and must never hang the wrapper's exit.
+const CAPTURE_HEALTH_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Event name of the run-end capture-health record.
+const CAPTURE_DRAIN_EVENT: &str = "capture.drain";
+
+/// Attribute keys of the `capture.drain` health record.
+mod capture_keys {
+    pub(super) const FOUND: &str = "capture.blobs.found";
+    pub(super) const LANDED: &str = "capture.blobs.landed";
+    pub(super) const MISSING: &str = "capture.blobs.missing";
+    pub(super) const OVERSIZE: &str = "capture.blobs.oversize";
+    pub(super) const MISSING_BYTES: &str = "capture.blobs.missing_bytes";
+    pub(super) const COMPLETE: &str = "capture.complete";
+    pub(super) const ERROR: &str = "capture.error";
+}
 
 /// Locations of the OS public-root CA bundle, most-common first. The wrapped child
 /// would normally trust these; the interception bundle must *preserve* that trust,
@@ -137,6 +161,8 @@ pub struct RunOptions {
     export_grpc: Option<GrpcExportOptions>,
     export_batch_size: usize,
     export_flush_interval: Option<Duration>,
+    blob_drain_interval: Duration,
+    blob_drain_retry: DrainRetryPolicy,
     attributes: Attributes,
     redaction: RedactionPolicy,
     egress: EgressPolicy,
@@ -161,8 +187,9 @@ impl RunOptions {
     /// unlimited — prefer a finite cap such as [`crate::proxy::DEFAULT_MAX_CAPTURE_BYTES`]
     /// so a large body can't OOM the wrapper; forwarding to the origin is never capped),
     /// and `export_grpc` streams events to a telemetry gateway and, when the proxy is
-    /// capturing, uploads the captured payload blobs there at run end (digest-first
-    /// dedup). Invariants between these are validated by [`run`], not here.
+    /// capturing, uploads the captured payload blobs there both during the run and in a
+    /// retried run-end drain (digest-first dedup), reporting the outcome as a
+    /// `capture.drain` event. Invariants between these are validated by [`run`], not here.
     #[expect(
         clippy::too_many_arguments,
         reason = "public, embeddable run config; the flat constructor mirrors the CLI's RunArgs 1:1 — a builder is deferred while there is a single in-tree caller"
@@ -191,6 +218,8 @@ impl RunOptions {
             export_grpc,
             export_batch_size: DEFAULT_EXPORT_BATCH_SIZE,
             export_flush_interval: Some(DEFAULT_EXPORT_FLUSH_INTERVAL),
+            blob_drain_interval: DEFAULT_BLOB_DRAIN_INTERVAL,
+            blob_drain_retry: DrainRetryPolicy::default(),
             attributes: Attributes::new(),
             redaction: RedactionPolicy::default(),
             egress: EgressPolicy::default(),
@@ -259,6 +288,23 @@ impl RunOptions {
     #[must_use]
     pub fn with_export_batch_size(mut self, size: usize) -> Self {
         self.export_batch_size = size.max(1);
+        self
+    }
+
+    /// Override the incremental blob drain cadence. Captured payload blobs are shipped to
+    /// the gateway on this interval while the run is alive (idle intervals cost no RPC), so
+    /// a run killed without grace loses at most the last interval's blobs. A zero duration
+    /// disables the incremental drain; the run-end drain still runs.
+    #[must_use]
+    pub fn with_blob_drain_interval(mut self, interval: Duration) -> Self {
+        self.blob_drain_interval = interval;
+        self
+    }
+
+    /// Override the run-end blob drain's bounded retry schedule.
+    #[must_use]
+    pub fn with_blob_drain_retry(mut self, policy: DrainRetryPolicy) -> Self {
+        self.blob_drain_retry = policy;
         self
     }
 
@@ -743,8 +789,28 @@ where
         ),
         _ => None,
     };
-    // The proxy consumes the store handle; keep one for the post-run blob upload.
-    let drain_blob_store = blob_store.clone();
+    // The proxy consumes the store handle; the drainer keeps its own clone for the
+    // incremental and run-end uploads. A gateway client that cannot even be configured
+    // still gets a drainer (over an always-failing uploader), so run-end accounting
+    // reports the loss instead of skipping silently.
+    let blob_drainer = match (&blob_store, &options.export_grpc) {
+        (Some(store), Some(grpc)) => {
+            let uploader: Arc<dyn BlobUploader> = match GrpcBlobUploader::connect(
+                &grpc.endpoint,
+                grpc.tenant_id.clone(),
+                grpc.insecure,
+            ) {
+                Ok(uploader) => Arc::new(uploader),
+                Err(error) => Arc::new(UnavailableUploader::new(format!(
+                    "failed to build the blob uploader for `{}`: {:#}",
+                    grpc.endpoint,
+                    anyhow::Error::new(error)
+                ))),
+            };
+            Some(BlobDrainer::new(store.as_ref().clone(), uploader))
+        }
+        _ => None,
+    };
     let (proxy_shutdown_tx, proxy_server_task) = match (proxy_server, proxy_ca, blob_store) {
         (Some(server), Some(ca), Some(blob_store)) => {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -767,6 +833,44 @@ where
     };
     drop(signal_tx);
 
+    // Incremental blob drain: ship captured bodies while the run is still alive, so a
+    // process killed without grace loses at most the last interval's blobs. Pass errors are
+    // expected while the gateway is unreachable — the next pass (or the authoritative
+    // run-end drain below) retries. The task hands the drainer back so run-end accounting
+    // continues from the same landed set.
+    let (drain_stop_tx, mut drain_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let drain_task = blob_drainer.map(|mut drainer| {
+        let interval = options.blob_drain_interval;
+        let verbose = options.verbose_diagnostics;
+        tokio::spawn(async move {
+            // A zero interval disables the incremental drain (the run-end drain still
+            // runs) — and `tokio::time::interval` panics on a zero period.
+            if interval.is_zero() {
+                let _ = (&mut drain_stop_rx).await;
+                return drainer;
+            }
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // An interval's first tick fires immediately; skip it so passes start one
+            // interval in.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = &mut drain_stop_rx => break,
+                    _ = ticker.tick() => {
+                        let outcome = drainer.pass().await;
+                        if verbose && let Some(error) = &outcome.error {
+                            eprintln!(
+                                "hiloop-interceptor: blob drain pass failed (will retry): {error}"
+                            );
+                        }
+                    }
+                }
+            }
+            drainer
+        })
+    });
+
     let stdio_normalizer = StdioLogNormalizer;
     let exec_normalizer = ExecLifecycleNormalizer;
     let otlp_normalizer = OtlpTraceNormalizer;
@@ -783,6 +887,9 @@ where
     let normalization_context = NormalizationContext::new(options.context.clone())
         .with_attributes(options.attributes.clone())
         .with_process(process);
+    // The pipeline consumes the context; the run-end capture-health event reuses a clone so
+    // it carries the same run identity and static attributes as every captured event.
+    let health_context = normalization_context.clone();
     let stream = tokio_stream::wrappers::ReceiverStream::new(signal_rx);
     let mut pipeline_builder =
         Pipeline::with_router(normalization_context, router, exporter).options(options_pipeline);
@@ -810,10 +917,11 @@ where
                 .await;
         }
         // Release the lifecycle sender, then stop the stdin pump (its source may
-        // never EOF) and the capture servers; dropping their senders lets the
-        // pipeline drain and finish.
+        // never EOF), the incremental blob drain, and the capture servers; dropping
+        // their senders lets the pipeline drain and finish.
         drop(exec_emitter);
         let _ = stdin_shutdown_tx.send(());
+        let _ = drain_stop_tx.send(());
         for shutdown_tx in [otlp_shutdown_tx, proxy_shutdown_tx].into_iter().flatten() {
             let _ = shutdown_tx.send(());
         }
@@ -863,29 +971,50 @@ where
     .filter_map(Result::err)
     .collect();
 
-    // Ship captured payload blobs to the gateway the events went to, best-effort like the rest
-    // of the drain. An incomplete drain keeps the scratch store: deleting it would destroy the
-    // only bytes behind already-exported payload_ref digests.
-    if let (Some(store), Some(grpc)) = (&drain_blob_store, &options.export_grpc) {
-        let incomplete = match upload_captured_blobs(store, grpc, options.verbose_diagnostics).await
-        {
-            Ok(report) if report.oversize_skipped > 0 => Some(anyhow::anyhow!(
-                "{} captured payload blob(s) exceed the upload cap and stayed local",
-                report.oversize_skipped
-            )),
-            Ok(_) => None,
-            Err(warning) => Some(warning),
-        };
-        if let Some(warning) = incomplete {
-            let warning = match scratch_blob_dir.take() {
-                // `keep` disables the TempDir's deletion; the bytes survive for recovery.
-                Some(scratch) => warning.context(format!(
-                    "captured payload blobs kept at `{}`",
-                    scratch.keep().display()
-                )),
-                None => warning,
-            };
-            drain_warnings.push(warning);
+    // Run-end blob drain + capture-health record, best-effort like the rest of the drain.
+    // The authoritative final pass re-probes every digest against the gateway and retries
+    // with bounded backoff (the child has exited, so the budget caps exit latency, not
+    // capture). Its outcome ships as a `capture.drain` event so a run whose payload bodies
+    // never landed is *queryably* incomplete — and a captured run with no `capture.drain`
+    // event at all is one whose wrapper died before draining. An incomplete drain keeps the
+    // scratch store: deleting it would destroy the only bytes behind already-exported
+    // payload_ref digests.
+    if let Some(task) = drain_task {
+        match task.await {
+            Ok(drainer) => {
+                let outcome = drainer.finish(&options.blob_drain_retry).await;
+                if options.verbose_diagnostics {
+                    let report = outcome.report;
+                    eprintln!(
+                        "hiloop-interceptor: payload blob drain: {} found, {} landed ({} uploaded this run), {} missing, {} oversize",
+                        report.found,
+                        report.landed,
+                        report.uploaded,
+                        report.missing,
+                        report.oversize_skipped
+                    );
+                }
+                let health_event = capture_drain_event(&health_context, clock.tick(), &outcome);
+                if let Err(warning) = export_capture_health(exporter, health_event).await {
+                    drain_warnings.push(warning);
+                }
+                if let Some(warning) = drain_problem(outcome) {
+                    let warning = match scratch_blob_dir.take() {
+                        // `keep` disables the TempDir's deletion; the bytes survive for
+                        // recovery.
+                        Some(scratch) => warning.context(format!(
+                            "captured payload blobs kept at `{}`",
+                            scratch.keep().display()
+                        )),
+                        None => warning,
+                    };
+                    drain_warnings.push(warning);
+                }
+            }
+            Err(join_error) => {
+                drain_warnings
+                    .push(anyhow::Error::new(join_error).context("blob drain task failed"));
+            }
         }
     }
     drop(scratch_blob_dir);
@@ -896,28 +1025,115 @@ where
     })
 }
 
-/// Upload the run's captured payload blobs to the gateway's blob service, reusing the event
-/// export's endpoint, TLS, and Bearer auth.
-async fn upload_captured_blobs(
-    store: &DirBlobStore,
-    grpc: &GrpcExportOptions,
-    verbose: bool,
-) -> Result<crate::blob::BlobUploadReport> {
-    let uploader = GrpcBlobUploader::connect(&grpc.endpoint, grpc.tenant_id.clone(), grpc.insecure)
-        .with_context(|| format!("failed to build the blob uploader for `{}`", grpc.endpoint))?;
-    let report = store
-        .upload_missing(&uploader)
-        .await
-        .context("failed to upload captured payload blobs")?;
-    if verbose {
-        eprintln!(
-            "hiloop-interceptor: uploaded {} of {} captured payload blobs ({} already present)",
-            report.uploaded,
-            report.found,
-            report.found - report.uploaded - report.oversize_skipped
+/// Render an incomplete or lossy drain outcome as the run's drain warning, or `None` when
+/// every uploadable blob landed and nothing stayed local.
+fn drain_problem(outcome: BlobDrainOutcome) -> Option<anyhow::Error> {
+    let complete = outcome.is_complete();
+    let BlobDrainOutcome { report, error } = outcome;
+    if !complete {
+        let message = format!(
+            "{} of {} captured payload blob(s) failed to land at the gateway",
+            report.missing, report.found
+        );
+        return Some(match error {
+            Some(error) => anyhow::Error::new(error).context(message),
+            None => anyhow::anyhow!(message),
+        });
+    }
+    if report.oversize_skipped > 0 {
+        return Some(anyhow::anyhow!(
+            "{} captured payload blob(s) exceed the upload cap and stayed local",
+            report.oversize_skipped
+        ));
+    }
+    None
+}
+
+/// Build the run-end capture-health event: one `log`-signal record per captured run stating
+/// whether every captured payload blob landed on the gateway, stamped with the same run
+/// identity and static attributes as the run's captured events.
+fn capture_drain_event(
+    context: &NormalizationContext,
+    ts: Hlc,
+    outcome: &BlobDrainOutcome,
+) -> Event {
+    let report = outcome.report;
+    let mut event = Event::new(
+        context.run_context(),
+        ts,
+        SignalType::Log,
+        EventName::from_static(CAPTURE_DRAIN_EVENT),
+    );
+    for (key, value) in context.attributes() {
+        event = event.with_attribute(key.clone(), value.clone());
+    }
+    event = event
+        .with_attribute(
+            AttributeKey::from_static(provenance_keys::WRAPPER_NAME),
+            context.wrapper.name,
+        )
+        .with_attribute(
+            AttributeKey::from_static(provenance_keys::WRAPPER_VERSION),
+            context.wrapper.version,
+        )
+        .with_attribute(
+            AttributeKey::from_static(capture_keys::FOUND),
+            count_attr(report.found),
+        )
+        .with_attribute(
+            AttributeKey::from_static(capture_keys::LANDED),
+            count_attr(report.landed),
+        )
+        .with_attribute(
+            AttributeKey::from_static(capture_keys::MISSING),
+            count_attr(report.missing),
+        )
+        .with_attribute(
+            AttributeKey::from_static(capture_keys::OVERSIZE),
+            count_attr(report.oversize_skipped),
+        )
+        .with_attribute(
+            AttributeKey::from_static(capture_keys::MISSING_BYTES),
+            i64::try_from(report.missing_bytes).unwrap_or(i64::MAX),
+        )
+        .with_attribute(
+            AttributeKey::from_static(capture_keys::COMPLETE),
+            outcome.is_complete(),
+        );
+    if let Some(error) = &outcome.error {
+        event = event.with_attribute(
+            AttributeKey::from_static(capture_keys::ERROR),
+            error.to_string(),
         );
     }
-    Ok(report)
+    event
+}
+
+fn count_attr(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Export the capture-health event within a hard deadline: like every post-exit step it is
+/// best-effort and must never hang the wrapper's exit.
+async fn export_capture_health<E: Exporter>(exporter: &E, event: Event) -> Result<()> {
+    match tokio::time::timeout(CAPTURE_HEALTH_EXPORT_TIMEOUT, async {
+        exporter
+            .export(std::slice::from_ref(&event))
+            .await
+            .context("failed to export the capture-health event")?;
+        exporter
+            .flush()
+            .await
+            .context("failed to flush the capture-health event")
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => bail!(
+            "capture-health export timed out after {}s",
+            CAPTURE_HEALTH_EXPORT_TIMEOUT.as_secs()
+        ),
+    }
 }
 
 fn child_process_context(options: &RunOptions, pid: Option<u32>) -> ProcessContext {
@@ -2145,7 +2361,42 @@ mod tests {
                 tenant_id: None,
                 project_id: "default".to_owned(),
             }),
-        );
+        )
+        .with_blob_drain_retry(DrainRetryPolicy {
+            attempts: 1,
+            initial_backoff: Duration::from_millis(1),
+        });
+
+        let code = run(&options).await.expect("run should complete");
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(0)));
+    }
+
+    #[tokio::test]
+    async fn zero_blob_drain_interval_disables_the_incremental_drain_without_panicking() {
+        // `tokio::time::interval` panics on a zero period; a zero cadence must instead mean
+        // "no incremental drain" while the run-end drain still executes.
+        let options = RunOptions::new(
+            RunContext::new_local_root(),
+            vec!["true".to_owned()],
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            Some(GrpcExportOptions {
+                endpoint: "http://127.0.0.1:9".to_owned(),
+                insecure: true,
+                tenant_id: None,
+                project_id: "default".to_owned(),
+            }),
+        )
+        .with_blob_drain_interval(Duration::ZERO)
+        .with_blob_drain_retry(DrainRetryPolicy {
+            attempts: 1,
+            initial_backoff: Duration::from_millis(1),
+        });
 
         let code = run(&options).await.expect("run should complete");
 

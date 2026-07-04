@@ -193,7 +193,7 @@ impl BlobWriter for DirBlobWriter {
 }
 
 /// Cap on one uploadable blob's size (64 MiB) — the backend's per-blob upload limit. A larger
-/// blob stays local: [`DirBlobStore::upload_missing`] skips it (reported, never silent) and
+/// blob stays local: [`crate::blob_drain::BlobDrainer`] skips it (reported, never silent) and
 /// uploader implementations reject it before sending.
 pub const MAX_UPLOAD_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -237,42 +237,51 @@ impl BlobUploader for NoopUploader {
     }
 }
 
-/// Outcome of shipping a blob store's contents to an uploader.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct BlobUploadReport {
-    /// Content-addressed blobs found in the store.
-    pub found: usize,
-    /// Blobs the backend was missing that were uploaded.
-    pub uploaded: usize,
-    /// Blobs skipped because they exceed [`MAX_UPLOAD_BLOB_BYTES`]; they stay local only.
-    pub oversize_skipped: usize,
+/// Stand-in when a real uploader could not be configured: every call fails with the
+/// configuration error, so drain accounting reports the loss instead of skipping silently.
+#[derive(Debug, Clone)]
+pub struct UnavailableUploader {
+    reason: String,
+}
+
+impl UnavailableUploader {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl BlobUploader for UnavailableUploader {
+    async fn find_missing(
+        &self,
+        _digests: &[PayloadDigest],
+    ) -> Result<Vec<PayloadDigest>, BlobStoreError> {
+        Err(BlobStoreError::other("unavailable", self.reason.clone()))
+    }
+
+    async fn upload(&self, _digest: &PayloadDigest, _bytes: &[u8]) -> Result<(), BlobStoreError> {
+        Err(BlobStoreError::other("unavailable", self.reason.clone()))
+    }
+}
+
+/// One finalized content-addressed blob in a [`DirBlobStore`].
+#[derive(Debug, Clone)]
+pub struct FinalizedBlob {
+    pub digest: PayloadDigest,
+    pub path: PathBuf,
+    pub size_bytes: u64,
 }
 
 impl DirBlobStore {
-    /// Ship this store's blobs to `uploader`, skipping any the backend already has.
-    ///
-    /// Digest-first: one [`BlobUploader::find_missing`] probe over every finalized blob in the
-    /// dir (`blake3-<hex>` files; temp files are ignored), then one [`BlobUploader::upload`] per
-    /// missing digest, read one blob at a time so memory stays bounded by the largest blob. An
-    /// over-cap blob is counted in the report rather than attempted (the backend would reject
-    /// it); the first transport error aborts, since the remaining uploads share its fate.
-    pub async fn upload_missing(
-        &self,
-        uploader: &dyn BlobUploader,
-    ) -> Result<BlobUploadReport, BlobStoreError> {
-        self.upload_missing_capped(uploader, MAX_UPLOAD_BLOB_BYTES)
-            .await
-    }
-
-    async fn upload_missing_capped(
-        &self,
-        uploader: &dyn BlobUploader,
-        cap: u64,
-    ) -> Result<BlobUploadReport, BlobStoreError> {
+    /// List the store's finalized blobs (`blake3-<hex>` files; temp and foreign files are
+    /// ignored), sorted by digest so callers see a deterministic probe and upload order.
+    pub async fn finalized_blobs(&self) -> Result<Vec<FinalizedBlob>, BlobStoreError> {
         let mut entries = fs::read_dir(&self.dir).await.map_err(|error| {
             BlobStoreError::with_source(STORE_NAME, "failed to list blob dir", error)
         })?;
-        let mut candidates: Vec<(PayloadDigest, PathBuf)> = Vec::new();
+        let mut blobs: Vec<FinalizedBlob> = Vec::new();
         while let Some(entry) = entries.next_entry().await.map_err(|error| {
             BlobStoreError::with_source(STORE_NAME, "failed to list blob dir", error)
         })? {
@@ -286,41 +295,21 @@ impl DirBlobStore {
             let digest = PayloadDigest::new(format!("blake3:{hex}")).map_err(|error| {
                 BlobStoreError::with_source(STORE_NAME, "invalid digest", error)
             })?;
-            candidates.push((digest, entry.path()));
+            let size_bytes = entry
+                .metadata()
+                .await
+                .map_err(|error| {
+                    BlobStoreError::with_source(STORE_NAME, "failed to stat blob", error)
+                })?
+                .len();
+            blobs.push(FinalizedBlob {
+                digest,
+                path: entry.path(),
+                size_bytes,
+            });
         }
-        // read_dir order is platform-dependent; sort so probe and upload order are deterministic.
-        candidates.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        let mut report = BlobUploadReport {
-            found: candidates.len(),
-            ..BlobUploadReport::default()
-        };
-        if candidates.is_empty() {
-            return Ok(report);
-        }
-
-        let digests: Vec<PayloadDigest> = candidates.iter().map(|(d, _)| d.clone()).collect();
-        let missing: std::collections::HashSet<PayloadDigest> =
-            uploader.find_missing(&digests).await?.into_iter().collect();
-
-        for (digest, path) in candidates {
-            if !missing.contains(&digest) {
-                continue;
-            }
-            let metadata = fs::metadata(&path).await.map_err(|error| {
-                BlobStoreError::with_source(STORE_NAME, "failed to stat blob", error)
-            })?;
-            if metadata.len() > cap {
-                report.oversize_skipped += 1;
-                continue;
-            }
-            let bytes = fs::read(&path).await.map_err(|error| {
-                BlobStoreError::with_source(STORE_NAME, "failed to read blob", error)
-            })?;
-            uploader.upload(&digest, &bytes).await?;
-            report.uploaded += 1;
-        }
-        Ok(report)
+        blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
+        Ok(blobs)
     }
 }
 
@@ -538,35 +527,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_missing_ships_only_backend_missing_blobs() {
+    async fn finalized_blobs_lists_sorted_with_sizes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = DirBlobStore::create(temp.path())
             .await
             .expect("create store");
-        let have = store_blob(&store, b"existing").await;
-        let missing = store_blob(&store, b"new").await;
-        let uploader = testing::RecordingUploader::with_existing([have.clone()]);
+        let first = store_blob(&store, b"alpha-content").await;
+        let second = store_blob(&store, b"beta").await;
 
-        let report = store.upload_missing(&uploader).await.expect("upload");
+        let blobs = store.finalized_blobs().await.expect("list");
 
-        assert_eq!(
-            report,
-            BlobUploadReport {
-                found: 2,
-                uploaded: 1,
-                oversize_skipped: 0,
-            }
-        );
-        let mut queried = uploader.queried();
-        queried.sort();
-        let mut expected = vec![have, missing.clone()];
+        let mut expected = vec![(first, 13_u64), (second, 4_u64)];
         expected.sort();
-        assert_eq!(queried, expected);
-        assert_eq!(uploader.uploaded(), vec![(missing, b"new".to_vec())]);
+        let listed: Vec<(PayloadDigest, u64)> = blobs
+            .iter()
+            .map(|blob| (blob.digest.clone(), blob.size_bytes))
+            .collect();
+        assert_eq!(listed, expected);
     }
 
     #[tokio::test]
-    async fn upload_missing_ignores_temp_and_foreign_files() {
+    async fn finalized_blobs_ignores_temp_and_foreign_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = DirBlobStore::create(temp.path())
             .await
@@ -578,48 +559,21 @@ mod tests {
         tokio::fs::write(temp.path().join("notes.txt"), b"foreign")
             .await
             .expect("write foreign");
-        let uploader = testing::RecordingUploader::default();
 
-        let report = store.upload_missing(&uploader).await.expect("upload");
+        let blobs = store.finalized_blobs().await.expect("list");
 
-        assert_eq!(report.found, 1);
-        assert_eq!(report.uploaded, 1);
-        assert_eq!(uploader.queried(), vec![blob]);
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].digest, blob);
     }
 
     #[tokio::test]
-    async fn upload_missing_on_empty_store_skips_the_probe() {
+    async fn finalized_blobs_on_empty_store_is_empty() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = DirBlobStore::create(temp.path())
             .await
             .expect("create store");
-        let uploader = testing::RecordingUploader::default();
 
-        let report = store.upload_missing(&uploader).await.expect("upload");
-
-        assert_eq!(report, BlobUploadReport::default());
-        assert!(uploader.queried().is_empty());
-    }
-
-    #[tokio::test]
-    async fn upload_missing_skips_and_reports_oversize_blobs() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = DirBlobStore::create(temp.path())
-            .await
-            .expect("create store");
-        store_blob(&store, b"way over the cap").await;
-        let small = store_blob(&store, b"ok").await;
-        let uploader = testing::RecordingUploader::default();
-
-        let report = store
-            .upload_missing_capped(&uploader, 8)
-            .await
-            .expect("upload");
-
-        assert_eq!(report.found, 2);
-        assert_eq!(report.uploaded, 1);
-        assert_eq!(report.oversize_skipped, 1);
-        assert_eq!(uploader.uploaded(), vec![(small, b"ok".to_vec())]);
+        assert!(store.finalized_blobs().await.expect("list").is_empty());
     }
 
     #[tokio::test]
@@ -687,17 +641,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn noop_uploader_uploads_nothing() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = DirBlobStore::create(temp.path())
+    async fn noop_uploader_reports_nothing_missing() {
+        let missing = NoopUploader
+            .find_missing(&[digest("a"), digest("b")])
             .await
-            .expect("create store");
-        store_blob(&store, b"a").await;
-        store_blob(&store, b"b").await;
+            .expect("probe");
 
-        let report = store.upload_missing(&NoopUploader).await.expect("upload");
+        assert!(missing.is_empty(), "noop uploader keeps every blob local");
+    }
 
-        assert_eq!(report.found, 2);
-        assert_eq!(report.uploaded, 0);
+    #[tokio::test]
+    async fn unavailable_uploader_fails_every_call_with_its_reason() {
+        let uploader = UnavailableUploader::new("bad endpoint");
+
+        let probe = uploader
+            .find_missing(std::slice::from_ref(&digest("a")))
+            .await
+            .expect_err("probe must fail");
+        let upload = uploader
+            .upload(&digest("a"), b"bytes")
+            .await
+            .expect_err("upload must fail");
+
+        assert!(probe.to_string().contains("bad endpoint"));
+        assert!(upload.to_string().contains("bad endpoint"));
     }
 }
