@@ -293,7 +293,8 @@ impl RunOptions {
 
     /// Override the incremental blob drain cadence. Captured payload blobs are shipped to
     /// the gateway on this interval while the run is alive (idle intervals cost no RPC), so
-    /// a run killed without grace loses at most the last interval's blobs.
+    /// a run killed without grace loses at most the last interval's blobs. A zero duration
+    /// disables the incremental drain; the run-end drain still runs.
     #[must_use]
     pub fn with_blob_drain_interval(mut self, interval: Duration) -> Self {
         self.blob_drain_interval = interval;
@@ -842,6 +843,12 @@ where
         let interval = options.blob_drain_interval;
         let verbose = options.verbose_diagnostics;
         tokio::spawn(async move {
+            // A zero interval disables the incremental drain (the run-end drain still
+            // runs) — and `tokio::time::interval` panics on a zero period.
+            if interval.is_zero() {
+                let _ = (&mut drain_stop_rx).await;
+                return drainer;
+            }
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // An interval's first tick fires immediately; skip it so passes start one
@@ -2355,6 +2362,37 @@ mod tests {
                 project_id: "default".to_owned(),
             }),
         )
+        .with_blob_drain_retry(DrainRetryPolicy {
+            attempts: 1,
+            initial_backoff: Duration::from_millis(1),
+        });
+
+        let code = run(&options).await.expect("run should complete");
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(0)));
+    }
+
+    #[tokio::test]
+    async fn zero_blob_drain_interval_disables_the_incremental_drain_without_panicking() {
+        // `tokio::time::interval` panics on a zero period; a zero cadence must instead mean
+        // "no incremental drain" while the run-end drain still executes.
+        let options = RunOptions::new(
+            RunContext::new_local_root(),
+            vec!["true".to_owned()],
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            Some(GrpcExportOptions {
+                endpoint: "http://127.0.0.1:9".to_owned(),
+                insecure: true,
+                tenant_id: None,
+                project_id: "default".to_owned(),
+            }),
+        )
+        .with_blob_drain_interval(Duration::ZERO)
         .with_blob_drain_retry(DrainRetryPolicy {
             attempts: 1,
             initial_backoff: Duration::from_millis(1),
