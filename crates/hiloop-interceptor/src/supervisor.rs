@@ -597,8 +597,9 @@ where
     };
     // With a gRPC export and no explicit blob dir, bodies are staged in a per-run scratch store;
     // the TempDir handle keeps it alive until the post-run blob upload below, then removes it on
-    // drop. An explicit blob dir is the durable local CAS and is never removed.
-    let scratch_blob_dir = match (options.proxy, &options.blob_dir, &options.export_grpc) {
+    // drop — unless the drain left blobs behind, in which case it is kept (see the drain below).
+    // An explicit blob dir is the durable local CAS and is never removed.
+    let mut scratch_blob_dir = match (options.proxy, &options.blob_dir, &options.export_grpc) {
         (true, None, Some(_)) => {
             Some(tempfile::tempdir().context("failed to create scratch blob dir")?)
         }
@@ -864,11 +865,31 @@ where
 
     // Ship captured payload blobs to the gateway the events went to (digest-first, so
     // already-present content is never re-sent). Same best-effort contract as the rest of the
-    // drain. The scratch store (if any) is removed right after, when `scratch_blob_dir` drops.
-    if let (Some(store), Some(grpc)) = (&drain_blob_store, &options.export_grpc)
-        && let Err(warning) = upload_captured_blobs(store, grpc, options.verbose_diagnostics).await
-    {
-        drain_warnings.push(warning);
+    // drain. The scratch store (if any) is removed only after a complete drain: when any blob
+    // failed to reach the gateway (upload failure, over-cap skip), deleting it would destroy
+    // the only bytes behind those events' payload_ref digests, so it is kept and named in the
+    // warning instead.
+    if let (Some(store), Some(grpc)) = (&drain_blob_store, &options.export_grpc) {
+        let incomplete = match upload_captured_blobs(store, grpc, options.verbose_diagnostics).await
+        {
+            Ok(report) if report.oversize_skipped > 0 => Some(anyhow::anyhow!(
+                "{} captured payload blob(s) exceed the upload cap and stayed local",
+                report.oversize_skipped
+            )),
+            Ok(_) => None,
+            Err(warning) => Some(warning),
+        };
+        if let Some(warning) = incomplete {
+            let warning = match scratch_blob_dir.take() {
+                // `keep` disables the TempDir's deletion; the bytes survive for recovery.
+                Some(scratch) => warning.context(format!(
+                    "captured payload blobs kept at `{}`",
+                    scratch.keep().display()
+                )),
+                None => warning,
+            };
+            drain_warnings.push(warning);
+        }
     }
     drop(scratch_blob_dir);
 
@@ -879,13 +900,12 @@ where
 }
 
 /// Upload the run's captured payload blobs to the gateway's blob service, reusing the event
-/// export's endpoint, TLS, and Bearer auth. Returns the warning to report when the upload
-/// failed or left over-cap blobs behind.
+/// export's endpoint, TLS, and Bearer auth.
 async fn upload_captured_blobs(
     store: &DirBlobStore,
     grpc: &GrpcExportOptions,
     verbose: bool,
-) -> Result<()> {
+) -> Result<crate::blob::BlobUploadReport> {
     let uploader = GrpcBlobUploader::connect(&grpc.endpoint, grpc.tenant_id.clone(), grpc.insecure)
         .with_context(|| format!("failed to build the blob uploader for `{}`", grpc.endpoint))?;
     let report = store
@@ -900,13 +920,7 @@ async fn upload_captured_blobs(
             report.found - report.uploaded - report.oversize_skipped
         );
     }
-    if report.oversize_skipped > 0 {
-        bail!(
-            "{} captured payload blob(s) exceed the upload cap and stayed local only",
-            report.oversize_skipped
-        );
-    }
-    Ok(())
+    Ok(report)
 }
 
 fn child_process_context(options: &RunOptions, pid: Option<u32>) -> ProcessContext {

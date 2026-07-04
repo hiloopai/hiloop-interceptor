@@ -875,6 +875,75 @@ async fn proxy_capture_without_blob_dir_uploads_bodies_to_the_gateway() {
     assert_eq!(digest, &response_upload.0);
 }
 
+#[tokio::test]
+async fn failed_blob_drain_keeps_the_scratch_store_for_recovery() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = upstream.accept().await {
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/plain\r\n",
+                "Content-Length: 9\r\n\r\n",
+                "body-kept",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    // A gateway that ingests events but serves no blob service: the run-end blob drain fails,
+    // so the scratch store must be kept — deleting it would destroy the only copy of the
+    // captured bodies its exported events reference.
+    let gateway = fake_gateway::serve_ingest_only().await;
+
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--export-grpc")
+        .arg(&gateway.endpoint)
+        .arg("--insecure-grpc");
+    let url = format!("http://127.0.0.1:{upstream_port}/v1/body");
+    append_mock_harness(&mut command, "proxy-http", &[&url]);
+
+    let output = run(command).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+
+    let kept_marker = "captured payload blobs kept at `";
+    let start = stderr
+        .find(kept_marker)
+        .unwrap_or_else(|| panic!("warning should name the kept scratch dir, stderr: {stderr}"))
+        + kept_marker.len();
+    let kept_path = std::path::PathBuf::from(
+        &stderr[start..start + stderr[start..].find('`').expect("closing backtick")],
+    );
+
+    let kept_blobs: Vec<_> = std::fs::read_dir(&kept_path)
+        .expect("kept scratch dir should still exist")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("blake3-"))
+        })
+        .collect();
+    assert!(
+        kept_blobs
+            .iter()
+            .any(|path| std::fs::read(path).expect("read kept blob") == b"body-kept"),
+        "the captured response body should survive in the kept scratch dir"
+    );
+
+    std::fs::remove_dir_all(&kept_path).expect("cleanup kept scratch dir");
+}
+
 /// In-process telemetry gateway hosting both services the interceptor speaks — event ingest and
 /// the digest-first blob transport — on one endpoint, mirroring the hosted gateway's shape.
 mod fake_gateway {
@@ -970,6 +1039,16 @@ mod fake_gateway {
     }
 
     pub(crate) async fn serve() -> FakeGateway {
+        serve_with_blob_service(true).await
+    }
+
+    /// A gateway that ingests events but hosts no blob service, so blob uploads fail
+    /// (`unimplemented`) while the event export succeeds.
+    pub(crate) async fn serve_ingest_only() -> FakeGateway {
+        serve_with_blob_service(false).await
+    }
+
+    async fn serve_with_blob_service(with_blobs: bool) -> FakeGateway {
         let ingest = Ingest::default();
         let blobs = Blobs::default();
         let events = Arc::clone(&ingest.events);
@@ -979,9 +1058,12 @@ mod fake_gateway {
             .expect("bind gateway");
         let addr = listener.local_addr().expect("gateway addr");
         tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(TelemetryIngestServiceServer::new(ingest))
-                .add_service(TelemetryBlobServiceServer::new(blobs))
+            let mut router = tonic::transport::Server::builder()
+                .add_service(TelemetryIngestServiceServer::new(ingest));
+            if with_blobs {
+                router = router.add_service(TelemetryBlobServiceServer::new(blobs));
+            }
+            router
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .expect("serve gateway");
