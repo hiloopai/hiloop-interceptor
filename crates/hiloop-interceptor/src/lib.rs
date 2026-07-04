@@ -2,10 +2,12 @@
 
 pub mod anomaly;
 pub mod blob;
+pub mod blob_upload;
 pub mod egress;
 pub mod exec_events;
 pub mod exporters;
 pub mod framing;
+pub mod grpc_client;
 pub mod grpc_export;
 pub mod inspect;
 pub mod jsonl;

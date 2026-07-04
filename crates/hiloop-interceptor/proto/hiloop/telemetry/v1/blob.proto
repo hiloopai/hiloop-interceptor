@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package hiloop.telemetry.v1;
+
+// Vendored copy of the telemetry gateway's digest-first blob transport contract. Keep it in
+// lockstep with the gateway's published `hiloop.telemetry.v1` blob service; update it when that
+// contract changes.
+//
+// Large captured bodies (LLM request/response payloads, tool outputs) travel out-of-line from the
+// event stream: an event carries only a `PayloadRef` digest (see telemetry.proto), and the bytes
+// move through this service. The protocol is digest-first: a client first asks which of its digests
+// the store is missing (`HasBlobs`), then uploads exactly those (`UploadBlob`). Content addressing
+// (blake3) makes uploads idempotent and already-present content is never re-sent.
+
+message HasBlobsRequest {
+  // Candidate blake3 content digests: 64-character lowercase hex, optionally prefixed "blake3:".
+  repeated string digests = 1;
+  // Tenant to check under. The backend assigns the tenant from the authenticated request context
+  // when one is present; the body value is honoured only on unauthenticated local deployments.
+  string tenant_id = 2;
+}
+
+message HasBlobsResponse {
+  // The subset of requested digests the store does not yet hold — upload exactly these. Echoed
+  // verbatim as requested (duplicates and equivalent spellings collapse to the first occurrence).
+  repeated string missing_digests = 1;
+}
+
+// One frame of a blob upload. The first frame declares the digest (and tenancy); every frame
+// carries a chunk of content, concatenated in arrival order. Later frames may leave `digest` and
+// `tenant_id` empty; a non-empty value that differs from the first frame rejects the upload.
+message UploadBlobRequest {
+  // blake3 digest the assembled bytes must hash to (64-character lowercase hex, optionally
+  // prefixed "blake3:"). The server verifies before storing; a mismatch rejects the upload.
+  string digest = 1;
+  // The next chunk of blob content.
+  bytes data = 2;
+  // Tenant to store under (first frame; same trust rules as HasBlobsRequest.tenant_id).
+  string tenant_id = 3;
+}
+
+message UploadBlobResponse {
+  // Total content bytes stored for the uploaded digest.
+  uint64 size_bytes = 1;
+}
+
+service TelemetryBlobService {
+  // Report which of the given digests the store is missing. Call before UploadBlob so
+  // already-present content is never re-sent.
+  rpc HasBlobs(HasBlobsRequest) returns (HasBlobsResponse);
+  // Upload one blob as a stream of chunks. The server verifies the assembled bytes hash to the
+  // declared digest before storing; re-uploading an existing digest is an idempotent no-op-shaped
+  // write. Uploads are capped at 64 MiB per blob.
+  rpc UploadBlob(stream UploadBlobRequest) returns (UploadBlobResponse);
+}

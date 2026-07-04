@@ -192,14 +192,19 @@ impl BlobWriter for DirBlobWriter {
     }
 }
 
+/// Cap on one uploadable blob's size (64 MiB) — the backend's per-blob upload limit. A larger
+/// blob stays local: [`DirBlobStore::upload_missing`] skips it (reported, never silent) and
+/// uploader implementations reject it before sending.
+pub const MAX_UPLOAD_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Ships local blobs to a hosted backend, deduplicating by digest first.
 ///
 /// The protocol is digest-first: ask the backend which digests it lacks via
 /// [`find_missing`](BlobUploader::find_missing), then [`upload`](BlobUploader::upload)
 /// only those. The backend re-hashes on receipt, so a corrupt or mislabeled
 /// blob is rejected rather than trusted. This sits off the capture hot path;
-/// the OSS repo ships only the seam and [`NoopUploader`], with the real hosted
-/// uploader (HTTP/gRPC, presigned-URL direct-to-object-storage) living elsewhere.
+/// [`crate::blob_upload::GrpcBlobUploader`] is the gateway implementation and
+/// [`NoopUploader`] the standalone/air-gapped default.
 #[async_trait]
 pub trait BlobUploader: Send + Sync {
     /// Digest-first dedup: of these digests, return the subset the backend lacks.
@@ -209,7 +214,8 @@ pub trait BlobUploader: Send + Sync {
     ) -> Result<Vec<PayloadDigest>, BlobStoreError>;
 
     /// Upload one blob's bytes; the backend re-hashes and rejects a mismatch.
-    // Takes the full bytes for the sketch; a streaming reader is a future refinement.
+    // Takes the full bytes (bounded by MAX_UPLOAD_BLOB_BYTES); a streaming reader is a future
+    // refinement.
     async fn upload(&self, digest: &PayloadDigest, bytes: &[u8]) -> Result<(), BlobStoreError>;
 }
 
@@ -231,30 +237,91 @@ impl BlobUploader for NoopUploader {
     }
 }
 
-/// Upload the given blobs to `uploader`, skipping any the backend already has.
-///
-/// `blobs` pairs each digest with its already-read bytes (the caller supplies
-/// these, e.g. by reading `<dir>/blake3-<hex>`), keeping this helper pure and
-/// free of filesystem coupling. Returns how many blobs were uploaded.
-//
-// The real hosted path adds the "read from DirBlobStore + background queue +
-// retry" wiring around this digest-first core.
-pub async fn drain_to_uploader(
-    uploader: &dyn BlobUploader,
-    blobs: &[(PayloadDigest, Vec<u8>)],
-) -> Result<usize, BlobStoreError> {
-    let digests: Vec<PayloadDigest> = blobs.iter().map(|(digest, _)| digest.clone()).collect();
-    let missing: std::collections::HashSet<PayloadDigest> =
-        uploader.find_missing(&digests).await?.into_iter().collect();
+/// Outcome of shipping a blob store's contents to an uploader.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BlobUploadReport {
+    /// Content-addressed blobs found in the store.
+    pub found: usize,
+    /// Blobs the backend was missing that were uploaded.
+    pub uploaded: usize,
+    /// Blobs skipped because they exceed [`MAX_UPLOAD_BLOB_BYTES`]; they stay local only.
+    pub oversize_skipped: usize,
+}
 
-    let mut uploaded = 0;
-    for (digest, bytes) in blobs {
-        if missing.contains(digest) {
-            uploader.upload(digest, bytes).await?;
-            uploaded += 1;
-        }
+impl DirBlobStore {
+    /// Ship this store's blobs to `uploader`, skipping any the backend already has.
+    ///
+    /// Digest-first: one [`BlobUploader::find_missing`] probe over every finalized blob in the
+    /// dir (`blake3-<hex>` files; temp files are ignored), then one [`BlobUploader::upload`] per
+    /// missing digest, read one blob at a time so memory stays bounded by the largest blob. An
+    /// over-cap blob is counted in the report rather than attempted (the backend would reject
+    /// it); the first transport error aborts, since the remaining uploads share its fate.
+    pub async fn upload_missing(
+        &self,
+        uploader: &dyn BlobUploader,
+    ) -> Result<BlobUploadReport, BlobStoreError> {
+        self.upload_missing_capped(uploader, MAX_UPLOAD_BLOB_BYTES)
+            .await
     }
-    Ok(uploaded)
+
+    async fn upload_missing_capped(
+        &self,
+        uploader: &dyn BlobUploader,
+        cap: u64,
+    ) -> Result<BlobUploadReport, BlobStoreError> {
+        let mut entries = fs::read_dir(&self.dir).await.map_err(|error| {
+            BlobStoreError::with_source(STORE_NAME, "failed to list blob dir", error)
+        })?;
+        let mut candidates: Vec<(PayloadDigest, PathBuf)> = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(|error| {
+            BlobStoreError::with_source(STORE_NAME, "failed to list blob dir", error)
+        })? {
+            let name = entry.file_name();
+            let Some(hex) = name.to_str().and_then(|name| name.strip_prefix("blake3-")) else {
+                continue;
+            };
+            if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                continue;
+            }
+            let digest = PayloadDigest::new(format!("blake3:{hex}")).map_err(|error| {
+                BlobStoreError::with_source(STORE_NAME, "invalid digest", error)
+            })?;
+            candidates.push((digest, entry.path()));
+        }
+        // read_dir order is platform-dependent; sort so probe and upload order are deterministic.
+        candidates.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        let mut report = BlobUploadReport {
+            found: candidates.len(),
+            ..BlobUploadReport::default()
+        };
+        if candidates.is_empty() {
+            return Ok(report);
+        }
+
+        let digests: Vec<PayloadDigest> = candidates.iter().map(|(d, _)| d.clone()).collect();
+        let missing: std::collections::HashSet<PayloadDigest> =
+            uploader.find_missing(&digests).await?.into_iter().collect();
+
+        for (digest, path) in candidates {
+            if !missing.contains(&digest) {
+                continue;
+            }
+            let metadata = fs::metadata(&path).await.map_err(|error| {
+                BlobStoreError::with_source(STORE_NAME, "failed to stat blob", error)
+            })?;
+            if metadata.len() > cap {
+                report.oversize_skipped += 1;
+                continue;
+            }
+            let bytes = fs::read(&path).await.map_err(|error| {
+                BlobStoreError::with_source(STORE_NAME, "failed to read blob", error)
+            })?;
+            uploader.upload(&digest, &bytes).await?;
+            report.uploaded += 1;
+        }
+        Ok(report)
+    }
 }
 
 /// Test helpers and an in-memory store for conformance suites.
@@ -463,21 +530,96 @@ mod tests {
         PayloadDigest::new(format!("blake3:{hex}")).expect("valid digest")
     }
 
+    /// Finalize `content` into `store` and return its minted digest.
+    async fn store_blob(store: &DirBlobStore, content: &[u8]) -> PayloadDigest {
+        let mut writer = store.writer();
+        writer.write(content).await.expect("write");
+        writer.finish().await.expect("finish").digest
+    }
+
     #[tokio::test]
-    async fn drain_uploads_only_missing_digests() {
-        let have = digest("have");
-        let missing = digest("missing");
+    async fn upload_missing_ships_only_backend_missing_blobs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+        let have = store_blob(&store, b"existing").await;
+        let missing = store_blob(&store, b"new").await;
         let uploader = testing::RecordingUploader::with_existing([have.clone()]);
 
-        let blobs = vec![
-            (have.clone(), b"existing".to_vec()),
-            (missing.clone(), b"new".to_vec()),
-        ];
-        let count = drain_to_uploader(&uploader, &blobs).await.expect("drain");
+        let report = store.upload_missing(&uploader).await.expect("upload");
 
-        assert_eq!(count, 1);
-        assert_eq!(uploader.queried(), vec![have, missing.clone()]);
+        assert_eq!(
+            report,
+            BlobUploadReport {
+                found: 2,
+                uploaded: 1,
+                oversize_skipped: 0,
+            }
+        );
+        let mut queried = uploader.queried();
+        queried.sort();
+        let mut expected = vec![have, missing.clone()];
+        expected.sort();
+        assert_eq!(queried, expected);
         assert_eq!(uploader.uploaded(), vec![(missing, b"new".to_vec())]);
+    }
+
+    #[tokio::test]
+    async fn upload_missing_ignores_temp_and_foreign_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+        let blob = store_blob(&store, b"real").await;
+        tokio::fs::write(temp.path().join(".tmp-1234-0000000000000001"), b"partial")
+            .await
+            .expect("write temp");
+        tokio::fs::write(temp.path().join("notes.txt"), b"foreign")
+            .await
+            .expect("write foreign");
+        let uploader = testing::RecordingUploader::default();
+
+        let report = store.upload_missing(&uploader).await.expect("upload");
+
+        assert_eq!(report.found, 1);
+        assert_eq!(report.uploaded, 1);
+        assert_eq!(uploader.queried(), vec![blob]);
+    }
+
+    #[tokio::test]
+    async fn upload_missing_on_empty_store_skips_the_probe() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+        let uploader = testing::RecordingUploader::default();
+
+        let report = store.upload_missing(&uploader).await.expect("upload");
+
+        assert_eq!(report, BlobUploadReport::default());
+        assert!(uploader.queried().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_missing_skips_and_reports_oversize_blobs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+        store_blob(&store, b"way over the cap").await;
+        let small = store_blob(&store, b"ok").await;
+        let uploader = testing::RecordingUploader::default();
+
+        let report = store
+            .upload_missing_capped(&uploader, 8)
+            .await
+            .expect("upload");
+
+        assert_eq!(report.found, 2);
+        assert_eq!(report.uploaded, 1);
+        assert_eq!(report.oversize_skipped, 1);
+        assert_eq!(uploader.uploaded(), vec![(small, b"ok".to_vec())]);
     }
 
     #[tokio::test]
@@ -535,28 +677,27 @@ mod tests {
     async fn recording_uploader_with_no_existing_reports_all_missing() {
         let uploader = testing::RecordingUploader::default();
         let d = digest("new");
-        let blobs = vec![(d.clone(), b"data".to_vec())];
-        let count = drain_to_uploader(&uploader, &blobs).await.expect("drain");
 
-        assert_eq!(count, 1);
-        assert_eq!(uploader.uploaded().len(), 1);
-    }
+        let missing = uploader
+            .find_missing(std::slice::from_ref(&d))
+            .await
+            .expect("probe");
 
-    #[tokio::test]
-    async fn drain_to_uploader_with_empty_list_uploads_nothing() {
-        let uploader = testing::RecordingUploader::default();
-        let count = drain_to_uploader(&uploader, &[]).await.expect("drain");
-        assert_eq!(count, 0);
-        assert!(uploader.queried().is_empty());
-        assert!(uploader.uploaded().is_empty());
+        assert_eq!(missing, vec![d]);
     }
 
     #[tokio::test]
     async fn noop_uploader_uploads_nothing() {
-        let blobs = vec![(digest("a"), b"a".to_vec()), (digest("b"), b"b".to_vec())];
-        let count = drain_to_uploader(&NoopUploader, &blobs)
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
             .await
-            .expect("drain");
-        assert_eq!(count, 0);
+            .expect("create store");
+        store_blob(&store, b"a").await;
+        store_blob(&store, b"b").await;
+
+        let report = store.upload_missing(&NoopUploader).await.expect("upload");
+
+        assert_eq!(report.found, 2);
+        assert_eq!(report.uploaded, 0);
     }
 }

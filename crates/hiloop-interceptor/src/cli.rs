@@ -84,7 +84,9 @@ struct RunArgs {
     raw_jsonl: Option<PathBuf>,
 
     /// Directory for the content-addressed blob store the proxy streams bodies to.
-    /// Created if absent. Required by `--proxy`.
+    /// Created if absent. Required by `--proxy` unless `--export-grpc` is set, in
+    /// which case captured bodies default to a per-run scratch store that is uploaded
+    /// to the gateway and removed at run end.
     #[arg(long = "blob-dir", env = "HILOOP_BLOB_DIR")]
     blob_dir: Option<PathBuf>,
 
@@ -94,7 +96,9 @@ struct RunArgs {
     otlp: bool,
 
     /// Run an embedded MITM proxy and capture the child's HTTP(S) traffic.
-    /// Requires `--events-jsonl` and `--blob-dir`.
+    /// Requires an export target (`--events-jsonl` or `--export-grpc`) plus
+    /// somewhere for captured bodies: `--blob-dir`, or `--export-grpc` (bodies are
+    /// then uploaded to the gateway).
     #[arg(long = "proxy")]
     proxy: bool,
 
@@ -185,8 +189,10 @@ struct RunArgs {
     secret_broker_token: Option<String>,
 
     /// Stream captured events to a telemetry gateway over gRPC, e.g.
-    /// `https://telemetry.example.com:443`. Composes with `--events-jsonl`. The API token is read
-    /// from the `HILOOP_API_KEY` environment variable (never a flag, to keep it out of argv).
+    /// `https://telemetry.example.com:443`. Composes with `--events-jsonl`. With `--proxy`,
+    /// captured payload blobs are uploaded to the same gateway at run end (only content the
+    /// gateway is missing is sent). The API token is read from the `HILOOP_API_KEY` environment
+    /// variable (never a flag, to keep it out of argv).
     #[arg(long = "export-grpc", env = "HILOOP_TELEMETRY_ENDPOINT")]
     export_grpc: Option<String>,
 

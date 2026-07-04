@@ -10,6 +10,16 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- Payload blob upload to the telemetry gateway: with `--export-grpc` and `--proxy`, captured
+  request/response bodies now ship to the gateway's blob service at run end over the same endpoint
+  and Bearer auth as the event export (`GrpcBlobUploader`, behind the existing `BlobUploader`
+  seam). The protocol is digest-first — a `HasBlobs` probe reports which blake3 digests the gateway
+  is missing and only those are uploaded, as chunked client-streams (1 MiB frames, 64 MiB per-blob
+  cap) the gateway re-hashes before storing. `--blob-dir` becomes optional with a gRPC export:
+  omitted, bodies stage in a per-run scratch store that is removed after the upload. The upload is
+  best-effort like the rest of the telemetry drain: a failure is reported on stderr and never
+  overrides the child's exit code.
+
 - Process-boundary lifecycle events on the `exec` signal (previously declared but never emitted):
   every captured run now records `process.start` at spawn, `process.exit` with the child's exit byte
   and wall-clock duration (plus `process.term_signal` when the child was signal-killed), and one
@@ -58,6 +68,11 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Changed
 
+- **Breaking (embedders):** the generated `hiloop.telemetry.v1` client stubs moved from
+  `grpc_export::proto` to `grpc_client::proto`, alongside the shared gateway-client plumbing
+  (`TOKEN_ENV`, channel construction, Bearer auth) now used by both the event exporter and the
+  blob uploader. Imports of `grpc_export::proto` or `grpc_export::TOKEN_ENV` switch to the
+  `grpc_client` paths.
 - **Breaking:** the telemetry spine is now keyed on a run and its **lineage path** (the dotted
   sequence of run ULIDs from the root run to this run) instead of an intra-run fork tree. The
   `ForkContext { run_id, fork_node_id, fork_path }` type is replaced by `RunContext { run_id,

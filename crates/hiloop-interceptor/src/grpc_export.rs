@@ -3,48 +3,16 @@
 //! request's Bearer token, so the client omits `tenant_id` (`None`) there; `project_id` selects the
 //! project to record under. Against an unauthenticated local gateway, set `tenant_id` explicitly.
 
+use crate::grpc_client::{AuthInterceptor, build_channel, fold_status_message};
 use crate::seams::{ExportError, Exporter};
 use async_trait::async_trait;
 use hiloop_core::event::{AttributeValue, Event, PayloadRef, SignalType};
-use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, ClientTlsConfig};
+use tonic::transport::Channel;
 use tonic::{Request, Status};
 
-/// Generated `hiloop.telemetry.v1` stubs (vendored proto, see `build.rs`).
-#[allow(
-    clippy::all,
-    clippy::pedantic,
-    clippy::nursery,
-    clippy::allow_attributes_without_reason,
-    reason = "tonic-prost-build generated code is not ours to lint (incl. its own bare #[allow]s)"
-)]
-pub mod proto {
-    tonic::include_proto!("hiloop.telemetry.v1");
-}
-
+use crate::grpc_client::proto;
 use proto::telemetry_ingest_service_client::TelemetryIngestServiceClient;
-
-/// Env var holding the API key. Sourced from the environment only — never a CLI argument, so it
-/// stays out of process provenance (`process.argv`).
-pub const TOKEN_ENV: &str = "HILOOP_API_KEY";
-
-/// Attaches `authorization: Bearer <token>` to every request when a token is configured.
-#[derive(Clone)]
-struct AuthInterceptor {
-    bearer: Option<MetadataValue<Ascii>>,
-}
-
-impl tonic::service::Interceptor for AuthInterceptor {
-    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        if let Some(bearer) = &self.bearer {
-            request
-                .metadata_mut()
-                .insert("authorization", bearer.clone());
-        }
-        Ok(request)
-    }
-}
 
 type AuthedClient = TelemetryIngestServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 
@@ -71,32 +39,9 @@ impl GrpcIngestExporter {
         insecure: bool,
     ) -> Result<Self, ExportError> {
         let endpoint = endpoint.into();
-        let mut builder = Channel::from_shared(endpoint.clone()).map_err(|e| {
-            ExportError::with_source("grpc", format!("invalid endpoint `{endpoint}`"), e)
-        })?;
-        if !insecure {
-            // `with_enabled_roots()` trusts BOTH the OS store (native roots — for an on-prem gateway
-            // behind a private CA) AND the compiled-in webpki/Mozilla bundle. Native roots alone fail
-            // to auto-discover the trust store in a minimal container (the sandbox base, where
-            // `hiloop run` embeds this interceptor: `with_native_roots()` yielded an empty set →
-            // `UnknownIssuer` even though the public chain's anchor was installed); the webpki bundle
-            // anchors the public chain regardless. This matches the HTTP capture path's rustls trust.
-            builder = builder
-                .tls_config(ClientTlsConfig::new().with_enabled_roots())
-                .map_err(|e| ExportError::with_source("grpc", "TLS configuration failed", e))?;
-        }
-        let channel = builder.connect_lazy();
-
-        let bearer = match std::env::var(TOKEN_ENV).ok().filter(|t| !t.is_empty()) {
-            Some(token) => Some(
-                format!("Bearer {token}")
-                    .parse()
-                    .map_err(|e| ExportError::with_source("grpc", "invalid API token", e))?,
-            ),
-            None => None,
-        };
-        let client =
-            TelemetryIngestServiceClient::with_interceptor(channel, AuthInterceptor { bearer });
+        let channel = build_channel(&endpoint, insecure).map_err(client_config_error)?;
+        let interceptor = AuthInterceptor::from_env().map_err(client_config_error)?;
+        let client = TelemetryIngestServiceClient::with_interceptor(channel, interceptor);
         Ok(Self {
             client,
             tenant_id,
@@ -137,50 +82,15 @@ impl Exporter for GrpcIngestExporter {
     }
 }
 
-/// Render a rejected ingest RPC as one human-readable line.
-///
-/// `tonic::Status` can carry an empty gRPC message and noisy sources — its own `Display` embeds
-/// the `Debug` of its transport source (`tonic::transport::Error(Transport, hyper::Error(..))`),
-/// which would leak internals into a wrapping CLI's stderr. Fold the readable pieces into one
-/// compact diagnostic instead: the status message (or the code description when the message is
-/// empty) followed by each source's `Display`. Hops in the chain routinely restate each other
-/// (tonic stamps the root cause into the status message), so a hop that appears verbatim inside
-/// another hop is dropped rather than repeated. The `Status` is deliberately not kept as a
-/// structured `source` — any wrapper that renders an error chain (`anyhow`'s `{err:#}`) would
-/// hit `Status`'s leaky `Display` again.
+/// Wrap a gateway-client configuration failure as an export error.
+fn client_config_error(error: crate::grpc_client::GrpcClientError) -> ExportError {
+    ExportError::with_source("grpc", "failed to configure the gateway client", error)
+}
+
+/// Render a rejected ingest RPC as one human-readable line (see
+/// [`fold_status_message`] for why the `Status` chain is folded rather than kept).
 fn ingest_rejection_message(status: &Status) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut push = |part: &str| {
-        let part = part.trim();
-        if !part.is_empty() {
-            parts.push(part.to_owned());
-        }
-    };
-    if status.message().is_empty() {
-        push(status.code().description());
-    } else {
-        push(status.message());
-    }
-    let mut source = std::error::Error::source(status);
-    while let Some(error) = source {
-        push(&error.to_string());
-        source = error.source();
-    }
-
-    // Keep a hop only if no other hop subsumes it: a strictly longer hop that contains it, or an
-    // identical earlier hop (so exact repeats keep their first occurrence).
-    let kept: Vec<&str> = parts
-        .iter()
-        .enumerate()
-        .filter(|(i, part)| {
-            !parts.iter().enumerate().any(|(j, other)| {
-                j != *i && other.contains(part.as_str()) && (other.len() > part.len() || j < *i)
-            })
-        })
-        .map(|(_, part)| part.as_str())
-        .collect();
-
-    format!("ingest rejected: {}", kept.join(": "))
+    format!("ingest rejected: {}", fold_status_message(status))
 }
 
 fn to_proto_event(event: &Event) -> proto::Event {
@@ -435,102 +345,11 @@ mod tests {
     }
 
     #[test]
-    fn auth_interceptor_attaches_bearer_when_token_present() {
-        use tonic::service::Interceptor as _;
-
-        let mut with_token = AuthInterceptor {
-            bearer: Some("Bearer hil_secret".parse().expect("metadata value")),
-        };
-        let request = with_token.call(Request::new(())).expect("intercept");
-        assert_eq!(
-            request
-                .metadata()
-                .get("authorization")
-                .map(|v| v.to_str().expect("ascii")),
-            Some("Bearer hil_secret")
-        );
-    }
-
-    #[test]
-    fn auth_interceptor_omits_header_when_no_token() {
-        use tonic::service::Interceptor as _;
-
-        let mut no_token = AuthInterceptor { bearer: None };
-        let request = no_token.call(Request::new(())).expect("intercept");
-        assert!(request.metadata().get("authorization").is_none());
-    }
-
-    #[test]
-    fn ingest_rejection_uses_the_status_message() {
+    fn ingest_rejection_prefixes_the_folded_status() {
         let status = Status::unavailable("gateway draining");
         assert_eq!(
             ingest_rejection_message(&status),
             "ingest rejected: gateway draining"
-        );
-    }
-
-    #[test]
-    fn ingest_rejection_falls_back_to_the_code_description_for_an_empty_message() {
-        let status = Status::new(tonic::Code::Unavailable, "");
-        assert_eq!(
-            ingest_rejection_message(&status),
-            format!(
-                "ingest rejected: {}",
-                tonic::Code::Unavailable.description()
-            )
-        );
-    }
-
-    /// A `Display`-only error chain fake: each hop renders its text and points at the next.
-    #[derive(Debug)]
-    struct ChainError(&'static str, Option<Box<ChainError>>);
-
-    impl std::fmt::Display for ChainError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.0)
-        }
-    }
-
-    impl std::error::Error for ChainError {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            self.1
-                .as_deref()
-                .map(|error| error as &(dyn std::error::Error + 'static))
-        }
-    }
-
-    #[test]
-    fn ingest_rejection_folds_the_source_chain_without_debug_noise() {
-        let mut status = Status::new(tonic::Code::Unknown, "transport error");
-        status.set_source(std::sync::Arc::new(ChainError(
-            "transport error",
-            Some(Box::new(ChainError("connection refused", None))),
-        )));
-
-        // The repeated "transport error" hop collapses and the chain stays `Display`-only —
-        // no `tonic::transport::Error(..)` debug internals.
-        assert_eq!(
-            ingest_rejection_message(&status),
-            "ingest rejected: transport error: connection refused"
-        );
-    }
-
-    #[test]
-    fn ingest_rejection_drops_hops_subsumed_by_a_more_specific_hop() {
-        // Real-world shape: tonic stamps the root cause ("tcp connect error") into the status
-        // message, and the deepest hop restates it with the OS detail.
-        let mut status = Status::new(tonic::Code::Unavailable, "tcp connect error");
-        status.set_source(std::sync::Arc::new(ChainError(
-            "transport error",
-            Some(Box::new(ChainError(
-                "tcp connect error: Connection refused (os error 61)",
-                None,
-            ))),
-        )));
-
-        assert_eq!(
-            ingest_rejection_message(&status),
-            "ingest rejected: transport error: tcp connect error: Connection refused (os error 61)"
         );
     }
 }

@@ -216,14 +216,20 @@ whole (within the capture cap) before offload; on a blob-write failure either de
 only (no inline fallback). The capture cap bounds memory by default (8 MiB); setting it to `0` opts
 into unlimited capture, where a very large body buffers its captured copy in full.
 
-**Blobs are local-only — getting them to the backend is the next step.** `DirBlobStore` writes blobs
-to a local directory (now blake3-keyed) and the `Event` carries only the `payload_ref` digest;
-nothing yet uploads the bytes to the telemetry backend, so a digest is currently unresolvable
-downstream. The `BlobUploader` seam (`src/blob.rs`) sketches the edge side of the upload — a
-digest-first `find_missing` + `upload` with a `NoopUploader` default — but the hosted uploader and
-the wire protocol are out of scope for this repository. Capture size is bounded by
-`--max-capture-bytes` (default 8 MiB, `0` for unlimited): bodies over the cap are captured up to it,
-marked `http.capture.truncated`, and still forwarded in full to the client.
+**Blob upload to the telemetry gateway (shipped).** `DirBlobStore` writes blobs to a local
+directory (blake3-keyed) and the `Event` carries only the `payload_ref` digest. With a gRPC export
+configured, a run-end drain ships those blobs to the gateway's blob service over the same endpoint
+and Bearer auth as the event export (`src/blob_upload.rs`, behind the `BlobUploader` seam in
+`src/blob.rs`): a digest-first `HasBlobs` probe asks which digests the gateway is missing, and only
+those are uploaded as chunked client-streams (1 MiB frames, ≤ 64 MiB per blob) — the gateway
+re-hashes before storing, so a corrupt or mislabeled upload is rejected, and re-running against
+already-present content sends nothing. Without a gRPC export (`--events-jsonl` only) blobs stay
+local in `--blob-dir` (`NoopUploader`, the standalone/air-gapped default); with a gRPC export and
+no `--blob-dir`, bodies stage in a per-run scratch store that is removed after the upload. The
+drain is best-effort like the rest of telemetry: a failure is a stderr warning, never the child's
+exit code. Capture size is bounded by `--max-capture-bytes` (default 8 MiB, `0` for unlimited):
+bodies over the cap are captured up to it, marked `http.capture.truncated`, and still forwarded in
+full to the client.
 
 **Status — OTLP shipped (`--otlp`).** `hiloop_interceptor::otlp` runs an embedded OTLP/HTTP receiver
 bound to an ephemeral localhost port; the supervisor injects the endpoint, registers
