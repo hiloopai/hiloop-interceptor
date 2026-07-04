@@ -807,6 +807,193 @@ async fn proxy_correlates_request_and_response_over_chunked_upstream() {
     assert_eq!(blob, b"chunk-1chunk-2");
 }
 
+#[tokio::test]
+async fn proxy_capture_without_blob_dir_uploads_bodies_to_the_gateway() {
+    // Same plain-HTTP upstream as the chunked-capture test: a response body worth shipping.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = upstream.accept().await {
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/event-stream\r\n",
+                "Transfer-Encoding: chunked\r\n\r\n",
+                "7\r\nchunk-1\r\n",
+                "7\r\nchunk-2\r\n",
+                "0\r\n\r\n",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let gateway = fake_gateway::serve().await;
+
+    // No --blob-dir: with a gRPC export, bodies stage in a per-run scratch store and are
+    // uploaded to the same gateway the events go to at run end.
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--export-grpc")
+        .arg(&gateway.endpoint)
+        .arg("--insecure-grpc");
+    let url = format!("http://127.0.0.1:{upstream_port}/v1/stream");
+    append_mock_harness(&mut command, "proxy-http", &[&url]);
+
+    let output = run(command).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("telemetry capture incomplete"),
+        "the blob drain must complete cleanly, stderr: {stderr}"
+    );
+
+    // The de-chunked response body reached the gateway CAS…
+    let uploads = gateway.uploads.lock().expect("lock");
+    let response_upload = uploads
+        .iter()
+        .find(|(_, bytes)| bytes == b"chunk-1chunk-2")
+        .expect("the captured response body should have been uploaded");
+
+    // …under exactly the digest the exported response event references.
+    let events = gateway.events.lock().expect("lock");
+    let response_event = events
+        .iter()
+        .find(|event| event.name == "http.response")
+        .expect("a captured http response event");
+    let digest = &response_event
+        .payload_ref
+        .as_ref()
+        .expect("response payload_ref")
+        .digest;
+    assert_eq!(digest, &response_upload.0);
+}
+
+/// In-process telemetry gateway hosting both services the interceptor speaks — event ingest and
+/// the digest-first blob transport — on one endpoint, mirroring the hosted gateway's shape.
+mod fake_gateway {
+    use std::sync::{Arc, Mutex};
+
+    use hiloop_interceptor::grpc_client::proto::telemetry_blob_service_server::{
+        TelemetryBlobService, TelemetryBlobServiceServer,
+    };
+    use hiloop_interceptor::grpc_client::proto::telemetry_ingest_service_server::{
+        TelemetryIngestService, TelemetryIngestServiceServer,
+    };
+    use hiloop_interceptor::grpc_client::proto::{
+        Event, HasBlobsRequest, HasBlobsResponse, IngestRequest, IngestResponse,
+        IngestStreamRequest, IngestStreamResponse, UploadBlobRequest, UploadBlobResponse,
+    };
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status, Streaming};
+
+    /// Completed uploads as `(declared digest, assembled bytes)`.
+    type RecordedUploads = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    pub(crate) struct FakeGateway {
+        pub(crate) endpoint: String,
+        pub(crate) events: Arc<Mutex<Vec<Event>>>,
+        pub(crate) uploads: RecordedUploads,
+    }
+
+    #[derive(Clone, Default)]
+    struct Ingest {
+        events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    #[tonic::async_trait]
+    impl TelemetryIngestService for Ingest {
+        async fn ingest(
+            &self,
+            request: Request<IngestRequest>,
+        ) -> Result<Response<IngestResponse>, Status> {
+            let req = request.into_inner();
+            let accepted = req.events.len() as u64;
+            self.events.lock().expect("lock").extend(req.events);
+            Ok(Response::new(IngestResponse { accepted }))
+        }
+
+        async fn ingest_stream(
+            &self,
+            request: Request<Streaming<IngestStreamRequest>>,
+        ) -> Result<Response<IngestStreamResponse>, Status> {
+            let mut stream = request.into_inner();
+            let mut accepted = 0;
+            while let Some(batch) = stream.message().await? {
+                accepted += batch.events.len() as u64;
+                self.events.lock().expect("lock").extend(batch.events);
+            }
+            Ok(Response::new(IngestStreamResponse { accepted }))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Blobs {
+        uploads: RecordedUploads,
+    }
+
+    #[tonic::async_trait]
+    impl TelemetryBlobService for Blobs {
+        async fn has_blobs(
+            &self,
+            request: Request<HasBlobsRequest>,
+        ) -> Result<Response<HasBlobsResponse>, Status> {
+            // An empty store: everything the client offers is missing.
+            Ok(Response::new(HasBlobsResponse {
+                missing_digests: request.into_inner().digests,
+            }))
+        }
+
+        async fn upload_blob(
+            &self,
+            request: Request<Streaming<UploadBlobRequest>>,
+        ) -> Result<Response<UploadBlobResponse>, Status> {
+            let mut stream = request.into_inner();
+            let mut digest = String::new();
+            let mut bytes = Vec::new();
+            while let Some(frame) = stream.message().await? {
+                bytes.extend_from_slice(&frame.data);
+                if digest.is_empty() {
+                    digest = frame.digest;
+                }
+            }
+            let size_bytes = bytes.len() as u64;
+            self.uploads.lock().expect("lock").push((digest, bytes));
+            Ok(Response::new(UploadBlobResponse { size_bytes }))
+        }
+    }
+
+    pub(crate) async fn serve() -> FakeGateway {
+        let ingest = Ingest::default();
+        let blobs = Blobs::default();
+        let events = Arc::clone(&ingest.events);
+        let uploads = Arc::clone(&blobs.uploads);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway");
+        let addr = listener.local_addr().expect("gateway addr");
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(TelemetryIngestServiceServer::new(ingest))
+                .add_service(TelemetryBlobServiceServer::new(blobs))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("serve gateway");
+        });
+        FakeGateway {
+            endpoint: format!("http://{addr}"),
+            events,
+            uploads,
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn forwards_sigterm_to_child_and_reports_signal_exit() {

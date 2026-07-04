@@ -48,7 +48,8 @@ and emits run-lineage-stamped events — `gen_ai.*` / `llm.*` spans become `llm`
 cargo run -p hiloop-interceptor -- run --otlp --events-jsonl ./events.jsonl -- <harness command>
 ```
 
-Add `--proxy` (with `--events-jsonl` and `--blob-dir`) to run an embedded MITM proxy: the wrapper
+Add `--proxy` (with an export target, plus `--blob-dir` — or `--export-grpc`, see below) to run an
+embedded MITM proxy: the wrapper
 mints an ephemeral CA, injects `HTTPS_PROXY` plus a child-scoped CA bundle, decrypts the harness's
 HTTPS traffic, and emits run-lineage-stamped `net` events (`llm` for known LLM API hosts). Bodies are
 streamed frame-by-frame into a content-addressed blob store (`--blob-dir`), so events carry only a
@@ -70,7 +71,10 @@ cargo run -p hiloop-interceptor -- run --proxy --events-jsonl ./events.jsonl --b
 
 Add `--export-grpc <URL>` to stream captured events to a hiloop telemetry gateway over gRPC. It
 composes with `--events-jsonl` (list both to keep a local JSONL durability log alongside the remote
-export). The API key is read from the `HILOOP_API_KEY` environment variable — never a flag, so
+export). With `--proxy`, the captured request/response bodies are uploaded to the same gateway at
+run end (digest-first: only content the gateway is missing is sent), so `--blob-dir` becomes
+optional — omitted, bodies stage in a per-run scratch store that is removed after the upload. The
+API key is read from the `HILOOP_API_KEY` environment variable — never a flag, so
 it stays out of `process.argv`. An authenticated gateway derives the tenant from that token, so leave
 `--tenant-id` empty there; `--project-id` selects the project to record under. Use `--insecure-grpc`
 for a cleartext local gateway (and `--tenant-id` to assert tenancy when it has no auth).

@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn event_schema_serializes_opaque_text_types_as_strings() {
         let context = RunContext::new_local_root();
-        let payload_ref = PayloadRef::new(PayloadDigest::new("sha256:abc").expect("digest"))
+        let payload_ref = PayloadRef::new(PayloadDigest::new("blake3:abc").expect("digest"))
             .with_media_type(MediaType::new("application/json").expect("media type"))
             .with_size_bytes(12);
         let event = Event::new(
@@ -353,7 +353,7 @@ mod tests {
 
         assert_eq!(value["name"], json!("http.request"));
         assert_eq!(value["attributes"]["http.status_code"], json!(200));
-        assert_eq!(value["payload_ref"]["digest"], json!("sha256:abc"));
+        assert_eq!(value["payload_ref"]["digest"], json!("blake3:abc"));
         assert_eq!(
             value["payload_ref"]["media_type"],
             json!("application/json")

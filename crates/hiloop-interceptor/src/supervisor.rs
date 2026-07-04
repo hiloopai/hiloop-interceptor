@@ -7,6 +7,7 @@
 use crate::{
     anomaly::AnomalyConfig,
     blob::DirBlobStore,
+    blob_upload::GrpcBlobUploader,
     egress::EgressPolicy,
     exec_events::{ExecLifecycleEmitter, ExecLifecycleNormalizer},
     exporters::{FanOutExporter, JsonlExporter},
@@ -152,14 +153,16 @@ impl RunOptions {
     ///
     /// Each sink is optional and composes with the others: `events_jsonl` writes a
     /// newline-delimited JSON event log, `raw_jsonl` a raw observation log (requires
-    /// an export target), `blob_dir` the proxy's blob store, `otlp` an embedded OTLP
-    /// receiver, `proxy` an embedded MITM proxy (requires an export target and
-    /// `blob_dir`), `max_capture_bytes` caps the captured copy of proxy bodies in
-    /// memory (`Some(n)` bounds it to `n` bytes; `None` is unlimited — prefer a finite
-    /// cap such as [`crate::proxy::DEFAULT_MAX_CAPTURE_BYTES`] so a large body can't OOM
-    /// the wrapper; forwarding to the origin is never capped), and `export_grpc` streams
-    /// events to a telemetry gateway. Invariants between these are validated by [`run`],
-    /// not here.
+    /// an export target), `blob_dir` the proxy's durable local blob store, `otlp` an
+    /// embedded OTLP receiver, `proxy` an embedded MITM proxy (requires an export
+    /// target, plus somewhere for captured bodies: `blob_dir`, or `export_grpc` — which
+    /// stages them in a per-run scratch store), `max_capture_bytes` caps the captured
+    /// copy of proxy bodies in memory (`Some(n)` bounds it to `n` bytes; `None` is
+    /// unlimited — prefer a finite cap such as [`crate::proxy::DEFAULT_MAX_CAPTURE_BYTES`]
+    /// so a large body can't OOM the wrapper; forwarding to the origin is never capped),
+    /// and `export_grpc` streams events to a telemetry gateway and, when the proxy is
+    /// capturing, uploads the captured payload blobs there at run end (digest-first
+    /// dedup). Invariants between these are validated by [`run`], not here.
     #[expect(
         clippy::too_many_arguments,
         reason = "public, embeddable run config; the flat constructor mirrors the CLI's RunArgs 1:1 — a builder is deferred while there is a single in-tree caller"
@@ -431,10 +434,20 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
         );
     }
 
-    if options.proxy && (!has_exporter || options.blob_dir.is_none()) {
-        bail!(
-            "--proxy requires an export target (--events-jsonl or --export-grpc) and --blob-dir so captured bodies are streamed to the blob store"
-        );
+    if options.proxy {
+        if !has_exporter {
+            bail!(
+                "--proxy requires an export target (--events-jsonl or --export-grpc) so captured exchanges have an exporter"
+            );
+        }
+        // Captured bodies need a durable destination: an explicit local store, or the gateway
+        // (staged in a per-run scratch store, uploaded at run end). Anything else would lose
+        // them silently.
+        if options.blob_dir.is_none() && options.export_grpc.is_none() {
+            bail!(
+                "--proxy requires --blob-dir so captured bodies are streamed to the blob store (with --export-grpc it may be omitted: bodies are staged in a scratch store and uploaded to the gateway)"
+            );
+        }
     }
 
     if !options.secret_bindings.is_empty() {
@@ -582,12 +595,31 @@ where
     } else {
         None
     };
-    let blob_store = match (options.proxy, &options.blob_dir) {
-        (true, Some(dir)) => {
+    // With a gRPC export and no explicit blob dir, bodies are staged in a per-run scratch store;
+    // the TempDir handle keeps it alive until the post-run blob upload below, then removes it on
+    // drop. An explicit blob dir is the durable local CAS and is never removed.
+    let scratch_blob_dir = match (options.proxy, &options.blob_dir, &options.export_grpc) {
+        (true, None, Some(_)) => {
+            Some(tempfile::tempdir().context("failed to create scratch blob dir")?)
+        }
+        _ => None,
+    };
+    let blob_store = match (options.proxy, &options.blob_dir, &scratch_blob_dir) {
+        (true, Some(dir), _) => {
             Some(Arc::new(DirBlobStore::create(dir).await.with_context(
                 || format!("failed to create blob store at `{}`", dir.display()),
             )?))
         }
+        (true, None, Some(scratch)) => Some(Arc::new(
+            DirBlobStore::create(scratch.path())
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to create blob store at `{}`",
+                        scratch.path().display()
+                    )
+                })?,
+        )),
         _ => None,
     };
 
@@ -710,6 +742,8 @@ where
         ),
         _ => None,
     };
+    // The proxy consumes the store handle; keep one for the post-run blob upload.
+    let drain_blob_store = blob_store.clone();
     let (proxy_shutdown_tx, proxy_server_task) = match (proxy_server, proxy_ca, blob_store) {
         (Some(server), Some(ca), Some(blob_store)) => {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -818,7 +852,7 @@ where
 
     // The child has exited: capture/export is best effort from here, so drain failures
     // become warnings instead of clobbering the child's exit code (exit-code transparency).
-    let drain_warnings = [
+    let mut drain_warnings: Vec<anyhow::Error> = [
         pipeline_result.map(|_| ()),
         stdin_result.context("failed to capture child stdin"),
         stdout_result.context("failed to capture child stdout"),
@@ -828,10 +862,51 @@ where
     .filter_map(Result::err)
     .collect();
 
+    // Ship captured payload blobs to the gateway the events went to (digest-first, so
+    // already-present content is never re-sent). Same best-effort contract as the rest of the
+    // drain. The scratch store (if any) is removed right after, when `scratch_blob_dir` drops.
+    if let (Some(store), Some(grpc)) = (&drain_blob_store, &options.export_grpc)
+        && let Err(warning) = upload_captured_blobs(store, grpc, options.verbose_diagnostics).await
+    {
+        drain_warnings.push(warning);
+    }
+    drop(scratch_blob_dir);
+
     Ok(CapturedRun {
         exit_code: exit_u8_from_status(status),
         drain_warnings,
     })
+}
+
+/// Upload the run's captured payload blobs to the gateway's blob service, reusing the event
+/// export's endpoint, TLS, and Bearer auth. Returns the warning to report when the upload
+/// failed or left over-cap blobs behind.
+async fn upload_captured_blobs(
+    store: &DirBlobStore,
+    grpc: &GrpcExportOptions,
+    verbose: bool,
+) -> Result<()> {
+    let uploader = GrpcBlobUploader::connect(&grpc.endpoint, grpc.tenant_id.clone(), grpc.insecure)
+        .with_context(|| format!("failed to build the blob uploader for `{}`", grpc.endpoint))?;
+    let report = store
+        .upload_missing(&uploader)
+        .await
+        .context("failed to upload captured payload blobs")?;
+    if verbose {
+        eprintln!(
+            "hiloop-interceptor: uploaded {} of {} captured payload blobs ({} already present)",
+            report.uploaded,
+            report.found,
+            report.found - report.uploaded - report.oversize_skipped
+        );
+    }
+    if report.oversize_skipped > 0 {
+        bail!(
+            "{} captured payload blob(s) exceed the upload cap and stayed local only",
+            report.oversize_skipped
+        );
+    }
+    Ok(())
 }
 
 fn child_process_context(options: &RunOptions, pid: Option<u32>) -> ProcessContext {
@@ -2017,6 +2092,53 @@ mod tests {
                 .to_string()
                 .contains("secret bindings require --proxy")
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_without_blob_dir_or_grpc_export_is_rejected() {
+        // An export target exists (events_jsonl) but captured bodies have nowhere durable to go.
+        let options = RunOptions::new(
+            RunContext::new_local_root(),
+            vec!["echo".to_owned(), "hi".to_owned()],
+            Some(PathBuf::from("/tmp/never-created.jsonl")),
+            None,
+            None,
+            false,
+            true,
+            None,
+            None,
+        );
+        let error = run(&options)
+            .await
+            .expect_err("proxy needs a body destination");
+        assert!(error.to_string().contains("--proxy requires --blob-dir"));
+    }
+
+    #[tokio::test]
+    async fn proxy_with_grpc_export_and_no_blob_dir_runs_with_a_scratch_store() {
+        // A gRPC export satisfies the body-destination invariant: bodies stage in a per-run
+        // scratch store. The unreachable gateway only degrades the drain to stderr warnings —
+        // never the child's exit code.
+        let options = RunOptions::new(
+            RunContext::new_local_root(),
+            vec!["true".to_owned()],
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            Some(GrpcExportOptions {
+                endpoint: "http://127.0.0.1:9".to_owned(),
+                insecure: true,
+                tenant_id: None,
+                project_id: "default".to_owned(),
+            }),
+        );
+
+        let code = run(&options).await.expect("run should complete");
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(0)));
     }
 
     #[tokio::test]

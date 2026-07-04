@@ -1035,7 +1035,7 @@ mod tests {
         assert!(plain.payload_ref().is_none());
         assert_eq!(plain.body.as_ref(), b"inline");
 
-        let digest = PayloadDigest::new("sha256:abc").expect("digest");
+        let digest = PayloadDigest::new("blake3:abc").expect("digest");
         let offloaded = sample_raw(b"").with_payload_ref(PayloadRef::new(digest));
         assert!(offloaded.payload_ref().is_some());
         assert!(offloaded.body.is_empty());

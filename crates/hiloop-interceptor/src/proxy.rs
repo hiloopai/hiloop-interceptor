@@ -1512,7 +1512,7 @@ mod tests {
     #[tokio::test]
     async fn normalizes_request_as_net_event_and_carries_payload_ref() {
         use crate::seams::RawRetentionPolicy;
-        let digest = PayloadDigest::new("sha256:abc").expect("digest");
+        let digest = PayloadDigest::new("blake3:abc").expect("digest");
         let raw = proxy_signal(
             REQUEST_KIND,
             &[
@@ -1540,7 +1540,7 @@ mod tests {
         assert_eq!(events[0].name.as_str(), "http.request");
         assert_eq!(
             events[0].payload_ref.as_ref().map(|p| p.digest.as_str()),
-            Some("sha256:abc")
+            Some("blake3:abc")
         );
         assert_eq!(
             events[0]

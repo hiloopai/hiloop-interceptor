@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 
 use hiloop_core::event::{AttributeKey, Event, EventName, SignalType};
 use hiloop_core::identity::{Hlc, RunContext};
-use hiloop_interceptor::grpc_export::GrpcIngestExporter;
-use hiloop_interceptor::grpc_export::proto::telemetry_ingest_service_server::{
+use hiloop_interceptor::grpc_client::proto::telemetry_ingest_service_server::{
     TelemetryIngestService, TelemetryIngestServiceServer,
 };
-use hiloop_interceptor::grpc_export::proto::{
+use hiloop_interceptor::grpc_client::proto::{
     Event as ProtoEvent, IngestRequest, IngestResponse, IngestStreamRequest, IngestStreamResponse,
 };
+use hiloop_interceptor::grpc_export::GrpcIngestExporter;
 use hiloop_interceptor::seams::Exporter;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
