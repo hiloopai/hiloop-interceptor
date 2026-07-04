@@ -61,9 +61,9 @@ const OTEL_EXECUTION_ID: &str = "hiloop.execution.id";
 /// without grace loses at most the last interval's blobs.
 const DEFAULT_BLOB_DRAIN_INTERVAL: Duration = DEFAULT_EXPORT_FLUSH_INTERVAL;
 
-/// Bound on exporting the run-end capture-health event: it shares the drain's best-effort
-/// contract and must never hang the wrapper's exit.
-const CAPTURE_HEALTH_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on exporting a supervisor-emitted record event (capture-health, spawn-failure): it
+/// shares the drain's best-effort contract and must never hang the wrapper's exit.
+const SUPERVISOR_RECORD_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Event name of the run-end capture-health record.
 const CAPTURE_DRAIN_EVENT: &str = "capture.drain";
@@ -700,9 +700,22 @@ where
     }
     child_env.apply_to(&mut command);
 
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // Full capture includes failed attempts: no process ever started, so the
+            // attempt itself is the recorded fact — without it the run's timeline would
+            // be empty and the failure reconstructable only from wrapper stderr.
+            let event = spawn_failure_event(options, clock.tick(), &error);
+            if let Err(warning) = export_supervisor_record(exporter, event, "spawn-failure").await {
+                eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
+            }
+            return Err(anyhow::Error::new(error).context(format!(
+                "failed to spawn child command `{}`",
+                options.command[0]
+            )));
+        }
+    };
     drop(command);
     let child_started = Instant::now();
     let spawn_ts = clock.tick();
@@ -995,7 +1008,9 @@ where
                     );
                 }
                 let health_event = capture_drain_event(&health_context, clock.tick(), &outcome);
-                if let Err(warning) = export_capture_health(exporter, health_event).await {
+                if let Err(warning) =
+                    export_supervisor_record(exporter, health_event, "capture-health").await
+                {
                     drain_warnings.push(warning);
                 }
                 if let Some(warning) = drain_problem(outcome) {
@@ -1113,25 +1128,73 @@ fn count_attr(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-/// Export the capture-health event within a hard deadline: like every post-exit step it is
-/// best-effort and must never hang the wrapper's exit.
-async fn export_capture_health<E: Exporter>(exporter: &E, event: Event) -> Result<()> {
-    match tokio::time::timeout(CAPTURE_HEALTH_EXPORT_TIMEOUT, async {
+/// Build the spawn-failure record: a `process.spawn_failed` `exec` event carrying the attempted
+/// argv, working directory, and the OS error that prevented the child from starting. It is
+/// stamped with the same run identity and static attributes (including `execution.id`, when
+/// set) as every captured event, so the failed attempt joins the run's timeline.
+fn spawn_failure_event(options: &RunOptions, ts: Hlc, error: &io::Error) -> Event {
+    let context = NormalizationContext::new(options.context.clone())
+        .with_attributes(options.attributes.clone());
+    let mut event = Event::new(
+        context.run_context(),
+        ts,
+        SignalType::Exec,
+        EventName::from_static(crate::exec_events::PROCESS_SPAWN_FAILED),
+    );
+    for (key, value) in context.attributes() {
+        event = event.with_attribute(key.clone(), value.clone());
+    }
+    let process = child_process_context(options, None);
+    event = event
+        .with_attribute(
+            AttributeKey::from_static(provenance_keys::WRAPPER_NAME),
+            context.wrapper.name,
+        )
+        .with_attribute(
+            AttributeKey::from_static(provenance_keys::WRAPPER_VERSION),
+            context.wrapper.version,
+        )
+        .with_attribute(
+            AttributeKey::from_static(provenance_keys::PROCESS_ARGV),
+            serde_json::to_string(&process.argv)
+                .expect("serializing an in-memory argv list cannot fail"),
+        )
+        .with_attribute(
+            AttributeKey::from_static(crate::exec_events::keys::PROCESS_ERROR),
+            error.to_string(),
+        );
+    if let Some(cwd) = process.cwd.filter(|cwd| !cwd.as_os_str().is_empty()) {
+        event = event.with_attribute(
+            AttributeKey::from_static(provenance_keys::PROCESS_CWD),
+            cwd.display().to_string(),
+        );
+    }
+    event
+}
+
+/// Export one supervisor-emitted record event (capture-health, spawn-failure) within a hard
+/// deadline: best-effort like every wind-down step, so it never hangs the wrapper's exit.
+async fn export_supervisor_record<E: Exporter>(
+    exporter: &E,
+    event: Event,
+    what: &str,
+) -> Result<()> {
+    match tokio::time::timeout(SUPERVISOR_RECORD_EXPORT_TIMEOUT, async {
         exporter
             .export(std::slice::from_ref(&event))
             .await
-            .context("failed to export the capture-health event")?;
+            .with_context(|| format!("failed to export the {what} event"))?;
         exporter
             .flush()
             .await
-            .context("failed to flush the capture-health event")
+            .with_context(|| format!("failed to flush the {what} event"))
     })
     .await
     {
         Ok(result) => result,
         Err(_elapsed) => bail!(
-            "capture-health export timed out after {}s",
-            CAPTURE_HEALTH_EXPORT_TIMEOUT.as_secs()
+            "{what} export timed out after {}s",
+            SUPERVISOR_RECORD_EXPORT_TIMEOUT.as_secs()
         ),
     }
 }
@@ -2261,6 +2324,43 @@ mod tests {
                 .get(&AttributeKey::from_static(provenance_keys::EXECUTION_ID)),
             Some(&AttributeValue::String("exec-123".to_owned()))
         );
+    }
+
+    #[test]
+    fn spawn_failure_event_records_the_attempt_with_run_identity() {
+        let options = base_options(vec!["/missing/harness".to_owned(), "--flag".to_owned()])
+            .with_execution_id("exec-123");
+        let error = io::Error::from_raw_os_error(2);
+
+        let event = spawn_failure_event(
+            &options,
+            Hlc {
+                wall_ns: 7,
+                logical: 0,
+            },
+            &error,
+        );
+
+        assert_eq!(event.signal, SignalType::Exec);
+        assert_eq!(
+            event.name.as_str(),
+            crate::exec_events::PROCESS_SPAWN_FAILED
+        );
+        assert_eq!(event.run_id, options.context.run_id);
+        let value = serde_json::to_value(&event).expect("serialize event");
+        assert_eq!(
+            value["attributes"][provenance_keys::EXECUTION_ID],
+            "exec-123"
+        );
+        assert_eq!(
+            value["attributes"][provenance_keys::PROCESS_ARGV],
+            r#"["/missing/harness","--flag"]"#
+        );
+        let recorded = value["attributes"][crate::exec_events::keys::PROCESS_ERROR]
+            .as_str()
+            .expect("process error");
+        assert!(recorded.contains("os error 2"), "error: {recorded}");
+        assert!(value["attributes"][provenance_keys::WRAPPER_NAME].is_string());
     }
 
     #[test]
