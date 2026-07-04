@@ -128,8 +128,8 @@ The integration tests wrap a real command and assert child output is teed while 
 events are flushed to JSONL, that an OTLP trace export from the child is captured, and that the MITM
 proxy captures decrypted HTTPS and correlates request/response over chunked upstreams. That proves
 the supervisor, env stamping, OTLP ingest, proxy capture, local normalization, and exporter seam
-wiring. ClickHouse export and harness-aware semantic normalization are still planned behind the
-existing seams.
+wiring. Additional export sinks and harness-aware semantic normalization are still planned behind
+the existing seams.
 
 ## Workspace
 

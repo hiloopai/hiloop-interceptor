@@ -189,7 +189,7 @@ shutdown. Exporters should not rewrite event semantics; enrichment belongs befor
 
 Expected growth:
 
-- ClickHouse, OTEL, and local test exporters;
+- additional export sinks (e.g. OTLP) and local test exporters;
 - retries and partial-failure policy;
 - compression and authentication;
 - partitioning;
