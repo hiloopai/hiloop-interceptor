@@ -2,6 +2,7 @@
 
 pub mod anomaly;
 pub mod blob;
+pub mod blob_drain;
 pub mod blob_upload;
 pub mod egress;
 pub mod exec_events;
@@ -22,6 +23,7 @@ pub mod stdio;
 pub mod supervisor;
 
 pub use anomaly::AnomalyConfig;
+pub use blob_drain::DrainRetryPolicy;
 pub use egress::{EgressMode, EgressPolicy};
 pub use proxy::DEFAULT_MAX_CAPTURE_BYTES;
 pub use redact::RedactionPolicy;

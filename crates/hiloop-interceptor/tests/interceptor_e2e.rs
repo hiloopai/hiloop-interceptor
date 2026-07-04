@@ -873,6 +873,64 @@ async fn proxy_capture_without_blob_dir_uploads_bodies_to_the_gateway() {
         .expect("response payload_ref")
         .digest;
     assert_eq!(digest, &response_upload.0);
+
+    // The run-end capture-health record states the drain landed everything.
+    let drain_event = find_capture_drain_event(&events);
+    assert_eq!(drain_event.signal, "log");
+    assert_eq!(
+        proto_attr_bool(drain_event, "capture.complete"),
+        Some(true),
+        "attributes: {:?}",
+        drain_event.attributes
+    );
+    assert_eq!(
+        proto_attr_i64(drain_event, "capture.blobs.missing"),
+        Some(0)
+    );
+    assert!(
+        proto_attr_i64(drain_event, "capture.blobs.found").is_some_and(|found| found >= 1),
+        "the drain must account for the captured body"
+    );
+    assert_eq!(
+        proto_attr_i64(drain_event, "capture.blobs.found"),
+        proto_attr_i64(drain_event, "capture.blobs.landed"),
+    );
+}
+
+/// The single `capture.drain` health record in `events` — exactly one per captured run.
+fn find_capture_drain_event(
+    events: &[hiloop_interceptor::grpc_client::proto::Event],
+) -> &hiloop_interceptor::grpc_client::proto::Event {
+    let drains: Vec<_> = events
+        .iter()
+        .filter(|event| event.name == "capture.drain")
+        .collect();
+    assert_eq!(
+        drains.len(),
+        1,
+        "expected exactly one capture.drain event, got {}",
+        drains.len()
+    );
+    drains[0]
+}
+
+fn proto_attr_i64(event: &hiloop_interceptor::grpc_client::proto::Event, key: &str) -> Option<i64> {
+    use hiloop_interceptor::grpc_client::proto::attribute_value::Value;
+    match event.attributes.get(key)?.value.as_ref()? {
+        Value::IntValue(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn proto_attr_bool(
+    event: &hiloop_interceptor::grpc_client::proto::Event,
+    key: &str,
+) -> Option<bool> {
+    use hiloop_interceptor::grpc_client::proto::attribute_value::Value;
+    match event.attributes.get(key)?.value.as_ref()? {
+        Value::BoolValue(value) => Some(*value),
+        _ => None,
+    }
 }
 
 #[tokio::test]
@@ -939,7 +997,124 @@ async fn failed_blob_drain_keeps_the_scratch_store_for_recovery() {
         "the captured response body should survive in the kept scratch dir"
     );
 
+    // The audit scenario: blob transport broken, event ingest healthy. The loss must be
+    // queryable, not silent — the capture-health record lands over ingest and says how many
+    // bodies never made it.
+    let events = gateway.events.lock().expect("lock");
+    let drain_event = find_capture_drain_event(&events);
+    assert_eq!(
+        proto_attr_bool(drain_event, "capture.complete"),
+        Some(false),
+        "attributes: {:?}",
+        drain_event.attributes
+    );
+    assert!(
+        proto_attr_i64(drain_event, "capture.blobs.missing").is_some_and(|missing| missing >= 1),
+        "the missing body count must be reported"
+    );
+    assert!(
+        drain_event.attributes.contains_key("capture.error"),
+        "the drain failure must be recorded on the event"
+    );
+
     std::fs::remove_dir_all(&kept_path).expect("cleanup kept scratch dir");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn incremental_drain_lands_bodies_before_a_sigkill_teardown() {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = upstream.accept().await {
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/plain\r\n",
+                "Content-Length: 13\r\n\r\n",
+                "survives-kill",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let gateway = fake_gateway::serve().await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let fetched = temp.path().join("fetched");
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--export-grpc")
+        .arg(&gateway.endpoint)
+        .arg("--insecure-grpc");
+    let url = format!("http://127.0.0.1:{upstream_port}/v1/body");
+    append_mock_harness(
+        &mut command,
+        "proxy-http-hang",
+        &[&url, fetched.to_str().expect("marker path")],
+    );
+    let mut child = command.spawn().expect("spawn interceptor");
+
+    // The harness has fetched the body; the run is still alive. The incremental drain must
+    // ship the captured bytes without waiting for run end — that is the durability contract
+    // for a teardown that never delivers SIGTERM.
+    wait_for_path(&fetched).await;
+    tokio::time::timeout(E2E_TIMEOUT, async {
+        loop {
+            let landed = gateway
+                .uploads
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|(_, bytes)| bytes == b"survives-kill");
+            if landed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the captured body should land at the gateway while the run is still alive");
+
+    // Hard-kill the wrapper: SIGKILL cannot be caught, so no run-end drain happens at all.
+    let pid =
+        i32::try_from(child.id().expect("interceptor pid")).expect("interceptor pid fits i32");
+    kill(Pid::from_raw(pid), Signal::SIGKILL).expect("send SIGKILL to interceptor");
+    let status = tokio::time::timeout(E2E_TIMEOUT, child.wait())
+        .await
+        .expect("interceptor should exit after SIGKILL")
+        .expect("wait interceptor");
+    assert!(!status.success());
+
+    // The bytes shipped before the kill are safe; and a hard-killed run leaves no
+    // capture.drain record — its absence is the queryable "capture died mid-run" signal.
+    assert!(
+        gateway
+            .uploads
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|(_, bytes)| bytes == b"survives-kill"),
+        "the body uploaded before SIGKILL must remain at the gateway"
+    );
+    assert!(
+        gateway
+            .events
+            .lock()
+            .expect("lock")
+            .iter()
+            .all(|event| event.name != "capture.drain"),
+        "a SIGKILLed wrapper cannot have drained at run end"
+    );
 }
 
 /// In-process telemetry gateway hosting both services the interceptor speaks — event ingest and

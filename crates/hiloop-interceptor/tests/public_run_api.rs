@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use hiloop_core::identity::RunContext;
-use hiloop_interceptor::{GrpcExportOptions, RunOptions, run};
+use hiloop_interceptor::{DrainRetryPolicy, GrpcExportOptions, RunOptions, run};
 
 fn options_for(command: Vec<String>, export_grpc: Option<GrpcExportOptions>) -> RunOptions {
     RunOptions::new(
@@ -58,6 +58,22 @@ async fn export_cadence_builders_are_part_of_the_public_surface() {
     let options = options_for(vec!["true".to_owned()], None)
         .with_export_batch_size(32)
         .with_export_flush_interval(Some(Duration::from_millis(250)));
+
+    let code = run(&options).await.expect("run should complete");
+
+    assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(0)));
+}
+
+#[tokio::test]
+async fn blob_drain_builders_are_part_of_the_public_surface() {
+    // A downstream embedder can tune the incremental drain cadence and the run-end
+    // drain's bounded retry schedule.
+    let options = options_for(vec!["true".to_owned()], None)
+        .with_blob_drain_interval(Duration::from_millis(250))
+        .with_blob_drain_retry(DrainRetryPolicy {
+            attempts: 2,
+            initial_backoff: Duration::from_millis(10),
+        });
 
     let code = run(&options).await.expect("run should complete");
 
