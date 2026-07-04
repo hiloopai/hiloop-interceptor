@@ -30,9 +30,13 @@ pub struct DrainRetryPolicy {
 }
 
 impl Default for DrainRetryPolicy {
-    // 3 attempts with 500 ms/1 s backoff keeps the worst case (per-RPC timeouts included)
-    // inside a Kubernetes pod's default 30 s termination grace, while a fast failure
-    // (connection refused, DNS) costs ~1.5 s of exit latency.
+    // 3 attempts with 500 ms/1 s backoff. Exit-latency cost when the gateway is down: a fast
+    // failure (connection refused, DNS) ≈ 1.5 s; a black-holed probe ≈ 3 × the probe RPC
+    // timeout + backoff (~31.5 s). The pathological ceiling — a probe that succeeds followed
+    // by a transfer that wedges until the upload RPC timeout, every attempt — is
+    // attempts × (probe + upload timeout) + backoff (~3.5 min), a hard bound where the
+    // previous single-pass drain could hang forever. Time spent actually transferring bytes
+    // is productive, not overhead.
     fn default() -> Self {
         Self {
             attempts: 3,
