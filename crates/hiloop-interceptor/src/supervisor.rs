@@ -863,12 +863,9 @@ where
     .filter_map(Result::err)
     .collect();
 
-    // Ship captured payload blobs to the gateway the events went to (digest-first, so
-    // already-present content is never re-sent). Same best-effort contract as the rest of the
-    // drain. The scratch store (if any) is removed only after a complete drain: when any blob
-    // failed to reach the gateway (upload failure, over-cap skip), deleting it would destroy
-    // the only bytes behind those events' payload_ref digests, so it is kept and named in the
-    // warning instead.
+    // Ship captured payload blobs to the gateway the events went to, best-effort like the rest
+    // of the drain. An incomplete drain keeps the scratch store: deleting it would destroy the
+    // only bytes behind already-exported payload_ref digests.
     if let (Some(store), Some(grpc)) = (&drain_blob_store, &options.export_grpc) {
         let incomplete = match upload_captured_blobs(store, grpc, options.verbose_diagnostics).await
         {

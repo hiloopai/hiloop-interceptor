@@ -898,9 +898,7 @@ async fn failed_blob_drain_keeps_the_scratch_store_for_recovery() {
         }
     });
 
-    // A gateway that ingests events but serves no blob service: the run-end blob drain fails,
-    // so the scratch store must be kept — deleting it would destroy the only copy of the
-    // captured bodies its exported events reference.
+    // Ingest-only gateway: the run-end blob drain fails, so the scratch store must survive.
     let gateway = fake_gateway::serve_ingest_only().await;
 
     let mut command = interceptor_command();
