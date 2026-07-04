@@ -61,9 +61,15 @@ const OTEL_EXECUTION_ID: &str = "hiloop.execution.id";
 /// without grace loses at most the last interval's blobs.
 const DEFAULT_BLOB_DRAIN_INTERVAL: Duration = DEFAULT_EXPORT_FLUSH_INTERVAL;
 
-/// Bound on exporting a supervisor-emitted record event (capture-health, spawn-failure): it
-/// shares the drain's best-effort contract and must never hang the wrapper's exit.
-const SUPERVISOR_RECORD_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on exporting the run-end capture-health record: it shares the drain's best-effort
+/// contract and must never hang the wrapper's exit. By run end the export channel is warm, so
+/// this stays tight.
+const CAPTURE_HEALTH_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on exporting the spawn-failure record. This is the process's FIRST network use — on
+/// guests with a degraded resolver the cold lookup alone can exceed 10s while later exports on a
+/// warm channel are instant — and the child never ran, so trading extra seconds on the failure
+/// path for the record actually landing is the right side of the budget.
+const SPAWN_FAILURE_EXPORT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Event name of the run-end capture-health record.
 const CAPTURE_DRAIN_EVENT: &str = "capture.drain";
@@ -704,7 +710,14 @@ where
         Ok(child) => child,
         Err(error) => {
             let event = spawn_failure_event(options, clock.tick(), &error);
-            if let Err(warning) = export_supervisor_record(exporter, event, "spawn-failure").await {
+            if let Err(warning) = export_supervisor_record(
+                exporter,
+                event,
+                "spawn-failure",
+                SPAWN_FAILURE_EXPORT_TIMEOUT,
+            )
+            .await
+            {
                 eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
             }
             return Err(anyhow::Error::new(error).context(format!(
@@ -1005,8 +1018,13 @@ where
                     );
                 }
                 let health_event = capture_drain_event(&health_context, clock.tick(), &outcome);
-                if let Err(warning) =
-                    export_supervisor_record(exporter, health_event, "capture-health").await
+                if let Err(warning) = export_supervisor_record(
+                    exporter,
+                    health_event,
+                    "capture-health",
+                    CAPTURE_HEALTH_EXPORT_TIMEOUT,
+                )
+                .await
                 {
                     drain_warnings.push(warning);
                 }
@@ -1170,13 +1188,15 @@ fn spawn_failure_event(options: &RunOptions, ts: Hlc, error: &io::Error) -> Even
 }
 
 /// Export one supervisor-emitted record event (capture-health, spawn-failure) within a hard
-/// deadline: best-effort like every wind-down step, so it never hangs the wrapper's exit.
+/// per-record deadline: best-effort like every wind-down step, so it never hangs the wrapper's
+/// exit.
 async fn export_supervisor_record<E: Exporter>(
     exporter: &E,
     event: Event,
     what: &str,
+    deadline: Duration,
 ) -> Result<()> {
-    match tokio::time::timeout(SUPERVISOR_RECORD_EXPORT_TIMEOUT, async {
+    match tokio::time::timeout(deadline, async {
         exporter
             .export(std::slice::from_ref(&event))
             .await
@@ -1189,10 +1209,7 @@ async fn export_supervisor_record<E: Exporter>(
     .await
     {
         Ok(result) => result,
-        Err(_elapsed) => bail!(
-            "{what} export timed out after {}s",
-            SUPERVISOR_RECORD_EXPORT_TIMEOUT.as_secs()
-        ),
+        Err(_elapsed) => bail!("{what} export timed out after {}s", deadline.as_secs()),
     }
 }
 
