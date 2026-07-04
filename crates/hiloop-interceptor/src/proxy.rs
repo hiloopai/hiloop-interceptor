@@ -1247,7 +1247,7 @@ fn count_tool_calls(value: &Value, depth: usize) -> usize {
                 count += 1;
             }
             for key in [
-                "choices", "message", "messages", "content", "output", "delta",
+                "choices", "message", "messages", "content", "output", "delta", "item", "response",
             ] {
                 if let Some(child) = map.get(key) {
                     count += count_tool_calls(child, depth + 1);
@@ -2370,6 +2370,17 @@ mod tests {
                 .get(&AttributeKey::new(GEN_AI_RESPONSE_MODEL_ATTR).expect("key")),
             Some(&AttributeValue::String("gpt-5-codex".to_owned()))
         );
+    }
+
+    #[test]
+    fn count_tool_calls_walks_openai_responses_streaming_envelopes() {
+        for body in [
+            br#"data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"run_shell","arguments":"{}"}}"#.as_slice(),
+            br#"data: {"type":"response.completed","response":{"output":[{"type":"function_call","call_id":"call_1","name":"run_shell","arguments":"{}"}]}}"#.as_slice(),
+        ] {
+            let metadata = llm_metadata_from_event_stream(body, LlmCaptureDirection::Response);
+            assert_eq!(metadata.tool_call.as_deref(), Some("1"));
+        }
     }
 
     #[test]
