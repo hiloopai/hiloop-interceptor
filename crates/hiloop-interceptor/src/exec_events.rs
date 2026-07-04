@@ -6,7 +6,9 @@
 //! `exec` events named `process.start`, `process.exit`, and `process.signal`.
 //! Process identity (`process.pid`/`process.argv`/`process.cwd`) is stamped by
 //! the pipeline's provenance pass on every event, so the raw signals carry only
-//! the lifecycle-specific attributes.
+//! the lifecycle-specific attributes. A child that fails to spawn produces the
+//! `process.spawn_failed` `exec` event instead, emitted directly by the
+//! supervisor since no process (and thus no pipeline run) ever existed.
 
 use crate::seams::{
     NormalizationContext, NormalizationOutcome, NormalizeError, Normalizer, NormalizerDescriptor,
@@ -37,6 +39,10 @@ pub const PROCESS_START: &str = "process.start";
 pub const PROCESS_EXIT: &str = "process.exit";
 /// Event name / raw kind: a terminating signal was forwarded to the child.
 pub const PROCESS_SIGNAL: &str = "process.signal";
+/// Event name: the child command could not be spawned, so no process ever started. Emitted
+/// directly by the supervisor (there is no process to drain raw signals from) — full capture
+/// includes failed attempts, so the attempt itself is the recorded fact.
+pub const PROCESS_SPAWN_FAILED: &str = "process.spawn_failed";
 
 /// Attribute keys carried by process lifecycle events.
 pub mod keys {
@@ -49,6 +55,9 @@ pub mod keys {
     pub const PROCESS_DURATION_MS: &str = "process.duration_ms";
     /// The signal that terminated the child (e.g. `SIGKILL`), when signal-killed.
     pub const PROCESS_TERM_SIGNAL: &str = "process.term_signal";
+    /// The OS error that prevented the child from spawning
+    /// (e.g. `No such file or directory (os error 2)`).
+    pub const PROCESS_ERROR: &str = "process.error";
     /// The signal forwarded to the child's process group (e.g. `SIGINT`).
     pub const SIGNAL: &str = "signal";
 }

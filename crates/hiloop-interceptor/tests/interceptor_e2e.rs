@@ -488,6 +488,54 @@ async fn captures_forwarded_signal_as_a_process_signal_event() {
 }
 
 #[tokio::test]
+async fn spawn_failure_is_captured_as_a_process_spawn_failed_event() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let missing = temp.path().join("no-such-harness");
+    let mut command = interceptor_command();
+    command.arg("--events-jsonl").arg(&events_path);
+    command.arg("--").arg(&missing).arg("--flag");
+
+    let output = run(command).await;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(
+        stderr.contains("failed to spawn child command"),
+        "stderr: {stderr}"
+    );
+
+    // Full capture includes the failed attempt: exactly one exec-signal record
+    // stating what was attempted and why no process ever started.
+    let events = read_jsonl(&events_path);
+    let [event] = events.as_slice() else {
+        panic!("expected exactly the spawn-failure event, got {events:?}");
+    };
+    assert_eq!(event["name"], "process.spawn_failed");
+    assert_eq!(event["signal"], "exec");
+    assert_eq!(event["run_id"], RUN_ID);
+    assert_eq!(event["lineage_path"], LINEAGE_PATH);
+    let argv = serde_json::from_str::<Vec<String>>(
+        event["attributes"][provenance_keys::PROCESS_ARGV]
+            .as_str()
+            .expect("process argv"),
+    )
+    .expect("process argv json");
+    assert_eq!(
+        argv,
+        vec![
+            missing.to_str().expect("missing path").to_owned(),
+            "--flag".to_owned()
+        ]
+    );
+    let error = event["attributes"]["process.error"]
+        .as_str()
+        .expect("process error");
+    assert!(error.contains("os error 2"), "error: {error}");
+    assert!(event["attributes"][provenance_keys::WRAPPER_NAME].is_string());
+}
+
+#[tokio::test]
 async fn raw_output_without_event_output_fails_before_starting_child() {
     let temp = tempfile::tempdir().expect("tempdir");
     let raw_path = temp.path().join("raw.jsonl");

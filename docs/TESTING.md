@@ -29,6 +29,7 @@ thresholds.
 | B15 | With `--otlp`, the wrapper injects `OTEL_EXPORTER_OTLP_ENDPOINT`, receives the child's OTLP trace export, and emits run-lineage-stamped events; LLM spans become `llm`. | Mock-harness E2E + normalizer tests |
 | B16 | With `--proxy`, the wrapper injects `HTTPS_PROXY` + a child-scoped CA bundle, decrypts the child's HTTPS, and emits run-lineage-stamped `net`/`llm` events; bodies stream frame-by-frame into a content-addressed blob store (`--blob-dir`) and events carry a `payload_ref`. | Mock-harness MITM E2E + blob/handler/normalizer tests |
 | B17 | With capture enabled, the wrapper emits process-boundary lifecycle events on the `exec` signal: `process.start` at spawn (process identity via provenance, plus the configured `--env-allowlist` names — never values), `process.exit` with the child's exit byte and wall-clock duration (plus the terminating signal when signal-killed), and one `process.signal` per forwarded terminating signal. | Mock-harness E2E + normalizer/emitter unit tests |
+| B18 | With capture enabled, a child that fails to spawn is still captured: the wrapper exports one `process.spawn_failed` `exec` event (attempted argv, working directory, OS error, run identity and static attributes including `execution.id`) before the spawn error propagates — full capture includes failed attempts. | Mock-harness E2E + supervisor unit test |
 
 These are desired contracts, not incidental implementation details. Changing one requires an
 explicit design decision and updated tests.
