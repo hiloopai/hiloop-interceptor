@@ -10,7 +10,7 @@ use crate::{
     blob_drain::{BlobDrainOutcome, BlobDrainer, DrainRetryPolicy},
     blob_upload::GrpcBlobUploader,
     egress::EgressPolicy,
-    exec_events::{ExecLifecycleEmitter, ExecLifecycleNormalizer},
+    exec_events::{ExecLifecycleEmitter, ExecLifecycleNormalizer, captured_env_values},
     exporters::{FanOutExporter, JsonlExporter},
     framing::LineFramer,
     grpc_export::GrpcIngestExporter,
@@ -351,10 +351,14 @@ impl RunOptions {
         self
     }
 
-    /// Record these environment variable *names* on the run's `process.start`
-    /// event (`process.env_allowlist`). Names only — values are never captured,
-    /// so secrets can't leak through the process record. Empty (the default)
-    /// omits the attribute.
+    /// Record these environment variables on the run's `process.start` event:
+    /// the names as `process.env_allowlist`, and each listed variable that is
+    /// set in the child's environment as a `process.env.<NAME>` attribute whose
+    /// value is scrubbed by the run's capture-side redaction (the same pattern
+    /// and known-secret-literal passes applied to captured bodies) before it is
+    /// recorded. Variables not listed here are never captured — the environment
+    /// is a known secret carrier, so value capture stays strictly opt-in. Empty
+    /// (the default) captures nothing and omits both attributes.
     #[must_use]
     pub fn with_env_allowlist(mut self, env_allowlist: Vec<String>) -> Self {
         self.env_allowlist = env_allowlist;
@@ -437,6 +441,17 @@ impl ChildEnv {
 
     fn apply_to(&self, command: &mut Command) {
         command.envs(self.vars.iter().cloned());
+    }
+
+    /// The value `name` resolves to in the child's environment: the last
+    /// supervisor-injected override when present, else the inherited value.
+    fn child_value(&self, name: &str) -> Option<OsString> {
+        self.vars
+            .iter()
+            .rev()
+            .find(|(key, _)| key.as_os_str() == std::ffi::OsStr::new(name))
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os(name))
     }
 }
 
@@ -751,8 +766,22 @@ where
     // Process-boundary lifecycle capture: `process.start` now, `process.signal`
     // on each forwarded terminating signal, `process.exit` once the child exits.
     let exec_emitter = ExecLifecycleEmitter::new(signal_tx.clone(), Arc::clone(&clock));
+    // The broker token is the one secret the supervisor itself holds at spawn;
+    // scrub it as a literal so an allowlist mistake can't record it verbatim.
+    let secret_literals: Vec<&[u8]> = options
+        .secret_broker
+        .as_ref()
+        .map(|broker| broker.token.as_bytes())
+        .into_iter()
+        .collect();
+    let env_values = captured_env_values(
+        &options.env_allowlist,
+        |name| child_env.child_value(name),
+        options.redaction,
+        &secret_literals,
+    );
     exec_emitter
-        .emit_start(spawn_ts, &options.env_allowlist)
+        .emit_start(spawn_ts, &options.env_allowlist, &env_values)
         .await;
 
     let (stdin_shutdown_tx, stdin_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2212,6 +2241,24 @@ mod tests {
             encode_otel_resource_value("exec,= id/1"),
             "exec%2C%3D%20id%2F1"
         );
+    }
+
+    #[test]
+    fn child_env_value_prefers_injected_override_then_inherited() {
+        let context = RunContext::new_local_root();
+        let env = ChildEnv::for_run(&context, None);
+
+        assert_eq!(
+            env.child_value("HILOOP_RUN_ID"),
+            Some(OsString::from(context.run_id.to_string())),
+            "a supervisor-injected variable resolves to the injected value"
+        );
+        assert_eq!(
+            env.child_value("PATH"),
+            std::env::var_os("PATH"),
+            "a variable the supervisor does not set falls back to the inherited value"
+        );
+        assert_eq!(env.child_value("HILOOP_TEST_DEFINITELY_UNSET"), None);
     }
 
     #[tokio::test]

@@ -27,7 +27,11 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   and wall-clock duration (plus `process.term_signal` when the child was signal-killed), and one
   `process.signal` per forwarded terminating signal. A new `--env-allowlist` flag (or
   `RunOptions::with_env_allowlist`) records the listed environment variable *names* on
-  `process.start` — values are never captured.
+  `process.start` (`process.env_allowlist`), and captures each listed variable that is set in the
+  child's environment as a `process.env.<NAME>` attribute — the value scrubbed by the capture-side
+  secret redaction (the same pattern and known-secret-literal passes applied to captured bodies)
+  before it is recorded. The environment is a known secret carrier, so value capture is strictly
+  opt-in per name: variables outside the allowlist are never captured.
 - Egress policy enforcement for intercepted HTTP(S) traffic (`--egress-mode allow|deny` with
   repeatable `--egress-domain` / `--egress-cidr` rules, and the `RunOptions::with_egress` builder).
   Hosts are canonicalized (control-char/percent/userinfo rejection, IDNA→punycode, IP-literal
