@@ -424,7 +424,7 @@ async fn process_start_leads_the_stream_and_records_the_env_allowlist() {
     assert_eq!(argv[0], "sh");
     assert!(start["attributes"][provenance_keys::PROCESS_CWD].is_string());
 
-    // Without the flag the attribute is omitted (names are opt-in; values never captured).
+    // Without the flag the attribute is omitted (capture is opt-in per name).
     let bare_events_path = temp.path().join("bare-events.jsonl");
     let mut bare = interceptor_command();
     bare.arg("--events-jsonl").arg(&bare_events_path);
@@ -438,6 +438,69 @@ async fn process_start_leads_the_stream_and_records_the_env_allowlist() {
         bare_start["attributes"]
             .get("process.env_allowlist")
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn process_start_captures_allowlisted_env_values_redacted() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let mut command = interceptor_command();
+    command
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--env-allowlist")
+        .arg("HILOOP_E2E_RATE,HILOOP_E2E_KEY,HILOOP_E2E_UNSET")
+        .env("HILOOP_E2E_RATE", "0.001")
+        .env("HILOOP_E2E_KEY", "sk-e2e-secret-123")
+        .env("HILOOP_E2E_OFFLIST", "must-not-appear")
+        .env_remove("HILOOP_E2E_UNSET");
+    append_mock_harness(&mut command, "mixed", &[]);
+
+    let output = run(command).await;
+
+    assert!(output.status.success());
+    let events = read_jsonl(&events_path);
+    let start = &events[0];
+    assert_eq!(start["name"], "process.start");
+    let attributes = &start["attributes"];
+    assert_eq!(
+        attributes["process.env_allowlist"], "HILOOP_E2E_RATE,HILOOP_E2E_KEY,HILOOP_E2E_UNSET",
+        "the allowlist names every configured variable, set or not"
+    );
+    assert_eq!(attributes["process.env.HILOOP_E2E_RATE"], "0.001");
+    assert_eq!(
+        attributes["process.env.HILOOP_E2E_KEY"], "[REDACTED]",
+        "a secret-shaped value is scrubbed by the capture-side redaction"
+    );
+    assert!(
+        attributes.get("process.env.HILOOP_E2E_UNSET").is_none(),
+        "an unset allowlisted variable yields no value attribute"
+    );
+    assert!(
+        attributes.get("process.env.HILOOP_E2E_OFFLIST").is_none(),
+        "a variable outside the allowlist is never captured"
+    );
+
+    // --no-redact captures allowlisted values verbatim, matching body behavior.
+    let verbatim_events_path = temp.path().join("verbatim-events.jsonl");
+    let mut verbatim = interceptor_command();
+    verbatim
+        .arg("--events-jsonl")
+        .arg(&verbatim_events_path)
+        .arg("--no-redact")
+        .arg("--env-allowlist")
+        .arg("HILOOP_E2E_KEY")
+        .env("HILOOP_E2E_KEY", "sk-e2e-secret-123");
+    append_mock_harness(&mut verbatim, "mixed", &[]);
+    assert!(run(verbatim).await.status.success());
+    let verbatim_start = read_jsonl(&verbatim_events_path)
+        .into_iter()
+        .find(|event| event["name"] == "process.start")
+        .expect("process.start event");
+    assert_eq!(
+        verbatim_start["attributes"]["process.env.HILOOP_E2E_KEY"],
+        "sk-e2e-secret-123"
     );
 }
 

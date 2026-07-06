@@ -235,9 +235,12 @@ struct RunArgs {
     )]
     export_flush_interval_ms: u64,
 
-    /// Environment variable names to record on the run's `process.start` event
-    /// (comma-separated, e.g. `PATH,HOME,PYTHONPATH`). Names only — values are
-    /// never captured.
+    /// Environment variables to record on the run's `process.start` event
+    /// (comma-separated names, e.g. `PATH,PYTHONPATH,LEARNING_RATE`). The names
+    /// are recorded as `process.env_allowlist`; each listed variable set for the
+    /// run is also captured as a `process.env.<NAME>` attribute, scrubbed by the
+    /// capture-side secret redaction before it is recorded. Variables not listed
+    /// are never captured.
     #[arg(
         long = "env-allowlist",
         env = "HILOOP_ENV_ALLOWLIST",
