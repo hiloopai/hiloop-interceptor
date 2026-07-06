@@ -302,6 +302,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exotic_env_names_never_sink_the_start_event() {
+        // `AttributeKey` rejects only blank keys, and the `process.env.` prefix
+        // keeps every env-derived key non-blank, so no allowlisted name — however
+        // exotic — can fail normalization and drop the whole `process.start`.
+        let signal = raw(PROCESS_START)
+            .with_attribute("process.env.LC_ALL@host", "C")
+            .with_attribute("process.env.変数", "value")
+            .with_attribute("process.env. ", "space-named");
+
+        let outcome = ExecLifecycleNormalizer
+            .normalize(&context(), signal)
+            .await
+            .expect("normalize process.start with exotic env names");
+
+        let value = serde_json::to_value(&outcome.events()[0]).expect("serialize event");
+        assert_eq!(value["attributes"]["process.env.LC_ALL@host"], "C");
+        assert_eq!(value["attributes"]["process.env.変数"], "value");
+        assert_eq!(value["attributes"]["process.env. "], "space-named");
+    }
+
+    #[tokio::test]
     async fn normalizes_process_exit_integers_and_term_signal() {
         let context = context();
         let signal = raw(PROCESS_EXIT)
