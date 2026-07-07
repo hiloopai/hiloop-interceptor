@@ -43,10 +43,11 @@ use std::{
     pin::Pin,
     process::{ExitCode, ExitStatus, Stdio},
     sync::Arc,
+    task::Poll,
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::mpsc,
 };
@@ -1451,7 +1452,13 @@ fn stdio_pipe_captures(
         signal_tx.clone(),
         Arc::clone(&clock),
     ));
-    let stdin_capture = Box::pin(stdin_capture(stdin, stdin_shutdown_rx, signal_tx, clock));
+    let stdin_capture = Box::pin(stdin_capture(
+        io::stdin(),
+        stdin,
+        stdin_shutdown_rx,
+        signal_tx,
+        clock,
+    ));
     (stdin_capture, stdout_capture, stderr_capture)
 }
 
@@ -1694,33 +1701,102 @@ fn set_cloexec(fd: std::os::fd::RawFd) -> io::Result<()> {
     }
 }
 
-async fn stdin_capture<W>(
+/// Forwards a blocking reader (the parent's stdin) into async code from a dedicated,
+/// deliberately detached OS thread.
+///
+/// `tokio::io::stdin()` would dispatch each `read(2)` to the runtime's blocking pool, where an
+/// in-flight read cannot be cancelled: aborting the pump leaves the read parked, and runtime
+/// shutdown then blocks until stdin delivers a byte or EOF (tokio's `io::stdin` docs warn about
+/// exactly this). Reading on a detached thread keeps the pump — and the embedder's runtime —
+/// genuinely cancellable: dropping this reader closes the channel, the runtime never waits on
+/// the thread, and the thread retires on its next read return (or with the process). While the
+/// reader is alive every chunk is delivered in order, so no input is lost mid-run.
+struct DetachedStdinReader {
+    chunks: mpsc::Receiver<io::Result<Bytes>>,
+    pending: Bytes,
+}
+
+impl DetachedStdinReader {
+    fn spawn(source: impl io::Read + Send + 'static) -> io::Result<Self> {
+        // Capacity 1 keeps the thread from reading ahead of the pump: at most one chunk is in
+        // flight, so a chunk can be dropped only once the pump (and the child it feeds) has
+        // already gone away.
+        let (chunk_tx, chunks) = mpsc::channel::<io::Result<Bytes>>(1);
+        std::thread::Builder::new()
+            .name("hiloop-stdin-reader".to_owned())
+            .spawn(move || forward_blocking_reads(source, &chunk_tx))?;
+        Ok(Self {
+            chunks,
+            pending: Bytes::new(),
+        })
+    }
+}
+
+fn forward_blocking_reads(mut source: impl io::Read, chunk_tx: &mpsc::Sender<io::Result<Bytes>>) {
+    let mut buffer = [0; 8192];
+    loop {
+        match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                if chunk_tx
+                    .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..read])))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                let _ = chunk_tx.blocking_send(Err(error));
+                break;
+            }
+        }
+    }
+}
+
+impl AsyncRead for DetachedStdinReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.pending.is_empty() {
+            match this.chunks.poll_recv(cx) {
+                Poll::Ready(Some(Ok(chunk))) => this.pending = chunk,
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(error)),
+                // The reader thread saw EOF (an error chunk, if any, arrived before the close).
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        let take = this.pending.len().min(buf.remaining());
+        buf.put_slice(&this.pending.split_to(take));
+        Poll::Ready(Ok(()))
+    }
+}
+
+async fn stdin_capture<R, W>(
+    stdin_source: R,
     child_stdin: W,
     stdin_shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
     clock: Arc<hiloop_core::identity::HlcClock>,
 ) -> Result<()>
 where
-    W: AsyncWrite + Unpin + Send + 'static,
+    R: io::Read + Send + 'static,
+    W: AsyncWrite + Unpin,
 {
     // stdin: pump the parent's stdin into the child while capturing it as `process.stdin` events.
     // Unlike stdout/stderr (which EOF when the child exits), the parent's stdin may never close (an
-    // interactive TTY), so a child-exit shutdown signal cancels the pump instead of blocking teardown.
+    // interactive TTY), so a child-exit shutdown signal cancels the pump instead of blocking
+    // teardown — and the detached reader keeps that cancellation instant even mid-read.
     // When the pump ends — parent EOF or shutdown — `child_stdin` drops, closing the child's stdin.
-    let task = tokio::spawn(capture_stream(
-        tokio::io::stdin(),
-        child_stdin,
-        "stdin",
-        signal_tx,
-        clock,
-    ));
-    tokio::pin!(task);
+    let reader =
+        DetachedStdinReader::spawn(stdin_source).context("failed to start the stdin reader")?;
     tokio::select! {
-        result = &mut task => result.context("stdin capture task panicked")?,
-        _ = stdin_shutdown_rx => {
-            task.abort();
-            Ok(())
-        },
+        result = capture_stream(reader, child_stdin, "stdin", signal_tx, clock) => result,
+        _ = stdin_shutdown_rx => Ok(()),
     }
 }
 
@@ -2683,5 +2759,86 @@ mod tests {
             !captured.drain_warnings.is_empty(),
             "the export failure is surfaced as a drain warning"
         );
+    }
+
+    #[tokio::test]
+    async fn detached_stdin_reader_delivers_all_bytes_in_order_then_eofs() {
+        let payload: Vec<u8> = (0..20_000u32).map(|index| (index % 251) as u8).collect();
+        let mut reader = DetachedStdinReader::spawn(std::io::Cursor::new(payload.clone()))
+            .expect("spawn reader");
+
+        // A destination smaller than the reader's chunks forces splitting across poll_read calls.
+        let mut collected = Vec::new();
+        let mut buffer = [0_u8; 7];
+        loop {
+            let read = reader.read(&mut buffer).await.expect("read chunk");
+            if read == 0 {
+                break;
+            }
+            collected.extend_from_slice(&buffer[..read]);
+        }
+
+        assert_eq!(collected, payload);
+    }
+
+    /// Stands in for an interactive stdin that never delivers a byte: `read` reports that it is
+    /// in flight, then parks until the test drops `park_until_dropped`, then reports EOF.
+    struct NeverReadyStdin {
+        read_in_flight: std::sync::mpsc::Sender<()>,
+        park_until_dropped: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::io::Read for NeverReadyStdin {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            let _ = self.read_in_flight.send(());
+            let _ = self.park_until_dropped.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn stdin_pump_shutdown_is_prompt_and_never_blocks_runtime_teardown() {
+        let (read_in_flight_tx, read_in_flight) = std::sync::mpsc::channel::<()>();
+        let (hold_read_open, park_until_dropped) = std::sync::mpsc::channel::<()>();
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        runtime.block_on(async {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let (signal_tx, _signal_rx) = mpsc::channel(8);
+            let pump = tokio::spawn(stdin_capture(
+                NeverReadyStdin {
+                    read_in_flight: read_in_flight_tx,
+                    park_until_dropped,
+                },
+                tokio::io::sink(),
+                shutdown_rx,
+                signal_tx,
+                Arc::new(hiloop_core::identity::HlcClock::new()),
+            ));
+            // Shut down only once a read is provably in flight — the uncancellable case.
+            tokio::task::spawn_blocking(move || {
+                read_in_flight
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the pump must start a stdin read");
+            })
+            .await
+            .expect("wait for the in-flight read");
+            shutdown_tx.send(()).expect("pump listens for shutdown");
+            tokio::time::timeout(Duration::from_secs(2), pump)
+                .await
+                .expect("pump must finish promptly after shutdown")
+                .expect("pump task")
+                .expect("pump result");
+        });
+
+        // The blocking read is still in flight on its detached thread; runtime teardown must not
+        // wait for it (a pool-dispatched read here parked the embedder's runtime drop forever).
+        let teardown_started = Instant::now();
+        runtime.shutdown_timeout(Duration::from_secs(5));
+        assert!(
+            teardown_started.elapsed() < Duration::from_secs(2),
+            "runtime teardown waited on the parked stdin read"
+        );
+        drop(hold_read_open);
     }
 }
