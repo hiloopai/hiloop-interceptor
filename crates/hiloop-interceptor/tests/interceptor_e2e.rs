@@ -175,6 +175,36 @@ async fn captures_and_tees_stdin_to_the_child() {
     assert_eq!(event["run_id"], RUN_ID);
 }
 
+#[tokio::test]
+async fn wrapper_exits_after_the_child_even_when_its_stdin_never_closes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut command = interceptor_command();
+    // An export target turns capture on — without one the wrapper is a pass-through with no
+    // stdin pump, and this scenario would trivially pass.
+    command
+        .arg("--events-jsonl")
+        .arg(temp.path().join("events.jsonl"));
+    // The child must outlive the pump's first poll so a stdin read is in flight when the
+    // child exits — an instant child made the historical hang racy instead of deterministic.
+    command.arg("--").arg("sh").arg("-c").arg("sleep 0.3");
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = command.spawn().expect("spawn interceptor");
+    // Hold the wrapper's stdin open across the child's exit: an interactive parent (terminal,
+    // agent-harness pipe) never EOFs, and the wrapper must still exit on its own.
+    let held_open_stdin = child.stdin.take().expect("interceptor stdin");
+    let status = tokio::time::timeout(E2E_TIMEOUT, child.wait())
+        .await
+        .expect("wrapper must exit after the child even though its stdin never closed")
+        .expect("wait for interceptor");
+    drop(held_open_stdin);
+
+    assert!(status.success(), "wrapper exited non-zero: {status:?}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn capture_preserves_tty_stdio_for_interactive_children() {
