@@ -382,7 +382,7 @@ where
                         &source,
                         &kind,
                         raw_observation.as_ref(),
-                    )?;
+                    );
                     event_tx
                         .send(event)
                         .await
@@ -504,15 +504,11 @@ fn stamp_normalization_metadata(
     source: &str,
     kind: &str,
     raw_observation: Option<&RawObservationRef>,
-) -> Result<Event, PipelineError> {
+) -> Event {
     use provenance_keys as keys;
 
-    let mut event = event;
-    for (key, value) in context.attributes() {
-        event = event.with_attribute(key.clone(), value.clone());
-    }
-
-    let mut event = event
+    let mut event = context
+        .stamp_provenance(event)
         .with_attribute(
             AttributeKey::from_static(keys::NORMALIZER_NAME),
             descriptor.name(),
@@ -530,47 +526,7 @@ fn stamp_normalization_metadata(
         .with_attribute(
             AttributeKey::from_static(keys::RAW_RETENTION),
             retention.as_str(),
-        )
-        .with_attribute(
-            AttributeKey::from_static(keys::WRAPPER_NAME),
-            context.wrapper.name,
-        )
-        .with_attribute(
-            AttributeKey::from_static(keys::WRAPPER_VERSION),
-            context.wrapper.version,
         );
-
-    if let Some(process) = &context.process {
-        if let Some(pid) = process.pid {
-            event =
-                event.with_attribute(AttributeKey::from_static(keys::PROCESS_PID), i64::from(pid));
-        }
-        if let Some(command) = &process.command
-            && !command.as_os_str().is_empty()
-        {
-            event = event.with_attribute(
-                AttributeKey::from_static(keys::PROCESS_COMMAND),
-                command.display().to_string(),
-            );
-        }
-        if !process.argv.is_empty() {
-            let argv = serde_json::to_string(&process.argv).map_err(|error| {
-                PipelineError::Normalize(NormalizeError::InvalidOutput {
-                    normalizer: descriptor.name(),
-                    message: error.to_string(),
-                })
-            })?;
-            event = event.with_attribute(AttributeKey::from_static(keys::PROCESS_ARGV), argv);
-        }
-        if let Some(cwd) = &process.cwd
-            && !cwd.as_os_str().is_empty()
-        {
-            event = event.with_attribute(
-                AttributeKey::from_static(keys::PROCESS_CWD),
-                cwd.display().to_string(),
-            );
-        }
-    }
 
     if let Some(raw_observation) = raw_observation {
         event = event.with_attribute(
@@ -579,7 +535,7 @@ fn stamp_normalization_metadata(
         );
     }
 
-    Ok(event)
+    event
 }
 
 #[cfg(test)]

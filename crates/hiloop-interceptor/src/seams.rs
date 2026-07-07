@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
 use hiloop_core::{
-    event::{Attributes, Event, PayloadRef},
+    event::{AttributeKey, Attributes, Event, PayloadRef},
     identity::{Hlc, RunContext},
 };
 use std::{
@@ -30,6 +30,7 @@ pub mod provenance_keys {
     pub const RAW_SOURCE: &str = "raw.source";
     pub const RAW_KIND: &str = "raw.kind";
     pub const RAW_RETENTION: &str = "raw.retention";
+    pub const WRAPPER_INVOCATION_ID: &str = "wrapper.invocation_id";
     pub const WRAPPER_NAME: &str = "wrapper.name";
     pub const WRAPPER_VERSION: &str = "wrapper.version";
 }
@@ -447,6 +448,62 @@ impl NormalizationContext {
     /// Static attributes stamped onto every normalized event.
     pub fn attributes(&self) -> &Attributes {
         &self.attributes
+    }
+
+    /// Stamp the context's shared provenance onto `event`: the run's static
+    /// attributes, wrapper identity, and process identity when known.
+    ///
+    /// Every event the wrapper emits must pass through this seam — the pipeline
+    /// applies it to every normalized event, and out-of-band records (capture
+    /// health, spawn failure) call it directly — so scope identity can never be
+    /// dropped by an event built outside the pipeline.
+    #[must_use]
+    pub fn stamp_provenance(&self, event: Event) -> Event {
+        use provenance_keys as keys;
+
+        let mut event = event;
+        for (key, value) in &self.attributes {
+            event = event.with_attribute(key.clone(), value.clone());
+        }
+        event = event
+            .with_attribute(
+                AttributeKey::from_static(keys::WRAPPER_NAME),
+                self.wrapper.name,
+            )
+            .with_attribute(
+                AttributeKey::from_static(keys::WRAPPER_VERSION),
+                self.wrapper.version,
+            );
+
+        let Some(process) = &self.process else {
+            return event;
+        };
+        if let Some(pid) = process.pid {
+            event =
+                event.with_attribute(AttributeKey::from_static(keys::PROCESS_PID), i64::from(pid));
+        }
+        if let Some(command) = &process.command
+            && !command.as_os_str().is_empty()
+        {
+            event = event.with_attribute(
+                AttributeKey::from_static(keys::PROCESS_COMMAND),
+                command.display().to_string(),
+            );
+        }
+        if !process.argv.is_empty() {
+            let argv = serde_json::to_string(&process.argv)
+                .expect("serializing an in-memory argv list cannot fail");
+            event = event.with_attribute(AttributeKey::from_static(keys::PROCESS_ARGV), argv);
+        }
+        if let Some(cwd) = &process.cwd
+            && !cwd.as_os_str().is_empty()
+        {
+            event = event.with_attribute(
+                AttributeKey::from_static(keys::PROCESS_CWD),
+                cwd.display().to_string(),
+            );
+        }
+        event
     }
 }
 

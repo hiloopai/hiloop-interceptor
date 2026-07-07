@@ -596,6 +596,12 @@ async fn spawn_failure_is_captured_as_a_process_spawn_failed_event() {
         .expect("process error");
     assert!(error.contains("os error 2"), "error: {error}");
     assert!(event["attributes"][provenance_keys::WRAPPER_NAME].is_string());
+    // The spawn-failure record is built outside the pipeline yet still carries
+    // the wrap's minted invocation identity.
+    let invocation_id = event["attributes"][provenance_keys::WRAPPER_INVOCATION_ID]
+        .as_str()
+        .expect("wrapper.invocation_id on the spawn-failure event");
+    ulid::Ulid::from_string(invocation_id).expect("wrapper.invocation_id is a valid ULID");
 }
 
 #[tokio::test]
@@ -1006,6 +1012,190 @@ async fn proxy_capture_without_blob_dir_uploads_bodies_to_the_gateway() {
         proto_attr_i64(drain_event, "capture.blobs.found"),
         proto_attr_i64(drain_event, "capture.blobs.landed"),
     );
+}
+
+#[tokio::test]
+async fn every_exported_event_carries_the_wrap_invocation_identity() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A plain-HTTP upstream that answers, so the wrap captures a full exchange.
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = upstream.accept().await {
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/plain\r\n",
+                "Content-Length: 2\r\n\r\n",
+                "ok",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let gateway = fake_gateway::serve().await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let fixture_path = temp.path().join("trace.pb");
+    std::fs::write(&fixture_path, otlp_trace_fixture()).expect("write fixture");
+
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--otlp")
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--export-grpc")
+        .arg(&gateway.endpoint)
+        .arg("--insecure-grpc")
+        .arg("--egress-mode")
+        .arg("allow")
+        .arg("--egress-domain")
+        .arg("denied.test");
+    let url = format!("http://127.0.0.1:{upstream_port}/v1/ok");
+    append_mock_harness(
+        &mut command,
+        "full",
+        &[
+            fixture_path.to_str().expect("fixture path"),
+            &url,
+            "http://denied.test/",
+        ],
+    );
+
+    let output = run(command).await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = read_jsonl(&events_path);
+    let names = events
+        .iter()
+        .map(|event| event["name"].as_str().expect("event name").to_owned())
+        .collect::<BTreeSet<_>>();
+    for required in [
+        "process.start",
+        "process.exit",
+        "process.stdout",
+        "process.stderr",
+        "http.request",
+        "http.response",
+        "egress.denied",
+        "chat",
+        "capture.drain",
+    ] {
+        assert!(
+            names.contains(required),
+            "expected a {required} event, got {names:?}"
+        );
+    }
+
+    // One invocation identity across every exported event — pipeline-normalized
+    // and out-of-band alike — and it is a minted ULID.
+    let invocation_id = events[0]["attributes"][provenance_keys::WRAPPER_INVOCATION_ID]
+        .as_str()
+        .expect("wrapper.invocation_id on the first event")
+        .to_owned();
+    ulid::Ulid::from_string(&invocation_id).expect("wrapper.invocation_id is a valid ULID");
+    for event in &events {
+        assert_eq!(
+            event["attributes"][provenance_keys::WRAPPER_INVOCATION_ID].as_str(),
+            Some(invocation_id.as_str()),
+            "every exported event carries the run's invocation id: {event}"
+        );
+    }
+
+    // The capture-health record is built outside the pipeline; the shared
+    // provenance seam must still stamp process identity onto it.
+    let drain = events
+        .iter()
+        .find(|event| event["name"] == "capture.drain")
+        .expect("capture.drain event");
+    assert!(
+        drain["attributes"][provenance_keys::PROCESS_PID]
+            .as_i64()
+            .expect("capture.drain carries process.pid")
+            > 0
+    );
+}
+
+#[tokio::test]
+async fn exchange_ids_do_not_collide_across_wrapper_invocations_in_one_run() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = upstream.accept().await {
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/plain\r\n",
+                "Content-Length: 2\r\n\r\n",
+                "ok",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    // Two sequential wrapper invocations stamped with the SAME run identity —
+    // the shape of sibling execs inside one sandbox run.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let url = format!("http://127.0.0.1:{upstream_port}/v1/ok");
+    let mut exchange_ids = Vec::new();
+    for events_file in ["first.jsonl", "second.jsonl"] {
+        let events_path = temp.path().join(events_file);
+        let blob_dir = temp.path().join(format!("{events_file}-blobs"));
+        let mut command = interceptor_command();
+        command
+            .arg("--proxy")
+            .arg("--events-jsonl")
+            .arg(&events_path)
+            .arg("--blob-dir")
+            .arg(&blob_dir);
+        append_mock_harness(&mut command, "proxy-http", &[&url]);
+
+        let output = run(command).await;
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let events = read_jsonl(&events_path);
+        let request = events
+            .iter()
+            .find(|event| event["name"] == "http.request")
+            .expect("a captured http request");
+        exchange_ids.push(
+            request["attributes"]["http.exchange_id"]
+                .as_str()
+                .expect("request exchange id")
+                .to_owned(),
+        );
+    }
+
+    let [first, second] = exchange_ids.as_slice() else {
+        panic!("expected two exchange ids, got {exchange_ids:?}");
+    };
+    assert_ne!(
+        first, second,
+        "invocations sharing one run must never mint the same exchange id"
+    );
+    for id in [first, second] {
+        ulid::Ulid::from_string(id).expect("http.exchange_id is a minted ULID");
+    }
 }
 
 /// The single `capture.drain` health record in `events` — exactly one per captured run.

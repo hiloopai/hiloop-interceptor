@@ -10,6 +10,16 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- Every event the wrapper emits now carries `wrapper.invocation_id`: a ULID minted once per wrap
+  invocation (at `RunOptions` construction) that identifies which invocation produced the event —
+  the scope key that correlates one wrapped process's capture (lifecycle, stdio, exchanges,
+  OTLP-derived telemetry, capture health) even when no orchestrator-assigned `execution.id` exists,
+  and keeps sibling invocations sharing one run distinguishable. Out-of-band records
+  (`capture.drain`, `process.spawn_failed`) are stamped through the same provenance seam as
+  pipeline-normalized events (`NormalizationContext::stamp_provenance`), so they now also carry the
+  full shared provenance set — `capture.drain` gains `process.pid`/`process.command`/
+  `process.argv`/`process.cwd`, and `process.spawn_failed` gains `process.command`. Purely
+  additive to the event schema.
 - Payload blob upload to the telemetry gateway: with `--export-grpc` and `--proxy`, captured
   request/response bodies now ship to the gateway's blob service at run end over the same endpoint
   and Bearer auth as the event export (`GrpcBlobUploader`, behind the existing `BlobUploader`
@@ -74,6 +84,11 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Changed
 
+- `http.exchange_id` is now a minted ULID instead of a `xchg-`-prefixed process-local counter.
+  The counter restarted at zero in every wrapper invocation, so two invocations emitting into one
+  run both minted `xchg-0000000000000000` and their unrelated exchanges collided under a single id;
+  ULIDs are globally unique across invocations. The attribute key and its request/response pairing
+  semantics are unchanged — only the value format changes, and only for newly captured events.
 - **Breaking (embedders):** the generated `hiloop.telemetry.v1` client stubs moved from
   `grpc_export::proto` to `grpc_client::proto`, alongside the shared gateway-client plumbing
   (`TOKEN_ENV`, channel construction, Bearer auth) now used by both the event exporter and the

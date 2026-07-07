@@ -65,6 +65,39 @@ fn concurrent_children_have_unique_descendant_paths_under_one_root() {
 }
 
 #[test]
+fn emitting_scope_identity_rides_the_flat_attribute_map() {
+    // Producers stamp their emitting-scope identity — e.g. the wrapper's
+    // per-invocation `wrapper.invocation_id` — as an ordinary attribute. This
+    // pins the canonical serialized shape: a flat string entry in `attributes`
+    // holding a ULID, requiring no spine change.
+    let context = RunContext::new_local_root();
+    let invocation_id = ulid::Ulid::new().to_string();
+    let event = Event::new(
+        &context,
+        Hlc {
+            wall_ns: 1,
+            logical: 0,
+        },
+        SignalType::Exec,
+        EventName::new("process.start").expect("event name"),
+    )
+    .with_attribute(
+        AttributeKey::new("wrapper.invocation_id").expect("attribute key"),
+        invocation_id.as_str(),
+    );
+
+    let value = serde_json::to_value(&event).expect("serialize event");
+    assert_eq!(
+        value["attributes"]["wrapper.invocation_id"],
+        serde_json::json!(invocation_id)
+    );
+    let serialized_id = value["attributes"]["wrapper.invocation_id"]
+        .as_str()
+        .expect("scope id serializes as a flat string");
+    ulid::Ulid::from_string(serialized_id).expect("scope id round-trips as a valid ULID");
+}
+
+#[test]
 fn event_v1_schema_is_locked() {
     let context = RunContext::new_local_root();
     let event = Event::new(

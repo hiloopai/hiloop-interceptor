@@ -183,6 +183,12 @@ impl RunOptions {
     /// Build run options for `command` (argv, where `command[0]` is the executable)
     /// stamped with the run `context`.
     ///
+    /// Construction mints the wrap's invocation identity: a ULID stamped as
+    /// `wrapper.invocation_id` onto every event the run emits — including
+    /// out-of-band records such as `capture.drain` and `process.spawn_failed` —
+    /// so one `RunOptions` value describes exactly one wrap invocation and its
+    /// events stay correlatable even when several invocations share a run.
+    ///
     /// Each sink is optional and composes with the others: `events_jsonl` writes a
     /// newline-delimited JSON event log, `raw_jsonl` a raw observation log (requires
     /// an export target), `blob_dir` the proxy's durable local blob store, `otlp` an
@@ -211,6 +217,11 @@ impl RunOptions {
         max_capture_bytes: Option<u64>,
         export_grpc: Option<GrpcExportOptions>,
     ) -> Self {
+        let mut attributes = Attributes::new();
+        attributes.insert(
+            AttributeKey::from_static(provenance_keys::WRAPPER_INVOCATION_ID),
+            ulid::Ulid::new().to_string().into(),
+        );
         Self {
             context,
             execution_id: None,
@@ -226,7 +237,7 @@ impl RunOptions {
             export_flush_interval: Some(DEFAULT_EXPORT_FLUSH_INTERVAL),
             blob_drain_interval: DEFAULT_BLOB_DRAIN_INTERVAL,
             blob_drain_retry: DrainRetryPolicy::default(),
-            attributes: Attributes::new(),
+            attributes,
             redaction: RedactionPolicy::default(),
             egress: EgressPolicy::default(),
             anomaly: AnomalyConfig::default(),
@@ -1109,32 +1120,23 @@ fn drain_problem(outcome: BlobDrainOutcome) -> Option<anyhow::Error> {
 }
 
 /// Build the run-end capture-health event: one `log`-signal record per captured run stating
-/// whether every captured payload blob landed on the gateway, stamped with the same run
-/// identity and static attributes as the run's captured events.
+/// whether every captured payload blob landed on the gateway, stamped through the same
+/// provenance seam as the run's captured events (run identity, static attributes, wrapper
+/// and process identity).
 fn capture_drain_event(
     context: &NormalizationContext,
     ts: Hlc,
     outcome: &BlobDrainOutcome,
 ) -> Event {
     let report = outcome.report;
-    let mut event = Event::new(
+    let event = Event::new(
         context.run_context(),
         ts,
         SignalType::Log,
         EventName::from_static(CAPTURE_DRAIN_EVENT),
     );
-    for (key, value) in context.attributes() {
-        event = event.with_attribute(key.clone(), value.clone());
-    }
-    event = event
-        .with_attribute(
-            AttributeKey::from_static(provenance_keys::WRAPPER_NAME),
-            context.wrapper.name,
-        )
-        .with_attribute(
-            AttributeKey::from_static(provenance_keys::WRAPPER_VERSION),
-            context.wrapper.version,
-        )
+    let mut event = context
+        .stamp_provenance(event)
         .with_attribute(
             AttributeKey::from_static(capture_keys::FOUND),
             count_attr(report.found),
@@ -1174,46 +1176,24 @@ fn count_attr(value: usize) -> i64 {
 
 /// Build the spawn-failure record: a `process.spawn_failed` `exec` event carrying the attempted
 /// argv, working directory, and the OS error that prevented the child from starting. It is
-/// stamped with the same run identity and static attributes (including `execution.id`, when
-/// set) as every captured event, so the failed attempt joins the run's timeline.
+/// stamped through the same provenance seam as every captured event (run identity, static
+/// attributes including `execution.id` when set, wrapper identity, the attempted process
+/// context — no pid, since no process ever existed), so the failed attempt joins the run's
+/// timeline.
 fn spawn_failure_event(options: &RunOptions, ts: Hlc, error: &io::Error) -> Event {
     let context = NormalizationContext::new(options.context.clone())
-        .with_attributes(options.attributes.clone());
-    let mut event = Event::new(
+        .with_attributes(options.attributes.clone())
+        .with_process(child_process_context(options, None));
+    let event = Event::new(
         context.run_context(),
         ts,
         SignalType::Exec,
         EventName::from_static(crate::exec_events::PROCESS_SPAWN_FAILED),
     );
-    for (key, value) in context.attributes() {
-        event = event.with_attribute(key.clone(), value.clone());
-    }
-    let process = child_process_context(options, None);
-    event = event
-        .with_attribute(
-            AttributeKey::from_static(provenance_keys::WRAPPER_NAME),
-            context.wrapper.name,
-        )
-        .with_attribute(
-            AttributeKey::from_static(provenance_keys::WRAPPER_VERSION),
-            context.wrapper.version,
-        )
-        .with_attribute(
-            AttributeKey::from_static(provenance_keys::PROCESS_ARGV),
-            serde_json::to_string(&process.argv)
-                .expect("serializing an in-memory argv list cannot fail"),
-        )
-        .with_attribute(
-            AttributeKey::from_static(crate::exec_events::keys::PROCESS_ERROR),
-            error.to_string(),
-        );
-    if let Some(cwd) = process.cwd.filter(|cwd| !cwd.as_os_str().is_empty()) {
-        event = event.with_attribute(
-            AttributeKey::from_static(provenance_keys::PROCESS_CWD),
-            cwd.display().to_string(),
-        );
-    }
-    event
+    context.stamp_provenance(event).with_attribute(
+        AttributeKey::from_static(crate::exec_events::keys::PROCESS_ERROR),
+        error.to_string(),
+    )
 }
 
 /// Export one supervisor-emitted record event (capture-health, spawn-failure) within a hard
@@ -2374,6 +2354,68 @@ mod tests {
     }
 
     #[test]
+    fn run_options_mint_a_distinct_wrapper_invocation_id_per_construction() {
+        let key = AttributeKey::from_static(provenance_keys::WRAPPER_INVOCATION_ID);
+        let ids = [
+            base_options(vec!["true".to_owned()]),
+            base_options(vec!["true".to_owned()]),
+        ]
+        .map(|options| {
+            let Some(AttributeValue::String(id)) = options.attributes.get(&key).cloned() else {
+                panic!("run options must mint a wrapper.invocation_id string attribute");
+            };
+            ulid::Ulid::from_string(&id).expect("wrapper.invocation_id is a valid ULID");
+            id
+        });
+
+        assert_ne!(ids[0], ids[1], "each construction mints its own identity");
+    }
+
+    #[test]
+    fn capture_drain_event_carries_full_provenance_via_the_shared_seam() {
+        let options = base_options(vec!["echo".to_owned(), "hi".to_owned()]);
+        let context = NormalizationContext::new(options.context.clone())
+            .with_attributes(options.attributes.clone())
+            .with_process(child_process_context(&options, Some(1234)));
+
+        let event = capture_drain_event(
+            &context,
+            Hlc {
+                wall_ns: 7,
+                logical: 0,
+            },
+            &BlobDrainOutcome {
+                report: crate::blob_drain::BlobDrainReport::default(),
+                error: None,
+            },
+        );
+
+        let value = serde_json::to_value(&event).expect("serialize event");
+        assert_eq!(value["attributes"][provenance_keys::PROCESS_PID], 1234);
+        assert_eq!(
+            value["attributes"][provenance_keys::PROCESS_COMMAND],
+            "echo"
+        );
+        assert_eq!(
+            value["attributes"][provenance_keys::PROCESS_ARGV],
+            r#"["echo","hi"]"#
+        );
+        assert_eq!(
+            value["attributes"][provenance_keys::WRAPPER_INVOCATION_ID],
+            serde_json::to_value(
+                options
+                    .attributes
+                    .get(&AttributeKey::from_static(
+                        provenance_keys::WRAPPER_INVOCATION_ID
+                    ))
+                    .expect("minted invocation id")
+            )
+            .expect("serialize attribute"),
+        );
+        assert_eq!(value["attributes"]["capture.complete"], true);
+    }
+
+    #[test]
     fn run_options_with_execution_id_stamps_attribute_and_child_env_id() {
         let options =
             base_options(vec!["echo".to_owned(), "hi".to_owned()]).with_execution_id("exec-123");
@@ -2422,6 +2464,16 @@ mod tests {
             .expect("process error");
         assert!(recorded.contains("os error 2"), "error: {recorded}");
         assert!(value["attributes"][provenance_keys::WRAPPER_NAME].is_string());
+        let invocation_id = value["attributes"][provenance_keys::WRAPPER_INVOCATION_ID]
+            .as_str()
+            .expect("wrapper.invocation_id on the spawn-failure event");
+        ulid::Ulid::from_string(invocation_id).expect("wrapper.invocation_id is a valid ULID");
+        assert!(
+            value["attributes"]
+                .get(provenance_keys::PROCESS_PID)
+                .is_none(),
+            "a child that never spawned has no pid"
+        );
     }
 
     #[test]

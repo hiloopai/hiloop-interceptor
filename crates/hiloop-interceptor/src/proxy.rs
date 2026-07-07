@@ -89,10 +89,6 @@ const CA_CACHE_SIZE: u64 = 1_000;
 const DESCRIPTOR: NormalizerDescriptor =
     NormalizerDescriptor::new("proxy-http", env!("CARGO_PKG_VERSION"), "hiloop.event.v1");
 
-/// Process-global monotonic source of exchange ids. A plain counter (rather than
-/// a ULID) keeps the proxy dependency-free; uniqueness only needs to hold within
-/// a single wrapper run, and `u64` will not wrap in any realistic run.
-static EXCHANGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static CERT_SERIAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Known LLM API hosts whose traffic is tagged as `llm` rather than `net`.
@@ -1005,9 +1001,12 @@ fn join_flag_names(flags: &[AnomalyFlag]) -> String {
         .join(",")
 }
 
+/// Mint a globally unique exchange id. A ULID rather than a process-local
+/// counter: several wrapper invocations can emit into one run (sibling
+/// commands sharing the same run identity), and a per-process counter would
+/// restart at zero in each, colliding their exchanges under one id.
 fn next_exchange_id() -> String {
-    let id = EXCHANGE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("xchg-{id:016x}")
+    ulid::Ulid::new().to_string()
 }
 
 /// A `403 Forbidden` short-circuit returned for an egress-denied destination.
@@ -2390,10 +2389,13 @@ mod tests {
     }
 
     #[test]
-    fn exchange_ids_are_unique() {
+    fn exchange_ids_are_unique_minted_ulids() {
         let first = next_exchange_id();
         let second = next_exchange_id();
         assert_ne!(first, second);
+        for id in [&first, &second] {
+            ulid::Ulid::from_string(id).expect("exchange id is a valid ULID");
+        }
     }
 
     #[tokio::test]

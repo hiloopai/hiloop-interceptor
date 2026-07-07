@@ -80,6 +80,25 @@ case "$mode" in
         command -v curl >/dev/null 2>&1 || { printf 'curl not found\n' >&2; exit 69; }
         curl -s -o /dev/null --max-time 5 "$url" || true
         ;;
+    full)
+        # Exercise every capture surface in one wrap: stdio, a child OTLP
+        # export, an allowed proxied exchange, and a denied egress attempt.
+        fixture="${1:?full requires an otlp fixture path}"
+        url="${2:?full requires an allowed upstream url}"
+        denied_url="${3:?full requires a denied url}"
+        : "${OTEL_EXPORTER_OTLP_ENDPOINT:?full mode needs OTEL_EXPORTER_OTLP_ENDPOINT}"
+        : "${HTTP_PROXY:?full mode needs HTTP_PROXY}"
+        command -v curl >/dev/null 2>&1 || { printf 'curl not found\n' >&2; exit 69; }
+        printf 'full-stdout\n'
+        printf 'full-stderr\n' >&2
+        # The OTLP endpoint is the wrapper's own loopback receiver; bypass the proxy for it.
+        curl -s --noproxy '*' -X POST -H 'Content-Type: application/x-protobuf' \
+            --data-binary @"$fixture" \
+            "$OTEL_EXPORTER_OTLP_ENDPOINT/v1/traces" >/dev/null
+        curl -s -o /dev/null --max-time 5 "$url" || true
+        # Denied by the run's egress policy: the proxy answers 403 without forwarding.
+        curl -s -o /dev/null --max-time 5 "$denied_url" || true
+        ;;
     proxy-http-hang)
         # Like `proxy-http`, then linger: fetch the URL, mark completion, and stay
         # alive (bounded, so a hard-killed wrapper cannot leak it forever) while a

@@ -202,8 +202,10 @@ access-key ids — are replaced with `[REDACTED]` (`crate::redact`). Redaction r
 captured copy, never the bytes forwarded to the origin, and is best-effort (only known patterns;
 bytes beyond the capture cap are never captured or scanned). Disable per run with `--no-redact`.
 
-**Request/response correlation (shipped).** Each non-`CONNECT` exchange gets a monotonic
-`http.exchange_id` (process-global counter) stamped on both its request and response events.
+**Request/response correlation (shipped).** Each non-`CONNECT` exchange gets a minted ULID
+`http.exchange_id` stamped on both its request and response events. (It was originally a
+process-local counter; that restarted at zero in every wrapper invocation, so sibling invocations
+emitting into one run collided on the same id — a ULID is globally unique across invocations.)
 hudsucker clones the handler per request (`serve_stream` → `self.clone().proxy(req)`) and that one
 clone drives both `handle_request` and `handle_response`, so the id minted on the request is read
 back from per-instance state on the matching response — robust even under HTTP/2 multiplexing, since
