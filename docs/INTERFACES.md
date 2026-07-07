@@ -117,8 +117,13 @@ reports applicability with `supports`, and converts one raw observation into zer
 `Event` values through `NormalizationOutcome`.
 
 The pipeline, not individual normalizers, stamps common provenance such as normalizer name/version,
-output schema version, raw source/kind, raw retention policy, wrapper identity, and generic process
-metadata when available. `process.argv` is currently JSON-encoded into a string attribute because
+output schema version, raw source/kind, and raw retention policy. The shared half of that
+provenance — the run's static attributes (including the per-invocation `wrapper.invocation_id`),
+wrapper identity, and generic process metadata when available — lives on
+`NormalizationContext::stamp_provenance`, the single construction seam the pipeline applies to
+every normalized event and out-of-band supervisor records (capture health, spawn failure) call
+directly, so an event built outside the pipeline cannot silently lose scope identity.
+`process.argv` is currently JSON-encoded into a string attribute because
 `hiloop-core::event::AttributeValue` is intentionally scalar-only; revisit this if arrays become a
 first-class attribute value.
 

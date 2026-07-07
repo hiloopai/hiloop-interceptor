@@ -36,6 +36,47 @@ async fn run_passes_through_child_exit_code() {
 }
 
 #[tokio::test]
+async fn sequential_runs_in_one_process_mint_distinct_invocation_ids() {
+    // The invocation id is minted per constructed run, never from process-wide
+    // static state, so an embedder running several wraps in one process gets a
+    // distinct identity for each.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut invocation_ids = Vec::new();
+    for events_file in ["first.jsonl", "second.jsonl"] {
+        let events_path = temp.path().join(events_file);
+        let options = RunOptions::new(
+            RunContext::new_local_root(),
+            vec!["true".to_owned()],
+            Some(events_path.clone()),
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+        );
+
+        run(&options).await.expect("run should complete");
+
+        let contents = std::fs::read_to_string(&events_path).expect("events file");
+        let event: serde_json::Value =
+            serde_json::from_str(contents.lines().next().expect("an exported event"))
+                .expect("event json");
+        let invocation_id = event["attributes"]["wrapper.invocation_id"]
+            .as_str()
+            .expect("wrapper.invocation_id attribute")
+            .to_owned();
+        ulid::Ulid::from_string(&invocation_id).expect("wrapper.invocation_id is a valid ULID");
+        invocation_ids.push(invocation_id);
+    }
+
+    assert_ne!(
+        invocation_ids[0], invocation_ids[1],
+        "each wrap invocation mints its own identity"
+    );
+}
+
+#[tokio::test]
 async fn grpc_export_options_are_part_of_the_public_surface() {
     // A downstream embedder constructs the gRPC target alongside the run options.
     let export = GrpcExportOptions {
