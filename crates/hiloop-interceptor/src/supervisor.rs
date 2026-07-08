@@ -600,10 +600,11 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
     ChildEnv::for_run(&options.context, options.execution_id.as_deref()).apply_to(&mut command);
     set_child_process_group(&mut command);
 
+    let signals = ForwardedSignals::install();
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn child command `{}`", options.command[0]))?;
-    let status = with_signal_forwarding(child.id(), None, None, child.wait())
+    let status = with_signal_forwarding(signals, child.id(), None, None, child.wait())
         .await
         .with_context(|| format!("failed to run child command `{}`", options.command[0]))?;
     Ok(exit_code_from_status(status))
@@ -733,6 +734,7 @@ where
     }
     child_env.apply_to(&mut command);
 
+    let signals = ForwardedSignals::install();
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -965,12 +967,15 @@ where
     // The child exiting is the cue to stop the capture servers: dropping their
     // senders lets the pipeline drain and finish.
     let child_and_shutdown = async {
-        let status =
-            with_signal_forwarding(child_pid, pty_resize_fd, Some(&exec_emitter), child.wait())
-                .await
-                .with_context(|| {
-                    format!("failed to wait for child command `{}`", options.command[0])
-                });
+        let status = with_signal_forwarding(
+            signals,
+            child_pid,
+            pty_resize_fd,
+            Some(&exec_emitter),
+            child.wait(),
+        )
+        .await
+        .with_context(|| format!("failed to wait for child command `{}`", options.command[0]));
         if let Ok(status) = &status {
             exec_emitter
                 .emit_exit(
@@ -1980,15 +1985,57 @@ fn set_child_process_group(command: &mut Command) {
     }
 }
 
+/// The wrapper's installed SIGINT/SIGTERM handlers, ready to drive
+/// [`with_signal_forwarding`].
+#[cfg(unix)]
+struct ForwardedSignals {
+    sigint: tokio::signal::unix::Signal,
+    sigterm: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ForwardedSignals {
+    /// Install the wrapper's SIGINT/SIGTERM handlers, or `None` when
+    /// installation fails (the run then proceeds without forwarding).
+    ///
+    /// Call this *before* spawning the child: handlers installed after the
+    /// spawn race it — a signal sent as soon as the child observably runs can
+    /// still hit the wrapper's default disposition, killing the wrapper
+    /// without forwarding and orphaning the child's process group.
+    fn install() -> Option<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) {
+            (Ok(sigint), Ok(sigterm)) => Some(Self { sigint, sigterm }),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ForwardedSignals;
+
+#[cfg(not(unix))]
+impl ForwardedSignals {
+    fn install() -> Option<Self> {
+        None
+    }
+}
+
 /// Run `work` to completion while forwarding terminating signals to the child.
 ///
-/// On Unix the wrapper installs SIGINT/SIGTERM handlers and re-sends the signal
+/// On Unix the wrapper re-sends each SIGINT/SIGTERM received on `signals`
+/// (installed by [`ForwardedSignals::install`] before the child was spawned)
 /// to the child's process group, so Ctrl-C and `kill` tear down the harness
 /// subtree once instead of racing the wrapper, while the wrapper still drains
-/// the child and reports its exit status. If handler installation fails, or off
+/// the child and reports its exit status. Without installed handlers, or off
 /// Unix, `work` runs without forwarding.
 #[cfg(unix)]
 async fn with_signal_forwarding<F, T>(
+    signals: Option<ForwardedSignals>,
     child_pid: Option<u32>,
     pty_resize_fd: Option<std::fs::File>,
     emitter: Option<&ExecLifecycleEmitter>,
@@ -1999,10 +2046,11 @@ where
 {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let (Ok(mut sigint), Ok(mut sigterm)) = (
-        signal(SignalKind::interrupt()),
-        signal(SignalKind::terminate()),
-    ) else {
+    let Some(ForwardedSignals {
+        mut sigint,
+        mut sigterm,
+    }) = signals
+    else {
         return work.await;
     };
     let mut sigwinch = if pty_resize_fd.is_some() {
@@ -2041,6 +2089,7 @@ where
 
 #[cfg(not(unix))]
 async fn with_signal_forwarding<F, T>(
+    _signals: Option<ForwardedSignals>,
     _child_pid: Option<u32>,
     _pty_resize_fd: (),
     _emitter: Option<&ExecLifecycleEmitter>,

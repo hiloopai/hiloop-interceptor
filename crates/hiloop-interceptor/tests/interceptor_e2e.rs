@@ -567,6 +567,9 @@ async fn captures_forwarded_signal_as_a_process_signal_event() {
     let events_path = temp.path().join("events.jsonl");
     let started = temp.path().join("started");
     let terminated = temp.path().join("terminated");
+    let _harness_reaper = HarnessGroupReaper {
+        pid_file: started.clone(),
+    };
 
     let mut command = interceptor_command();
     command.arg("--events-jsonl").arg(&events_path);
@@ -1612,6 +1615,9 @@ async fn forwards_sigterm_to_child_and_reports_signal_exit() {
     let temp = tempfile::tempdir().expect("tempdir");
     let started = temp.path().join("started");
     let terminated = temp.path().join("terminated");
+    let _harness_reaper = HarnessGroupReaper {
+        pid_file: started.clone(),
+    };
 
     let mut command = interceptor_command();
     append_mock_harness(
@@ -1625,8 +1631,8 @@ async fn forwards_sigterm_to_child_and_reports_signal_exit() {
     let mut child = command.spawn().expect("spawn interceptor");
 
     // The harness writes `started` only after installing its SIGTERM trap, and
-    // the wrapper installs its own handlers before the child can run, so once
-    // `started` exists both ends are ready for the signal.
+    // the wrapper installs its forwarding handlers before spawning the child,
+    // so once `started` exists both ends are ready for the signal.
     wait_for_path(&started).await;
 
     let pid =
@@ -1647,6 +1653,34 @@ async fn forwards_sigterm_to_child_and_reports_signal_exit() {
         Some(143),
         "wrapper should report the child's 128 + SIGTERM exit code"
     );
+}
+
+/// Kills the mock harness's process group on drop, so no exit path — panic,
+/// timeout, or a wrapper bug that skips forwarding — can leak the `trap`-mode
+/// harness past the test.
+///
+/// The harness records its pid in the started marker, and the wrapper starts
+/// it at the head of its own process group (pgid == pid); when the harness
+/// already exited the kill is a no-op.
+#[cfg(unix)]
+struct HarnessGroupReaper {
+    pid_file: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for HarnessGroupReaper {
+    fn drop(&mut self) {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+
+        let Ok(contents) = std::fs::read_to_string(&self.pid_file) else {
+            return;
+        };
+        let Ok(pid) = contents.trim().parse::<i32>() else {
+            return;
+        };
+        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+    }
 }
 
 #[cfg(unix)]

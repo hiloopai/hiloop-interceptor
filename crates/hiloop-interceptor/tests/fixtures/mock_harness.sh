@@ -47,11 +47,18 @@ case "$mode" in
     trap)
         started="${1:?trap requires a started-marker path}"
         terminated="${2:?trap requires a terminated-marker path}"
-        # Record that the trap is installed, then block until SIGTERM arrives.
+        # Record that the trap is installed, then wait (bounded, so a
+        # hard-killed wrapper cannot leak it forever) for SIGTERM to arrive.
+        # The marker carries this shell's pid — the head of its process group —
+        # so the test can reap the group if the signal is never forwarded; the
+        # tmp+mv makes it appear atomically with its content.
         trap ': > "$terminated"; exit 143' TERM
-        : > "$started"
-        while true; do
-            sleep 0.05
+        printf '%d\n' "$$" > "$started.tmp"
+        mv "$started.tmp" "$started"
+        index=0
+        while [ "$index" -lt 300 ]; do
+            sleep 0.1
+            index=$((index + 1))
         done
         ;;
     otlp)
