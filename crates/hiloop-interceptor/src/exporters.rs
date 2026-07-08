@@ -136,6 +136,17 @@ mod tests {
         assert_eq!(exporter.events().len(), 1);
     }
 
+    /// A shared handle satisfies the same contract and exports through the shared
+    /// instance (the supervisor fans out through one while keeping the other).
+    #[tokio::test]
+    async fn arc_exporter_satisfies_exporter_contract_through_the_shared_instance() {
+        let exporter = std::sync::Arc::new(MemoryExporter::default());
+
+        assert_exporter_accepts_empty_batch_and_flushes(&std::sync::Arc::clone(&exporter)).await;
+
+        assert_eq!(exporter.events().len(), 1);
+    }
+
     #[tokio::test]
     async fn jsonl_exporter_satisfies_exporter_contract() {
         let temp = tempfile::tempdir().expect("tempdir");

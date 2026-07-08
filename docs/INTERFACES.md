@@ -192,10 +192,16 @@ Ways this may go awry:
 `Exporter` owns delivery. It receives already-normalized event batches and flushes them before
 shutdown. Exporters should not rewrite event semantics; enrichment belongs before export.
 
+`ExportError` carries retry semantics in its variants — transient (`Backpressure`,
+`Unavailable`), permanent (`Rejected`), ambiguous (`Other`) — so retry policy composes at the
+seam instead of leaking transport knowledge upward. `SpoolingExporter` is that composition: a
+decorator that keeps the wrapped exporter single-shot and honest while it absorbs outages into
+a bounded in-memory spool with in-order redelivery, classified retry, and explicit drop
+accounting.
+
 Expected growth:
 
 - additional export sinks (e.g. OTLP) and local test exporters;
-- retries and partial-failure policy;
 - compression and authentication;
 - partitioning;
 - durable checkpoints.

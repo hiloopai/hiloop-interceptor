@@ -620,6 +620,19 @@ pub trait Exporter: Send + Sync {
     }
 }
 
+/// A shared exporter handle exports through the shared instance, so one exporter can
+/// sit in a fan-out while its owner keeps a handle for end-of-run accounting.
+#[async_trait]
+impl<T: Exporter + ?Sized> Exporter for std::sync::Arc<T> {
+    async fn export(&self, events: &[Event]) -> Result<(), ExportError> {
+        (**self).export(events).await
+    }
+
+    async fn flush(&self) -> Result<(), ExportError> {
+        (**self).flush().await
+    }
+}
+
 #[async_trait]
 pub trait RawStore: Send + Sync {
     async fn store(
@@ -673,10 +686,27 @@ pub enum NormalizeError {
     },
 }
 
+/// Export failures carry retry semantics in their variant, so a spooling/retrying
+/// wrapper (e.g. [`crate::spool::SpoolingExporter`]) can tell a transient outage from a
+/// permanent rejection without knowing the sink's transport:
+///
+/// - [`Backpressure`](Self::Backpressure) and [`Unavailable`](Self::Unavailable) are
+///   transient — the batch was never judged, so redelivering it later is safe and
+///   expected to succeed once the sink recovers;
+/// - [`Rejected`](Self::Rejected) is permanent — the sink judged the batch (or its
+///   credentials) and refused it, so retrying the same batch can never succeed;
+/// - [`Other`](Self::Other) is ambiguous — the sink's state is unknown.
 #[derive(Debug, Error)]
 pub enum ExportError {
     #[error("exporter `{exporter}` is applying back-pressure: {message}")]
     Backpressure { exporter: String, message: String },
+    /// The sink is unreachable (outage, transport failure, unresponsive endpoint).
+    #[error("exporter `{exporter}` is unavailable: {message}")]
+    Unavailable { exporter: String, message: String },
+    /// The sink refused this batch outright (invalid contents, missing or bad
+    /// credentials); the refusal is a property of the batch, not of the moment.
+    #[error("exporter `{exporter}` rejected the batch: {message}")]
+    Rejected { exporter: String, message: String },
     #[error("exporter `{exporter}` failed: {message}")]
     Other {
         exporter: String,
@@ -722,6 +752,27 @@ impl RawStoreError {
 }
 
 impl ExportError {
+    pub fn backpressure(exporter: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Backpressure {
+            exporter: exporter.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn unavailable(exporter: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Unavailable {
+            exporter: exporter.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn rejected(exporter: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Rejected {
+            exporter: exporter.into(),
+            message: message.into(),
+        }
+    }
+
     pub fn other(exporter: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Other {
             exporter: exporter.into(),
