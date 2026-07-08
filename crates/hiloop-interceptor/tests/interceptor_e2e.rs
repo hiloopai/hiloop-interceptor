@@ -208,14 +208,29 @@ async fn wrapper_exits_after_the_child_even_when_its_stdin_never_closes() {
 #[cfg(unix)]
 #[tokio::test]
 async fn capture_preserves_tty_stdio_for_interactive_children() {
-    use nix::pty::openpty;
+    use nix::fcntl::OFlag;
+    use nix::pty::{grantpt, posix_openpt, ptsname_r, unlockpt};
+    use std::os::unix::fs::OpenOptionsExt as _;
     use tokio::io::AsyncReadExt as _;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let events_path = temp.path().join("events.jsonl");
-    let pty = openpty(None, None).expect("open pty");
-    let master = std::fs::File::from(pty.master);
-    let slave = std::fs::File::from(pty.slave);
+    // openpty would hand out inheritable descriptors with no atomic way to fix that after the
+    // fact: a child forked by a concurrently running test inside the gap would keep the slave
+    // open past this test's child and hold the master read short of EOF below. Open both ends
+    // close-on-exec from birth instead (std's open sets O_CLOEXEC by default).
+    let master =
+        posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC).expect("open pty master");
+    grantpt(&master).expect("grant pty slave");
+    unlockpt(&master).expect("unlock pty slave");
+    let slave_path = ptsname_r(&master).expect("pty slave path");
+    let master = std::fs::File::from(std::os::fd::OwnedFd::from(master));
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_NOCTTY)
+        .open(&slave_path)
+        .expect("open pty slave");
 
     let mut command = interceptor_command();
     command
@@ -241,6 +256,9 @@ async fn capture_preserves_tty_stdio_for_interactive_children() {
         .stderr(std::process::Stdio::from(slave));
 
     let mut child = command.spawn().expect("spawn interceptor under pty");
+    // The command still owns the parent-side slave handles; drop it so the wrapper process holds
+    // the only remaining ones and the master reader reaches EOF (EIO on Linux) once it exits.
+    drop(command);
     let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let reader_output = std::sync::Arc::clone(&output);
     let mut master = tokio::fs::File::from_std(master);
@@ -263,7 +281,12 @@ async fn capture_preserves_tty_stdio_for_interactive_children() {
         .await
         .expect("pty capture scenario timed out")
         .expect("wait for interceptor");
-    reader.abort();
+    // The child's final burst can still be in flight between the PTY buffer and the reader when
+    // `wait` returns; await the reader's EOF instead of aborting it so no output is dropped.
+    tokio::time::timeout(E2E_TIMEOUT, reader)
+        .await
+        .expect("pty reader should reach EOF once the child exits")
+        .expect("pty reader task");
     let output = output.lock().expect("output buffer mutex").clone();
 
     assert!(
