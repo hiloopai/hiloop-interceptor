@@ -10,6 +10,23 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- The gRPC event export now survives telemetry-gateway outages: export failures are classified by
+  gRPC status — a transient failure (`UNAVAILABLE`, `RESOURCE_EXHAUSTED`, transport errors) parks
+  the batch in a bounded in-memory spool (8192 events / 32 MiB; over the caps the oldest events
+  are dropped and counted) and is redelivered strictly in arrival order under bounded exponential
+  backoff (500 ms doubling to 30 s, 10 s per attempt); a permanent rejection (`INVALID_ARGUMENT`,
+  `PERMISSION_DENIED`, `UNAUTHENTICATED`) drops that batch immediately with a loud warning
+  (redelivering a judged batch cannot succeed); anything else gets one inline retry, then spools.
+  An outage no longer aborts the capture pipeline, so local sinks (`--events-jsonl`) keep
+  capturing through it, and the child is never blocked on a sink known to be down. At run end the
+  spool drains best-effort within the same bounded budget as the payload-blob drain; anything
+  still undelivered is reported on stderr with counts instead of being dropped silently. The
+  `capture.drain` health record is now emitted for every gRPC-exported run (previously only
+  proxy-capturing runs) and gains `capture.events.dropped`, `capture.events.rejected`, and
+  `capture.events.pending` attributes; `capture.complete` now also requires that no exported
+  event was lost. `ExportError` gains `Unavailable` and `Rejected` variants carrying these retry
+  semantics at the exporter seam.
+
 - Every event the wrapper emits now carries `wrapper.invocation_id`: a ULID minted once per wrap
   invocation (at `RunOptions` construction) that identifies which invocation produced the event —
   the scope key that correlates one wrapped process's capture (lifecycle, stdio, exchanges,

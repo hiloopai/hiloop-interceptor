@@ -60,6 +60,9 @@ tonic-prost-build.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# Deterministic clock control (`start_paused`, `time::advance`) for the export
+# spool's backoff tests; a dev-only feature, never part of the shipped build.
+tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls.workspace = true
 x509-parser.workspace = true
 

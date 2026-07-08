@@ -1377,6 +1377,80 @@ async fn failed_blob_drain_keeps_the_scratch_store_for_recovery() {
     std::fs::remove_dir_all(&kept_path).expect("cleanup kept scratch dir");
 }
 
+/// A gateway outage for the whole run must not abort capture: every event still
+/// lands in the local JSONL sink, the child's exit code passes through, and the
+/// undelivered backlog is reported with counts — not dropped silently.
+#[tokio::test]
+async fn gateway_outage_keeps_local_capture_complete_and_reports_undelivered_counts() {
+    // A dead endpoint: bind a port, then drop the listener so every connect is refused.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let dead_endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+    drop(listener);
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let mut command = interceptor_command();
+    command
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--export-grpc")
+        .arg(&dead_endpoint)
+        .arg("--insecure-grpc")
+        // Small batches so the outage is hit across several export calls, not one
+        // final flush — the regression this guards is the pipeline dying on the
+        // first failed batch and losing the rest of the local capture too.
+        .arg("--export-batch-size")
+        .arg("4");
+    append_mock_harness(&mut command, "lines", &["10"]);
+
+    let output = run(command).await;
+
+    assert!(output.status.success(), "the outage must not fail the run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("telemetry capture incomplete"),
+        "the undelivered backlog must be reported, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("never reached the telemetry gateway"),
+        "the report names the loss class with a count, stderr: {stderr}"
+    );
+
+    // The local JSONL capture is untouched by the gateway outage.
+    let events = read_jsonl(&events_path);
+    let stdio_messages = events
+        .iter()
+        .filter(|event| event["name"] == "process.stdout" || event["name"] == "process.stderr")
+        .count();
+    assert_eq!(
+        stdio_messages, 20,
+        "all 10 stdout + 10 stderr lines are captured locally despite the outage"
+    );
+    assert_process_lifecycle(&events, 0);
+
+    // The capture-health record is minted and captured locally; it accounts for the
+    // backlog without claiming loss (the spool drops nothing under its caps here).
+    let drain = events
+        .iter()
+        .find(|event| event["name"] == "capture.drain")
+        .expect("capture.drain event in the local capture");
+    assert_eq!(drain["attributes"]["capture.events.dropped"], 0);
+    assert_eq!(drain["attributes"]["capture.events.rejected"], 0);
+    assert!(
+        drain["attributes"]["capture.events.pending"]
+            .as_i64()
+            .expect("pending count")
+            > 0,
+        "the backlog at mint time is recorded: {drain}"
+    );
+    assert_eq!(
+        drain["attributes"]["capture.complete"], true,
+        "spooled-but-undelivered is a backlog, not a loss: {drain}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn incremental_drain_lands_bodies_before_a_sigkill_teardown() {

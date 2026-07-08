@@ -26,6 +26,7 @@ use crate::{
         RawRetentionPolicy, RawSignal, RawStore, SourceError, provenance_keys,
     },
     secret::{BrokerConfig, SecretBinding, SecretInjector},
+    spool::{SpoolPolicy, SpoolReport, SpoolingExporter},
     stdio::StdioLogNormalizer,
 };
 use anyhow::{Context, Result, bail};
@@ -82,6 +83,9 @@ mod capture_keys {
     pub(super) const MISSING: &str = "capture.blobs.missing";
     pub(super) const OVERSIZE: &str = "capture.blobs.oversize";
     pub(super) const MISSING_BYTES: &str = "capture.blobs.missing_bytes";
+    pub(super) const EVENTS_DROPPED: &str = "capture.events.dropped";
+    pub(super) const EVENTS_REJECTED: &str = "capture.events.rejected";
+    pub(super) const EVENTS_PENDING: &str = "capture.events.pending";
     pub(super) const COMPLETE: &str = "capture.complete";
     pub(super) const ERROR: &str = "capture.error";
 }
@@ -319,7 +323,9 @@ impl RunOptions {
         self
     }
 
-    /// Override the run-end blob drain's bounded retry schedule.
+    /// Override the run-end drain's bounded retry schedule. One budget bounds both
+    /// final drains — captured payload blobs and the spooled event backlog — so it
+    /// caps the wrapper's exit latency when the gateway is unreachable.
     #[must_use]
     pub fn with_blob_drain_retry(mut self, policy: DrainRetryPolicy) -> Self {
         self.blob_drain_retry = policy;
@@ -565,18 +571,22 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
                 },
             )?));
         }
+        // The gRPC exporter is wrapped in a bounded spool so a gateway outage degrades
+        // capture measurably (spooled, redelivered in order on recovery) instead of
+        // killing the pipeline; the supervisor keeps a handle for the run-end drain
+        // and its loss accounting.
+        let mut event_spool: Option<Arc<SpoolingExporter<GrpcIngestExporter>>> = None;
         if let Some(grpc) = &options.export_grpc {
-            exporters.push(Box::new(
-                GrpcIngestExporter::connect(
-                    &grpc.endpoint,
-                    grpc.tenant_id.clone(),
-                    &grpc.project_id,
-                    grpc.insecure,
-                )
-                .with_context(|| {
-                    format!("failed to build gRPC exporter for `{}`", grpc.endpoint)
-                })?,
-            ));
+            let ingest = GrpcIngestExporter::connect(
+                &grpc.endpoint,
+                grpc.tenant_id.clone(),
+                &grpc.project_id,
+                grpc.insecure,
+            )
+            .with_context(|| format!("failed to build gRPC exporter for `{}`", grpc.endpoint))?;
+            let spool = Arc::new(SpoolingExporter::new(ingest, SpoolPolicy::default()));
+            exporters.push(Box::new(Arc::clone(&spool)));
+            event_spool = Some(spool);
         }
         let exporter = FanOutExporter::new(exporters);
         if let Some(raw_path) = &options.raw_jsonl {
@@ -586,13 +596,23 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
                     raw_path.display()
                 )
             })?;
-            return Box::pin(run_captured(options, &exporter, Some(&raw_store)))
-                .await
-                .map(CapturedRun::into_exit_code);
-        }
-        return Box::pin(run_captured(options, &exporter, None))
+            return Box::pin(run_captured(
+                options,
+                &exporter,
+                Some(&raw_store),
+                event_spool.as_deref(),
+            ))
             .await
             .map(CapturedRun::into_exit_code);
+        }
+        return Box::pin(run_captured(
+            options,
+            &exporter,
+            None,
+            event_spool.as_deref(),
+        ))
+        .await
+        .map(CapturedRun::into_exit_code);
     }
 
     let mut command = Command::new(&options.command[0]);
@@ -632,6 +652,7 @@ async fn run_captured<E>(
     options: &RunOptions,
     exporter: &E,
     raw_store: Option<&dyn RawStore>,
+    event_spool: Option<&SpoolingExporter<GrpcIngestExporter>>,
 ) -> Result<CapturedRun>
 where
     E: Exporter,
@@ -748,6 +769,17 @@ where
             .await
             {
                 eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
+            }
+            // The record may have parked in the event spool (a gateway outage at spawn
+            // time); this is the process's only exit path, so give it its bounded final
+            // chance now and report what stays undelivered.
+            if let Some(spool) = event_spool {
+                let report = spool.drain(&options.blob_drain_retry).await;
+                if let Some(warning) = spool_problem(&report, spool.last_failure().await) {
+                    eprintln!(
+                        "hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}"
+                    );
+                }
             }
             return Err(anyhow::Error::new(error).context(format!(
                 "failed to spawn child command `{}`",
@@ -1040,14 +1072,13 @@ where
     .filter_map(Result::err)
     .collect();
 
-    // Run-end blob drain + capture-health record, best-effort like the rest of the drain.
-    // The authoritative final pass re-probes every digest against the gateway and retries
-    // with bounded backoff (the child has exited, so the budget caps exit latency, not
-    // capture). Its outcome ships as a `capture.drain` event so a run whose payload bodies
-    // never landed is *queryably* incomplete — and a captured run with no `capture.drain`
-    // event at all is one whose wrapper died before draining. An incomplete drain keeps the
-    // scratch store: deleting it would destroy the only bytes behind already-exported
-    // payload_ref digests.
+    // Run-end blob drain, best-effort like the rest of the drain. The authoritative
+    // final pass re-probes every digest against the gateway and retries with bounded
+    // backoff (the child has exited, so the budget caps exit latency, not capture). An
+    // incomplete drain keeps the scratch store: deleting it would destroy the only
+    // bytes behind already-exported payload_ref digests.
+    let mut blob_outcome: Option<BlobDrainOutcome> = None;
+    let mut blob_drain_failed = false;
     if let Some(task) = drain_task {
         match task.await {
             Ok(drainer) => {
@@ -1063,34 +1094,67 @@ where
                         report.oversize_skipped
                     );
                 }
-                let health_event = capture_drain_event(&health_context, clock.tick(), &outcome);
-                if let Err(warning) = export_supervisor_record(
-                    exporter,
-                    health_event,
-                    "capture-health",
-                    CAPTURE_HEALTH_EXPORT_TIMEOUT,
-                )
-                .await
-                {
-                    drain_warnings.push(warning);
-                }
-                if let Some(warning) = drain_problem(outcome) {
-                    let warning = match scratch_blob_dir.take() {
-                        // `keep` disables the TempDir's deletion; the bytes survive for
-                        // recovery.
-                        Some(scratch) => warning.context(format!(
-                            "captured payload blobs kept at `{}`",
-                            scratch.keep().display()
-                        )),
-                        None => warning,
-                    };
-                    drain_warnings.push(warning);
-                }
+                blob_outcome = Some(outcome);
             }
             Err(join_error) => {
+                blob_drain_failed = true;
                 drain_warnings
                     .push(anyhow::Error::new(join_error).context("blob drain task failed"));
             }
+        }
+    }
+
+    // The capture-health record ships once per drained run so a run whose payload
+    // bodies or events never landed is *queryably* incomplete — and a captured run
+    // with no `capture.drain` event at all is one whose wrapper died before draining.
+    // It ships BEFORE the final event-spool drain on purpose: spool redelivery is
+    // strictly in arrival order, so a `capture.drain` event that reaches the gateway
+    // certifies that everything spooled before it landed too.
+    if !blob_drain_failed && (blob_outcome.is_some() || event_spool.is_some()) {
+        let spool_report = match event_spool {
+            Some(spool) => Some(spool.report().await),
+            None => None,
+        };
+        let health_event = capture_drain_event(
+            &health_context,
+            clock.tick(),
+            blob_outcome.as_ref(),
+            spool_report,
+        );
+        if let Err(warning) = export_supervisor_record(
+            exporter,
+            health_event,
+            "capture-health",
+            CAPTURE_HEALTH_EXPORT_TIMEOUT,
+        )
+        .await
+        {
+            drain_warnings.push(warning);
+        }
+    }
+
+    if let Some(outcome) = blob_outcome
+        && let Some(warning) = drain_problem(outcome)
+    {
+        let warning = match scratch_blob_dir.take() {
+            // `keep` disables the TempDir's deletion; the bytes survive for
+            // recovery.
+            Some(scratch) => warning.context(format!(
+                "captured payload blobs kept at `{}`",
+                scratch.keep().display()
+            )),
+            None => warning,
+        };
+        drain_warnings.push(warning);
+    }
+
+    // Run-end event drain: the spooled backlog gets its final chance within the same
+    // bounded budget as the blob drain; whatever remains undelivered is reported with
+    // counts instead of being dropped silently.
+    if let Some(spool) = event_spool {
+        let report = spool.drain(&options.blob_drain_retry).await;
+        if let Some(warning) = spool_problem(&report, spool.last_failure().await) {
+            drain_warnings.push(warning);
         }
     }
     drop(scratch_blob_dir);
@@ -1125,59 +1189,117 @@ fn drain_problem(outcome: BlobDrainOutcome) -> Option<anyhow::Error> {
     None
 }
 
-/// Build the run-end capture-health event: one `log`-signal record per captured run stating
-/// whether every captured payload blob landed on the gateway, stamped through the same
-/// provenance seam as the run's captured events (run identity, static attributes, wrapper
-/// and process identity).
+/// Build the run-end capture-health event: one `log`-signal record per captured run
+/// stating whether everything captured landed on the gateway — payload blobs (when a
+/// blob drain ran) and exported events (when a gRPC export spool ran) — stamped
+/// through the same provenance seam as the run's captured events (run identity,
+/// static attributes, wrapper and process identity). `capture.complete` is the
+/// conjunction: every uploadable blob landed AND no exported event was dropped. The
+/// event-spool counters are loss counters — events still awaiting redelivery do not
+/// count against completeness, because redelivery is strictly in order: this record
+/// reaching the gateway certifies everything spooled before it landed too.
 fn capture_drain_event(
     context: &NormalizationContext,
     ts: Hlc,
-    outcome: &BlobDrainOutcome,
+    blob_outcome: Option<&BlobDrainOutcome>,
+    spool_report: Option<SpoolReport>,
 ) -> Event {
-    let report = outcome.report;
     let event = Event::new(
         context.run_context(),
         ts,
         SignalType::Log,
         EventName::from_static(CAPTURE_DRAIN_EVENT),
     );
-    let mut event = context
-        .stamp_provenance(event)
-        .with_attribute(
-            AttributeKey::from_static(capture_keys::FOUND),
-            count_attr(report.found),
-        )
-        .with_attribute(
-            AttributeKey::from_static(capture_keys::LANDED),
-            count_attr(report.landed),
-        )
-        .with_attribute(
-            AttributeKey::from_static(capture_keys::MISSING),
-            count_attr(report.missing),
-        )
-        .with_attribute(
-            AttributeKey::from_static(capture_keys::OVERSIZE),
-            count_attr(report.oversize_skipped),
-        )
-        .with_attribute(
-            AttributeKey::from_static(capture_keys::MISSING_BYTES),
-            i64::try_from(report.missing_bytes).unwrap_or(i64::MAX),
-        )
-        .with_attribute(
-            AttributeKey::from_static(capture_keys::COMPLETE),
-            outcome.is_complete(),
-        );
-    if let Some(error) = &outcome.error {
-        event = event.with_attribute(
-            AttributeKey::from_static(capture_keys::ERROR),
-            error.to_string(),
-        );
+    let mut event = context.stamp_provenance(event);
+    let mut complete = true;
+    if let Some(outcome) = blob_outcome {
+        let report = outcome.report;
+        complete &= outcome.is_complete();
+        event = event
+            .with_attribute(
+                AttributeKey::from_static(capture_keys::FOUND),
+                count_attr(report.found),
+            )
+            .with_attribute(
+                AttributeKey::from_static(capture_keys::LANDED),
+                count_attr(report.landed),
+            )
+            .with_attribute(
+                AttributeKey::from_static(capture_keys::MISSING),
+                count_attr(report.missing),
+            )
+            .with_attribute(
+                AttributeKey::from_static(capture_keys::OVERSIZE),
+                count_attr(report.oversize_skipped),
+            )
+            .with_attribute(
+                AttributeKey::from_static(capture_keys::MISSING_BYTES),
+                i64::try_from(report.missing_bytes).unwrap_or(i64::MAX),
+            );
+        if let Some(error) = &outcome.error {
+            event = event.with_attribute(
+                AttributeKey::from_static(capture_keys::ERROR),
+                error.to_string(),
+            );
+        }
     }
-    event
+    if let Some(report) = spool_report {
+        complete &= report.is_lossless_so_far();
+        event = event
+            .with_attribute(
+                AttributeKey::from_static(capture_keys::EVENTS_DROPPED),
+                i64::try_from(report.dropped_events).unwrap_or(i64::MAX),
+            )
+            .with_attribute(
+                AttributeKey::from_static(capture_keys::EVENTS_REJECTED),
+                i64::try_from(report.rejected_events).unwrap_or(i64::MAX),
+            )
+            // The backlog at mint time, mainly for the local (JSONL) copy of this
+            // record: on the gateway copy a non-zero value documents late delivery,
+            // never loss — the record queues behind its backlog, so it can only
+            // arrive after everything it counted.
+            .with_attribute(
+                AttributeKey::from_static(capture_keys::EVENTS_PENDING),
+                count_attr(report.pending_events),
+            );
+    }
+    event.with_attribute(AttributeKey::from_static(capture_keys::COMPLETE), complete)
 }
 
 fn count_attr(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Render event-spool loss/backlog as the run's export warning, or `None` when the
+/// spool ended clean: everything delivered, nothing dropped.
+fn spool_problem(report: &SpoolReport, last_failure: Option<String>) -> Option<anyhow::Error> {
+    if report.is_clean() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if report.pending_events > 0 {
+        parts.push(format!(
+            "{} captured event(s) never reached the telemetry gateway",
+            report.pending_events
+        ));
+    }
+    if report.dropped_events > 0 {
+        parts.push(format!(
+            "{} oldest event(s) were dropped when the export spool filled",
+            report.dropped_events
+        ));
+    }
+    if report.rejected_events > 0 {
+        parts.push(format!(
+            "{} event(s) were dropped after the gateway permanently rejected their batch",
+            report.rejected_events
+        ));
+    }
+    let message = parts.join("; ");
+    Some(match last_failure {
+        Some(failure) => anyhow::anyhow!("last export failure: {failure}").context(message),
+        None => anyhow::anyhow!(message),
+    })
 }
 
 /// Build the spawn-failure record: a `process.spawn_failed` `exec` event carrying the attempted
@@ -2509,10 +2631,11 @@ mod tests {
                 wall_ns: 7,
                 logical: 0,
             },
-            &BlobDrainOutcome {
+            Some(&BlobDrainOutcome {
                 report: crate::blob_drain::BlobDrainReport::default(),
                 error: None,
-            },
+            }),
+            Some(SpoolReport::default()),
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
@@ -2538,6 +2661,110 @@ mod tests {
             .expect("serialize attribute"),
         );
         assert_eq!(value["attributes"]["capture.complete"], true);
+    }
+
+    #[test]
+    fn capture_drain_event_without_a_blob_drain_reports_event_spool_health_only() {
+        let options = base_options(vec!["true".to_owned()]);
+        let context = NormalizationContext::new(options.context.clone())
+            .with_attributes(options.attributes.clone());
+
+        let event = capture_drain_event(
+            &context,
+            Hlc {
+                wall_ns: 7,
+                logical: 0,
+            },
+            None,
+            Some(SpoolReport {
+                pending_events: 3,
+                pending_bytes: 512,
+                dropped_events: 2,
+                rejected_events: 1,
+            }),
+        );
+
+        let value = serde_json::to_value(&event).expect("serialize event");
+        assert_eq!(value["attributes"]["capture.events.dropped"], 2);
+        assert_eq!(value["attributes"]["capture.events.rejected"], 1);
+        // Loss makes the capture incomplete; pending events do not (in-order
+        // redelivery means this record landing certifies everything before it).
+        assert_eq!(value["attributes"]["capture.complete"], false);
+        assert_eq!(
+            value["attributes"].get("capture.blobs.found"),
+            None,
+            "no blob drain ran, so no blob attributes are claimed"
+        );
+    }
+
+    #[test]
+    fn capture_drain_event_completeness_requires_blobs_and_events_clean() {
+        let options = base_options(vec!["true".to_owned()]);
+        let context = NormalizationContext::new(options.context.clone())
+            .with_attributes(options.attributes.clone());
+        let clean_blobs = BlobDrainOutcome {
+            report: crate::blob_drain::BlobDrainReport::default(),
+            error: None,
+        };
+
+        let event = capture_drain_event(
+            &context,
+            Hlc {
+                wall_ns: 7,
+                logical: 0,
+            },
+            Some(&clean_blobs),
+            Some(SpoolReport {
+                pending_events: 0,
+                pending_bytes: 0,
+                dropped_events: 1,
+                rejected_events: 0,
+            }),
+        );
+
+        let value = serde_json::to_value(&event).expect("serialize event");
+        assert_eq!(value["attributes"]["capture.blobs.found"], 0);
+        assert_eq!(value["attributes"]["capture.events.dropped"], 1);
+        assert_eq!(
+            value["attributes"]["capture.complete"], false,
+            "a dropped event makes the capture incomplete even when every blob landed"
+        );
+    }
+
+    #[test]
+    fn spool_problem_is_silent_for_a_clean_spool() {
+        assert!(spool_problem(&SpoolReport::default(), None).is_none());
+    }
+
+    #[test]
+    fn spool_problem_reports_every_loss_class_with_counts() {
+        let report = SpoolReport {
+            pending_events: 4,
+            pending_bytes: 2048,
+            dropped_events: 3,
+            rejected_events: 2,
+        };
+
+        let warning =
+            spool_problem(&report, Some("gateway down".to_owned())).expect("a lossy spool warns");
+        let rendered = format!("{warning:#}");
+
+        assert!(
+            rendered.contains("4 captured event(s) never reached the telemetry gateway"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("3 oldest event(s) were dropped when the export spool filled"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("2 event(s) were dropped after the gateway permanently rejected"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("gateway down"),
+            "the last failure is attributed: {rendered}"
+        );
     }
 
     #[test]
@@ -2763,7 +2990,7 @@ mod tests {
             None,
         );
 
-        let captured = Box::pin(run_captured(&options, &FailingExporter, None))
+        let captured = Box::pin(run_captured(&options, &FailingExporter, None, None))
             .await
             .expect("a successful child's exit code wins over an export failure");
 
@@ -2799,7 +3026,7 @@ mod tests {
             None,
         );
 
-        let captured = Box::pin(run_captured(&options, &FailingExporter, None))
+        let captured = Box::pin(run_captured(&options, &FailingExporter, None, None))
             .await
             .expect("the child's own exit code wins over an export failure");
 

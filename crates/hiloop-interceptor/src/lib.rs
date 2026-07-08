@@ -19,6 +19,7 @@ pub mod raw;
 pub mod redact;
 pub mod seams;
 pub mod secret;
+pub mod spool;
 pub mod stdio;
 pub mod supervisor;
 

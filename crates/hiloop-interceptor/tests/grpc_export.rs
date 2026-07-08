@@ -13,9 +13,9 @@ use hiloop_interceptor::grpc_client::proto::{
     Event as ProtoEvent, IngestRequest, IngestResponse, IngestStreamRequest, IngestStreamResponse,
 };
 use hiloop_interceptor::grpc_export::GrpcIngestExporter;
-use hiloop_interceptor::seams::Exporter;
+use hiloop_interceptor::seams::{ExportError, Exporter};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status, Streaming};
+use tonic::{Code, Request, Response, Status, Streaming};
 
 #[derive(Default)]
 struct Recorded {
@@ -139,6 +139,125 @@ async fn omitted_tenant_is_empty_on_the_wire() {
     let rec = recorded.lock().expect("lock");
     assert_eq!(rec.tenant_id, "");
     assert_eq!(rec.project_id, "proj-y");
+}
+
+/// Ingest service that refuses every RPC with a fixed status code.
+#[derive(Clone)]
+struct RefusingService {
+    code: Code,
+}
+
+#[tonic::async_trait]
+impl TelemetryIngestService for RefusingService {
+    async fn ingest(
+        &self,
+        _request: Request<IngestRequest>,
+    ) -> Result<Response<IngestResponse>, Status> {
+        Err(Status::new(self.code, "refused by test gateway"))
+    }
+
+    async fn ingest_stream(
+        &self,
+        _request: Request<Streaming<IngestStreamRequest>>,
+    ) -> Result<Response<IngestStreamResponse>, Status> {
+        Err(Status::new(self.code, "refused by test gateway"))
+    }
+}
+
+async fn serve_refusing(code: Code) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(TelemetryIngestServiceServer::new(RefusingService { code }))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("serve");
+    });
+    format!("http://{addr}")
+}
+
+/// One classification-matrix row: a status code, the variant check it must satisfy,
+/// and the expected variant's name for the failure message.
+type ClassificationCase = (Code, fn(&ExportError) -> bool, &'static str);
+
+/// The classification matrix over the real wire: each gateway status code lands in
+/// the `ExportError` retry-taxonomy variant the spooling wrapper dispatches on.
+#[tokio::test]
+async fn gateway_status_codes_classify_onto_the_export_error_taxonomy() {
+    let cases: &[ClassificationCase] = &[
+        (
+            Code::ResourceExhausted,
+            |e| matches!(e, ExportError::Backpressure { .. }),
+            "Backpressure",
+        ),
+        (
+            Code::Unavailable,
+            |e| matches!(e, ExportError::Unavailable { .. }),
+            "Unavailable",
+        ),
+        (
+            Code::InvalidArgument,
+            |e| matches!(e, ExportError::Rejected { .. }),
+            "Rejected",
+        ),
+        (
+            Code::PermissionDenied,
+            |e| matches!(e, ExportError::Rejected { .. }),
+            "Rejected",
+        ),
+        (
+            Code::Unauthenticated,
+            |e| matches!(e, ExportError::Rejected { .. }),
+            "Rejected",
+        ),
+        (
+            Code::Internal,
+            |e| matches!(e, ExportError::Other { .. }),
+            "Other",
+        ),
+    ];
+    for (code, expected, expected_name) in cases {
+        let endpoint = serve_refusing(*code).await;
+        let exporter =
+            GrpcIngestExporter::connect(endpoint, None, "proj-y", true).expect("connect");
+
+        let error = exporter
+            .export(&[log_event("one")])
+            .await
+            .expect_err("the refusing gateway must fail the export");
+
+        assert!(
+            expected(&error),
+            "code {code:?} should classify as {expected_name}, got {error:?}"
+        );
+    }
+}
+
+/// A gateway that is not there at all (connection refused) classifies as the
+/// transient `Unavailable`, so the spool retries instead of dropping.
+#[tokio::test]
+async fn unreachable_gateway_classifies_as_unavailable() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+
+    let exporter = GrpcIngestExporter::connect(format!("http://{addr}"), None, "proj-y", true)
+        .expect("connect");
+
+    let error = exporter
+        .export(&[log_event("one")])
+        .await
+        .expect_err("nothing listens on the dropped port");
+
+    assert!(
+        matches!(error, ExportError::Unavailable { .. }),
+        "a transport failure classifies as Unavailable, got {error:?}"
+    );
 }
 
 #[tokio::test]

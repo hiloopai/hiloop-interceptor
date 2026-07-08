@@ -69,7 +69,7 @@ impl Exporter for GrpcIngestExporter {
                 project_id: self.project_id.clone(),
             }))
             .await
-            .map_err(|status| ExportError::other("grpc", ingest_rejection_message(&status)))?
+            .map_err(|status| ingest_error(&status))?
             .into_inner()
             .accepted;
         if accepted != expected {
@@ -85,6 +85,44 @@ impl Exporter for GrpcIngestExporter {
 /// Wrap a gateway-client configuration failure as an export error.
 fn client_config_error(error: crate::grpc_client::GrpcClientError) -> ExportError {
     ExportError::with_source("grpc", "failed to configure the gateway client", error)
+}
+
+/// Map a failed ingest RPC onto the [`ExportError`] retry taxonomy by `tonic::Code`,
+/// so a spooling/retrying wrapper can tell a gateway outage from a judged rejection:
+///
+/// - `RESOURCE_EXHAUSTED` → [`ExportError::Backpressure`] (the gateway is shedding
+///   load — a typed backlog shed deserves redelivery, not a warning);
+/// - `UNAVAILABLE`, or any status caused by a transport failure → [`ExportError::Unavailable`];
+/// - `INVALID_ARGUMENT` / `PERMISSION_DENIED` / `UNAUTHENTICATED` →
+///   [`ExportError::Rejected`] (the batch or its credentials were judged and refused);
+/// - anything else → the ambiguous [`ExportError::Other`].
+fn ingest_error(status: &Status) -> ExportError {
+    use tonic::Code;
+
+    let message = ingest_rejection_message(status);
+    match status.code() {
+        Code::ResourceExhausted => ExportError::backpressure("grpc", message),
+        Code::Unavailable => ExportError::unavailable("grpc", message),
+        Code::InvalidArgument | Code::PermissionDenied | Code::Unauthenticated => {
+            ExportError::rejected("grpc", message)
+        }
+        _ if is_transport_failure(status) => ExportError::unavailable("grpc", message),
+        _ => ExportError::other("grpc", message),
+    }
+}
+
+/// Whether the status was minted from a client-side transport failure (connect refused,
+/// broken stream) rather than returned by the gateway. tonic stamps most of these
+/// `UNAVAILABLE`, but some hops surface as `UNKNOWN` with the transport error as source.
+fn is_transport_failure(status: &Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error.is::<tonic::transport::Error>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// Render a rejected ingest RPC as one human-readable line (see
@@ -350,6 +388,67 @@ mod tests {
         assert_eq!(
             ingest_rejection_message(&status),
             "ingest rejected: gateway draining"
+        );
+    }
+
+    /// One classification-matrix row: a status code and the variant check it must satisfy.
+    type ClassificationCase = (tonic::Code, fn(&ExportError) -> bool);
+
+    /// The classification matrix: each `tonic::Code` lands in the retry-taxonomy
+    /// variant the spooling wrapper dispatches on.
+    #[test]
+    fn ingest_error_classifies_status_codes() {
+        use tonic::Code;
+
+        let cases: &[ClassificationCase] = &[
+            (Code::ResourceExhausted, |e| {
+                matches!(e, ExportError::Backpressure { .. })
+            }),
+            (Code::Unavailable, |e| {
+                matches!(e, ExportError::Unavailable { .. })
+            }),
+            (Code::InvalidArgument, |e| {
+                matches!(e, ExportError::Rejected { .. })
+            }),
+            (Code::PermissionDenied, |e| {
+                matches!(e, ExportError::Rejected { .. })
+            }),
+            (Code::Unauthenticated, |e| {
+                matches!(e, ExportError::Rejected { .. })
+            }),
+            (Code::Internal, |e| matches!(e, ExportError::Other { .. })),
+            (Code::Unknown, |e| matches!(e, ExportError::Other { .. })),
+            (Code::DeadlineExceeded, |e| {
+                matches!(e, ExportError::Other { .. })
+            }),
+        ];
+        for (code, expected) in cases {
+            let error = ingest_error(&Status::new(*code, "boom"));
+            assert!(expected(&error), "code {code:?} classified as {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_error_treats_a_transport_sourced_status_as_unavailable() {
+        // tonic stamps most client-side transport failures UNAVAILABLE, but some hops
+        // surface as UNKNOWN with the transport error attached as source. Mint a real
+        // transport error by connecting to a port nothing listens on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let transport_error = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect_err("nothing listens on the dropped port");
+
+        let mut status = Status::new(tonic::Code::Unknown, "transport error");
+        status.set_source(std::sync::Arc::new(transport_error));
+
+        let error = ingest_error(&status);
+        assert!(
+            matches!(error, ExportError::Unavailable { .. }),
+            "transport-sourced status classified as {error:?}"
         );
     }
 }
