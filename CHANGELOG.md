@@ -74,6 +74,10 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Fixed
 
+- The wrapper installs its SIGINT/SIGTERM forwarding handlers before spawning the child, closing
+  a startup window where a terminating signal could kill the wrapper by its default disposition —
+  ending the wrap without the signal ever being forwarded and leaving the just-spawned child's
+  process group orphaned.
 - A telemetry capture/export failure no longer overrides the exit code of a child that already
   ran: `run` is exit-code transparent, and post-exit drain failures are reported on stderr as
   `warning:` diagnostics instead of failing the wrapper. Only a missing/failed-to-spawn child or a
