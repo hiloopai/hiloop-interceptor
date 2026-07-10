@@ -4,7 +4,9 @@
 //! the wrapped harness sends a request to that host, the proxy resolves the secret's
 //! plaintext from a [broker](BrokerConfig) and replaces a user-authored
 //! *placeholder* (e.g. `hil-secret://openai-prod`) in the bound header with the real
-//! credential (`{scheme} {value}`), or injects the header when it is absent.
+//! credential (`{scheme} {value}`), or injects the header when it is absent. A host
+//! can carry several bindings as long as each writes a different header (e.g. an
+//! `authorization` bearer plus a separate `x-api-key`).
 //!
 //! # Why a placeholder, and what the user sees
 //!
@@ -79,12 +81,15 @@ pub struct BrokerConfig {
 
 /// A validated, host-keyed view of the secret bindings plus the broker.
 ///
-/// Built once per run; the proxy consults it on every request. `None` host-match is
+/// Built once per run; the proxy consults it on every request. No host-match is
 /// the common case (no binding for the destination) and returns immediately.
 #[derive(Clone, Debug)]
 pub struct SecretInjector {
-    /// Bindings keyed by canonicalized host (one binding per host for v1).
-    bindings: HashMap<String, ResolvedBinding>,
+    /// Bindings keyed by canonicalized host. A host holds one binding per header
+    /// (an origin can want both an `authorization` bearer and a separate
+    /// `x-api-key`); two bindings writing the same header on one host are
+    /// rejected at build.
+    bindings: HashMap<String, Vec<ResolvedBinding>>,
     broker: Arc<BrokerClient>,
 }
 
@@ -111,8 +116,8 @@ pub enum SecretConfigError {
     Header { header: String },
     #[error("broker URL `{url}` is not a valid http(s) URI")]
     BrokerUrl { url: String },
-    #[error("two secret bindings target the same host `{host}`")]
-    DuplicateHost { host: String },
+    #[error("two secret bindings target the same host `{host}` and header `{header}`")]
+    DuplicateBinding { host: String, header: String },
     #[error("broker TLS configuration failed: {0}")]
     Tls(String),
 }
@@ -160,9 +165,19 @@ impl SecretInjector {
                 header,
                 scheme: binding.scheme,
             };
-            if map.insert(host_key.clone(), resolved).is_some() {
-                return Err(SecretConfigError::DuplicateHost { host: host_key });
+            let host_bindings: &mut Vec<ResolvedBinding> = map.entry(host_key.clone()).or_default();
+            // One binding per (host, header): a second binding writing the same header
+            // would silently clobber the first, so it fails loudly at build instead.
+            if host_bindings
+                .iter()
+                .any(|existing| existing.header == resolved.header)
+            {
+                return Err(SecretConfigError::DuplicateBinding {
+                    host: host_key,
+                    header: resolved.header.as_str().to_owned(),
+                });
             }
+            host_bindings.push(resolved);
         }
         Ok(Self {
             bindings: map,
@@ -170,19 +185,19 @@ impl SecretInjector {
         })
     }
 
-    /// The binding for `host`, if one is bound to it.
-    fn binding_for(&self, host: &CanonicalHost) -> Option<&ResolvedBinding> {
+    /// The bindings scoped to `host`, in configuration order; empty when none are.
+    fn bindings_for(&self, host: &CanonicalHost) -> &[ResolvedBinding] {
         let key = match host {
             CanonicalHost::Domain(domain) => domain.clone(),
             CanonicalHost::Ip(ip) => ip.to_string(),
         };
-        self.bindings.get(&key)
+        self.bindings.get(&key).map_or(&[], Vec::as_slice)
     }
 
-    /// Inject the bound credential into `request` when its host matches a binding.
+    /// Inject every credential bound to `request`'s host, one header per binding.
     ///
-    /// On a match the broker resolves the secret value, and the bound header is written
-    /// to respect the agent's intent:
+    /// For each matching binding the broker resolves the secret value, and the bound
+    /// header is written to respect the agent's intent:
     ///
     /// - If the header is **present and contains the placeholder token**, the token is
     ///   replaced in place by the resolved `value` (the agent already authored the rest
@@ -191,47 +206,51 @@ impl SecretInjector {
     /// - Otherwise (header absent, or present without the placeholder) the header is
     ///   **set** to `{scheme} {value}` (or just `{value}` when `scheme` is empty).
     ///
-    /// The resolved value is returned in [`Zeroizing`] so the caller can scrub it from
-    /// any captured copy and so it is wiped when dropped. A non-matching host returns
-    /// `Ok(None)` and leaves the request untouched; a broker failure returns `Err`, and
-    /// the caller must fail the request closed.
+    /// The resolved values are returned in [`Zeroizing`] so the caller can scrub them
+    /// from any captured copy and so they are wiped when dropped. A non-matching host
+    /// returns `Ok(vec![])` and leaves the request untouched; any broker failure
+    /// returns `Err` — even after earlier bindings resolved — and the caller must fail
+    /// the request closed (a request is never forwarded with only part of its bound
+    /// credentials).
     pub async fn inject<B>(
         &self,
         host: &CanonicalHost,
         request: &mut Request<B>,
-    ) -> Result<Option<Zeroizing<String>>, InjectError> {
-        let Some(binding) = self.binding_for(host) else {
-            return Ok(None);
-        };
+    ) -> Result<Vec<Zeroizing<String>>, InjectError> {
+        let bindings = self.bindings_for(host);
+        let mut values = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let value = self.broker.resolve(&binding.name).await?;
 
-        let value = self.broker.resolve(&binding.name).await?;
+            // Substitute the placeholder in the existing header value when present; this
+            // preserves the agent-authored scheme/structure around the placeholder.
+            let existing = request
+                .headers()
+                .get(&binding.header)
+                .and_then(|v| v.to_str().ok());
+            let rendered = match existing {
+                Some(existing)
+                    if !binding.placeholder.is_empty()
+                        && existing.contains(&binding.placeholder) =>
+                {
+                    existing.replace(&binding.placeholder, value.as_str())
+                }
+                // Header absent or no placeholder to replace: set the full credential.
+                _ if binding.scheme.is_empty() => value.to_string(),
+                _ => format!("{} {}", binding.scheme, value.as_str()),
+            };
+            // Keep the rendered header value in `Zeroizing` so the secret it carries is
+            // wiped from this scratch buffer once it has been copied into the HeaderValue.
+            let rendered = Zeroizing::new(rendered);
+            let header_value = HeaderValue::try_from(rendered.as_str())
+                .map_err(|_| InjectError::InvalidHeaderValue)?;
+            request
+                .headers_mut()
+                .insert(binding.header.clone(), header_value);
+            values.push(value);
+        }
 
-        // Substitute the placeholder in the existing header value when present; this
-        // preserves the agent-authored scheme/structure around the placeholder.
-        let existing = request
-            .headers()
-            .get(&binding.header)
-            .and_then(|v| v.to_str().ok());
-        let rendered = match existing {
-            Some(existing)
-                if !binding.placeholder.is_empty() && existing.contains(&binding.placeholder) =>
-            {
-                existing.replace(&binding.placeholder, value.as_str())
-            }
-            // Header absent or no placeholder to replace: set the full credential.
-            _ if binding.scheme.is_empty() => value.to_string(),
-            _ => format!("{} {}", binding.scheme, value.as_str()),
-        };
-        // Keep the rendered header value in `Zeroizing` so the secret it carries is
-        // wiped from this scratch buffer once it has been copied into the HeaderValue.
-        let rendered = Zeroizing::new(rendered);
-        let header_value = HeaderValue::try_from(rendered.as_str())
-            .map_err(|_| InjectError::InvalidHeaderValue)?;
-        request
-            .headers_mut()
-            .insert(binding.header.clone(), header_value);
-
-        Ok(Some(value))
+        Ok(values)
     }
 }
 
@@ -429,6 +448,51 @@ mod tests {
         (format!("http://{addr}/resolve"), log, handle)
     }
 
+    /// Spin a stub broker that resolves every secret to `resolved-<name>` (parsed from the
+    /// request body), so a test can tell multiple bindings' resolutions apart.
+    async fn stub_broker_by_name() -> (String, Arc<BrokerLog>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr: SocketAddr = listener.local_addr().expect("addr");
+        let log = Arc::new(BrokerLog::default());
+        let log_for_task = Arc::clone(&log);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let log = Arc::clone(&log_for_task);
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let log = Arc::clone(&log);
+                        async move {
+                            let body = req.into_body().collect().await.expect("body").to_bytes();
+                            *log.body.lock().expect("lock") =
+                                Some(String::from_utf8_lossy(&body).into_owned());
+                            let name = serde_json::from_slice::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("name").and_then(|n| n.as_str().map(String::from))
+                                })
+                                .unwrap_or_default();
+                            let payload =
+                                serde_json::json!({ "value": format!("resolved-{name}") })
+                                    .to_string();
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::from(payload)))
+                                    .expect("response"),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, service).await;
+                });
+            }
+        });
+        (format!("http://{addr}/resolve"), log, handle)
+    }
+
     /// Spin a stub broker behind TLS with a self-signed cert for `localhost`, returning the
     /// `https://` URL and the trust anchor a client must add to reach it. This exercises the
     /// broker client's TLS path — the plaintext connector regression (an `https://` broker URL
@@ -551,13 +615,13 @@ mod tests {
             .body(())
             .expect("request");
 
-        let value = injector
+        let values = injector
             .inject(&canon("api.openai.com"), &mut request)
             .await
-            .expect("inject")
-            .expect("a value on the bound host");
+            .expect("inject");
 
-        assert_eq!(value.as_str(), "sk-real-secret");
+        assert_eq!(values.len(), 1, "one binding resolved on the bound host");
+        assert_eq!(values[0].as_str(), "sk-real-secret");
         assert_eq!(
             request
                 .headers()
@@ -594,8 +658,7 @@ mod tests {
         injector
             .inject(&canon("api.openai.com"), &mut request)
             .await
-            .expect("inject")
-            .expect("value");
+            .expect("inject");
         assert_eq!(
             request
                 .headers()
@@ -620,8 +683,7 @@ mod tests {
         injector
             .inject(&canon("api.openai.com"), &mut request)
             .await
-            .expect("inject")
-            .expect("value");
+            .expect("inject");
         assert_eq!(
             request
                 .headers()
@@ -641,12 +703,12 @@ mod tests {
             .body(())
             .expect("request");
 
-        let value = injector
+        let values = injector
             .inject(&canon("evil.example.com"), &mut request)
             .await
             .expect("inject");
 
-        assert!(value.is_none(), "no binding for the host");
+        assert!(values.is_empty(), "no binding for the host");
         assert!(
             request.headers().get("authorization").is_none(),
             "unbound host must not have a credential injected"
@@ -697,8 +759,7 @@ mod tests {
         injector
             .inject(&canon("api.openai.com"), &mut request)
             .await
-            .expect("inject")
-            .expect("value");
+            .expect("inject");
         assert_eq!(
             request
                 .headers()
@@ -709,7 +770,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_host_binding_is_rejected() {
+    fn duplicate_host_and_header_binding_is_rejected() {
+        // Two bindings writing the SAME header on the same host is a config error:
+        // one would silently clobber the other, so it must fail loudly at build.
         let error = SecretInjector::new(
             [binding("api.openai.com"), binding("api.openai.com")],
             &BrokerConfig {
@@ -717,8 +780,69 @@ mod tests {
                 token: "t".to_owned(),
             },
         )
-        .expect_err("duplicate host");
-        assert!(matches!(error, SecretConfigError::DuplicateHost { .. }));
+        .expect_err("duplicate (host, header)");
+        assert!(matches!(error, SecretConfigError::DuplicateBinding { .. }));
+    }
+
+    #[tokio::test]
+    async fn bindings_to_different_headers_on_one_host_coexist() {
+        // The documented v1 contract: an origin can want both an `authorization`
+        // bearer AND a separate `x-api-key` header. Regression test for the
+        // one-binding-per-host limit that failed this run at injector build.
+        let (url, _log, _task) = stub_broker_by_name().await;
+        let injector = SecretInjector::new(
+            [
+                binding("api.openai.com"),
+                SecretBinding {
+                    name: "openai-admin".to_owned(),
+                    env_placeholder: "hil-secret://openai-admin".to_owned(),
+                    header: "x-api-key".to_owned(),
+                    scheme: String::new(),
+                    ..binding("api.openai.com")
+                },
+            ],
+            &BrokerConfig {
+                url,
+                token: "broker-token".to_owned(),
+            },
+        )
+        .expect("host bind + header bind scoped to the same host must coexist");
+
+        let mut request = Request::builder()
+            .uri("https://api.openai.com/v1/chat")
+            .header("authorization", "Bearer hil-secret://openai-prod")
+            .body(())
+            .expect("request");
+
+        let values = injector
+            .inject(&canon("api.openai.com"), &mut request)
+            .await
+            .expect("inject");
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            ["resolved-openai-prod", "resolved-openai-admin"],
+            "every binding on the host resolves and reports its value for scrubbing"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer resolved-openai-prod"),
+            "the host binding's placeholder is substituted"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("resolved-openai-admin"),
+            "the header binding injects its bare credential alongside"
+        );
     }
 
     #[test]
@@ -756,9 +880,10 @@ mod tests {
             },
         )
         .expect("injector");
-        let resolved = injector
-            .binding_for(&canon("api.openai.com"))
-            .expect("binding");
+        let bindings = injector.bindings_for(&canon("api.openai.com"));
+        let [resolved] = bindings else {
+            panic!("expected exactly one binding, got {bindings:?}");
+        };
         assert_eq!(resolved.scheme, "");
         assert_eq!(resolved.header.as_str(), "x-api-key");
     }
