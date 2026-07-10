@@ -10,6 +10,14 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- Wire-capture fidelity metadata on proxy request/response events: `http.request.wire_size` /
+  `http.response.wire_size` record the body bytes actually observed on the wire (pre-cap,
+  pre-redaction), so a capture truncated at `--max-capture-bytes` no longer loses the true
+  transfer size (`body_size` keeps reporting the stored copy); and a `Content-Encoding` header is
+  recorded as `http.request.content_encoding` / `http.response.content_encoding` (absent when the
+  header is absent), so stored byte-exact wire bytes — often gzip — are no longer semantically
+  opaque against the decoded media type the content-type names. Purely additive to the event
+  schema.
 - Aborted/failed HTTP exchanges now reach an explicit terminal record: an `http.abort` event
   sharing the request's `http.exchange_id`, carrying the method/target/host actually sent and an
   `http.abort.reason` — `upstream_connect_error` / `upstream_error` (with the folded error chain
