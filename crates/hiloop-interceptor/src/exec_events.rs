@@ -4,7 +4,7 @@
 //! spawn, exit, and forwarded terminating signals — and records each fact as a
 //! `supervisor`-sourced raw signal. [`ExecLifecycleNormalizer`] maps those to
 //! `exec` events named `process.start`, `process.exit`, and `process.signal`.
-//! Process identity (`process.pid`/`process.argv`/`process.cwd`) is stamped by
+//! Process identity (`process.pid`/`process.command_args`/`process.cwd`) is stamped by
 //! the pipeline's provenance pass on every event, so the raw signals carry only
 //! the lifecycle-specific attributes. A child that fails to spawn produces the
 //! `process.spawn_failed` `exec` event instead, emitted directly by the

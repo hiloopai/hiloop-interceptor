@@ -469,7 +469,7 @@ async fn process_start_leads_the_stream_and_records_the_env_allowlist() {
             > 0
     );
     let argv = serde_json::from_str::<Vec<String>>(
-        start["attributes"][provenance_keys::PROCESS_ARGV]
+        start["attributes"][provenance_keys::PROCESS_COMMAND_ARGS]
             .as_str()
             .expect("process argv"),
     )
@@ -635,7 +635,7 @@ async fn spawn_failure_is_captured_as_a_process_spawn_failed_event() {
     assert_eq!(event["run_id"], RUN_ID);
     assert_eq!(event["lineage_path"], LINEAGE_PATH);
     let argv = serde_json::from_str::<Vec<String>>(
-        event["attributes"][provenance_keys::PROCESS_ARGV]
+        event["attributes"][provenance_keys::PROCESS_COMMAND_ARGS]
             .as_str()
             .expect("process argv"),
     )
@@ -2162,7 +2162,7 @@ fn assert_common_event_provenance(event: &Value, raw_retention: &str) {
     );
 
     let argv = serde_json::from_str::<Vec<String>>(
-        event["attributes"][provenance_keys::PROCESS_ARGV]
+        event["attributes"][provenance_keys::PROCESS_COMMAND_ARGS]
             .as_str()
             .expect("process argv"),
     )

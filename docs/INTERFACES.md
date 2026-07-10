@@ -123,7 +123,7 @@ wrapper identity, and generic process metadata when available — lives on
 `NormalizationContext::stamp_provenance`, the single construction seam the pipeline applies to
 every normalized event and out-of-band supervisor records (capture health, spawn failure) call
 directly, so an event built outside the pipeline cannot silently lose scope identity.
-`process.argv` is currently JSON-encoded into a string attribute because
+`process.command_args` is currently JSON-encoded into a string attribute because
 `hiloop-core::event::AttributeValue` is intentionally scalar-only; revisit this if arrays become a
 first-class attribute value.
 
