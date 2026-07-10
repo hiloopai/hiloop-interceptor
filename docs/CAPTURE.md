@@ -245,6 +245,18 @@ the rest of telemetry: a failure is a stderr warning, never the child's exit cod
 bodies over the cap are captured up to it, marked `http.capture.truncated`, and still forwarded in
 full to the client.
 
+**Wire-capture fidelity metadata (shipped).** Truncation and redaction bound the *stored* copy,
+never the record of what crossed the wire: every request/response event carries
+`http.request.wire_size` / `http.response.wire_size` — the body bytes actually observed on the
+wire (pre-cap, pre-redaction; on a mid-stream abort, what was seen before the stream ended) — so
+traffic accounting and "what did this run download" reconstruction survive a capture over the cap,
+while the `body_size` attributes keep reporting the stored (capped + redacted) copy. And because
+stored payload bytes are byte-exact wire bytes — often content-encoded — while the recorded
+content-type names the *decoded* media type, a `Content-Encoding` header rides along as
+`http.request.content_encoding` / `http.response.content_encoding` (absent when the header is
+absent), the same body-interpretation carve-out already made for content-type; without it a gzip
+body is semantically opaque against its media type.
+
 **Status — OTLP shipped (`--otlp`).** `hiloop_interceptor::otlp` runs an embedded OTLP/HTTP receiver
 bound to an ephemeral localhost port; the supervisor injects the endpoint, registers
 `OtlpTraceNormalizer` alongside the stdio normalizer, and shuts the receiver down on child exit so

@@ -35,7 +35,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hudsucker::certificate_authority::CertificateAuthority;
-use hudsucker::hyper::header::{CONTENT_TYPE, HOST};
+use hudsucker::hyper::header::{CONTENT_ENCODING, CONTENT_TYPE, HOST};
 use hudsucker::hyper::http::uri::Authority;
 use hudsucker::hyper::{Method, Request, Response, StatusCode};
 use hudsucker::rcgen::{
@@ -93,6 +93,19 @@ const GEN_AI_REQUEST_MODEL_ATTR: &str = "gen_ai.request.model";
 const GEN_AI_RESPONSE_MODEL_ATTR: &str = "gen_ai.response.model";
 const TOOL_CALL_ATTR: &str = "tool_call";
 const TRUNCATED_ATTR: &str = "http.capture.truncated";
+/// Body bytes observed on the wire for the request leg — pre-cap, pre-redaction —
+/// so a truncated capture still records the true transfer size. (The `body_size`
+/// attributes report the *stored* captured copy: post-cap, post-redaction.)
+const REQUEST_WIRE_SIZE_ATTR: &str = "http.request.wire_size";
+/// Body bytes observed on the wire for the response leg; on a mid-stream abort it
+/// counts what was seen before the stream ended. See [`REQUEST_WIRE_SIZE_ATTR`].
+const RESPONSE_WIRE_SIZE_ATTR: &str = "http.response.wire_size";
+/// The request's `Content-Encoding` header, recorded (like content-type) because the
+/// stored bytes are byte-exact wire bytes: without it a gzip body is semantically
+/// opaque against its decoded media type.
+const REQUEST_CONTENT_ENCODING_ATTR: &str = "http.request.content_encoding";
+/// The response's `Content-Encoding` header. See [`REQUEST_CONTENT_ENCODING_ATTR`].
+const RESPONSE_CONTENT_ENCODING_ATTR: &str = "http.response.content_encoding";
 /// Attribute stamped with a comma-separated list of matched anomaly rule names when a
 /// captured request trips one or more [`AnomalyConfig`] rules.
 const FLAGGED_ATTR: &str = "anomaly.flagged";
@@ -563,7 +576,13 @@ impl CaptureHandler {
             (EXCHANGE_ID_ATTR, exchange_id),
             ("http.method", method),
             ("http.target", target),
+            // The true transfer size, distinct from the stored (capped + redacted)
+            // `body_size`: reconstruction and traffic accounting survive truncation.
+            (REQUEST_WIRE_SIZE_ATTR, bytes.len().to_string()),
         ];
+        if let Some(encoding) = header_str(&parts.headers, &CONTENT_ENCODING) {
+            attributes.push((REQUEST_CONTENT_ENCODING_ATTR, encoding));
+        }
         let host = request_host(&parts.uri, &parts.headers).map(|host| telemetry_host(&host));
         self.exchange_host.clone_from(&host);
         if let Some(host) = &host {
@@ -736,10 +755,14 @@ impl CaptureHandler {
         if let Some(content_type) = &content_type {
             attributes.push(("http.response.content_type", content_type.clone()));
         }
+        if let Some(encoding) = header_str(&parts.headers, &CONTENT_ENCODING) {
+            attributes.push((RESPONSE_CONTENT_ENCODING_ATTR, encoding));
+        }
 
         let teed = self.tee_body(
             RESPONSE_KIND,
             "http.response.body_size",
+            RESPONSE_WIRE_SIZE_ATTR,
             attributes,
             content_type,
             body,
@@ -755,6 +778,7 @@ impl CaptureHandler {
         &self,
         kind: &'static str,
         size_attr: &'static str,
+        wire_size_attr: &'static str,
         attributes: Vec<(&'static str, String)>,
         media_type: Option<String>,
         body: Body,
@@ -774,6 +798,8 @@ impl CaptureHandler {
             clock: Arc::clone(&self.clock),
             kind,
             size_attr,
+            wire_size_attr,
+            wire_bytes: 0,
             emitted: false,
         };
 
@@ -851,11 +877,19 @@ struct TeeState {
     clock: Arc<HlcClock>,
     kind: &'static str,
     size_attr: &'static str,
+    /// Attribute name for the observed wire size ([`RESPONSE_WIRE_SIZE_ATTR`]).
+    wire_size_attr: &'static str,
+    /// Body bytes observed on the wire so far — counted past the capture cap, so a
+    /// truncated capture still records the true transfer size.
+    wire_bytes: u64,
     emitted: bool,
 }
 
 impl TeeState {
     fn capture(&mut self, data: &[u8]) {
+        // The wire count keeps running past the capture cap: the stored copy is
+        // bounded, the true transfer size is not.
+        self.wire_bytes = self.wire_bytes.saturating_add(data.len() as u64);
         if self.capped {
             return;
         }
@@ -892,6 +926,8 @@ impl TeeState {
             injected_secrets: std::mem::take(&mut self.injected_secrets),
             media_type: self.media_type.take(),
             truncated: truncated || self.truncated || self.capped,
+            wire_size_attr: self.wire_size_attr,
+            wire_bytes: self.wire_bytes,
         })
         .await;
         let _ = self.signal_tx.send(Ok(raw)).await;
@@ -910,6 +946,8 @@ impl Drop for TeeState {
         let clock = Arc::clone(&self.clock);
         let kind = self.kind;
         let size_attr = self.size_attr;
+        let wire_size_attr = self.wire_size_attr;
+        let wire_bytes = self.wire_bytes;
         let attributes = std::mem::take(&mut self.attributes);
         let blob_store = Arc::clone(&self.blob_store);
         let captured = std::mem::take(&mut self.captured);
@@ -929,6 +967,8 @@ impl Drop for TeeState {
                 injected_secrets,
                 media_type,
                 truncated: true,
+                wire_size_attr,
+                wire_bytes,
             })
             .await;
             let _ = signal_tx.send(Ok(raw)).await;
@@ -949,6 +989,11 @@ struct FinalizeTee<'a> {
     injected_secrets: Vec<zeroize::Zeroizing<String>>,
     media_type: Option<String>,
     truncated: bool,
+    /// Attribute name for the observed wire size ([`RESPONSE_WIRE_SIZE_ATTR`]).
+    wire_size_attr: &'static str,
+    /// Body bytes observed on the wire (counted past the capture cap); on a
+    /// mid-stream abort, what was seen before the stream ended.
+    wire_bytes: u64,
 }
 
 /// Redact `body` with the configured pattern policy plus the exchange's injected
@@ -968,7 +1013,9 @@ fn redact_with_injected(
 
 /// Redact the buffered capture once, offload it to the blob store, and build the
 /// offloaded (or metadata-only) signal. The size attribute reports the stored
-/// (post-redaction) byte count, consistent with the truncation path.
+/// (post-redaction) byte count, consistent with the truncation path; the wire-size
+/// attribute reports the bytes actually observed on the wire (pre-cap,
+/// pre-redaction), so truncation never loses the true transfer size.
 async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
     let FinalizeTee {
         clock,
@@ -981,6 +1028,8 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         injected_secrets,
         media_type,
         truncated,
+        wire_size_attr,
+        wire_bytes,
     } = args;
 
     let captured = Bytes::from(captured);
@@ -1005,7 +1054,8 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
     };
 
     let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), Bytes::new())
-        .with_attribute(size_attr, size.to_string());
+        .with_attribute(size_attr, size.to_string())
+        .with_attribute(wire_size_attr, wire_bytes.to_string());
     if truncated {
         raw = raw.with_attribute(TRUNCATED_ATTR, "true");
     }
@@ -1946,6 +1996,7 @@ mod tests {
         let teed = handler.tee_body(
             RESPONSE_KIND,
             "http.response.body_size",
+            RESPONSE_WIRE_SIZE_ATTR,
             attributes,
             None,
             body,
@@ -1999,6 +2050,7 @@ mod tests {
         let teed = handler.tee_body(
             RESPONSE_KIND,
             "http.response.body_size",
+            RESPONSE_WIRE_SIZE_ATTR,
             vec![("http.status_code", "200".to_owned())],
             None,
             streaming_body(&[b"chunk-1", b"chunk-2", b"chunk-3"]),
@@ -2021,6 +2073,14 @@ mod tests {
             Some("10")
         );
         assert_eq!(
+            signal
+                .attributes
+                .get(RESPONSE_WIRE_SIZE_ATTR)
+                .map(String::as_str),
+            Some("21"),
+            "truncation must not lose the true transfer size"
+        );
+        assert_eq!(
             signal.payload_ref().and_then(|p| p.size_bytes),
             Some(10),
             "blob holds exactly the cap"
@@ -2038,6 +2098,7 @@ mod tests {
         let teed = handler.tee_body(
             RESPONSE_KIND,
             "http.response.body_size",
+            RESPONSE_WIRE_SIZE_ATTR,
             vec![("http.status_code", "200".to_owned())],
             None,
             streaming_body(&[b"chunk-1", b"chunk-2"]),
@@ -2052,6 +2113,14 @@ mod tests {
                 .get("http.response.body_size")
                 .map(String::as_str),
             Some("14")
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get(RESPONSE_WIRE_SIZE_ATTR)
+                .map(String::as_str),
+            Some("14"),
+            "wire size equals the stored size when nothing is cut"
         );
     }
 
@@ -2088,6 +2157,80 @@ mod tests {
                 .get("http.request.body_size")
                 .map(String::as_str),
             Some("3")
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get(REQUEST_WIRE_SIZE_ATTR)
+                .map(String::as_str),
+            Some("5"),
+            "truncation must not lose the true transfer size"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_encoding_rides_along_on_both_directions() {
+        // Stored bytes are byte-exact wire bytes — often content-encoded — while the
+        // content-type names the *decoded* media type; without the encoding attribute
+        // a gzip body is semantically opaque.
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://example.com/upload")
+            .header(CONTENT_ENCODING, "gzip")
+            .body(Body::from(Bytes::from_static(b"\x1f\x8b\x08fake")))
+            .expect("request");
+        let _forwarded = expect_forwarded(handler.on_request(request).await);
+        let request_signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            request_signal
+                .attributes
+                .get(REQUEST_CONTENT_ENCODING_ATTR)
+                .map(String::as_str),
+            Some("gzip")
+        );
+
+        let response = Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "application/vnd.pypi.simple.v1+json")
+            .header(CONTENT_ENCODING, "gzip")
+            .body(streaming_body(&[b"\x1f\x8b\x08fake"]))
+            .expect("response");
+        let teed = handler.on_response(response);
+        drain_body(teed.into_body()).await;
+        let response_signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            response_signal
+                .attributes
+                .get(RESPONSE_CONTENT_ENCODING_ATTR)
+                .map(String::as_str),
+            Some("gzip")
+        );
+        assert_eq!(
+            response_signal
+                .attributes
+                .get("http.response.content_type")
+                .map(String::as_str),
+            Some("application/vnd.pypi.simple.v1+json"),
+            "the decoded media type still rides along unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_encoding_attribute_is_absent_for_identity_bodies() {
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("GET")
+            .uri("https://example.com/plain")
+            .body(Body::empty())
+            .expect("request");
+        let _forwarded = expect_forwarded(handler.on_request(request).await);
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert!(
+            !signal
+                .attributes
+                .contains_key(REQUEST_CONTENT_ENCODING_ATTR),
+            "no header, no attribute — never a synthesized `identity`"
         );
     }
 
@@ -2783,6 +2926,7 @@ mod tests {
         let teed = handler.tee_body(
             RESPONSE_KIND,
             "http.response.body_size",
+            RESPONSE_WIRE_SIZE_ATTR,
             vec![("http.status_code", "200".to_owned())],
             None,
             streaming_body(&[b"token=sk-abc123 ", b"and AKIA0123456789ABCDEF"]),
@@ -2810,6 +2954,7 @@ mod tests {
         let teed = handler.tee_body(
             RESPONSE_KIND,
             "http.response.body_size",
+            RESPONSE_WIRE_SIZE_ATTR,
             vec![("http.status_code", "200".to_owned())],
             None,
             streaming_body(&[b"Bearer super", b"secret-token-here"]),
@@ -2838,6 +2983,7 @@ mod tests {
         let teed = handler.tee_body(
             RESPONSE_KIND,
             "http.response.body_size",
+            RESPONSE_WIRE_SIZE_ATTR,
             vec![("http.status_code", "200".to_owned())],
             None,
             streaming_body(&[b"Bearer super", b"secret"]),
@@ -2855,6 +3001,7 @@ mod tests {
         let teed = handler.tee_body(
             RESPONSE_KIND,
             "http.response.body_size",
+            RESPONSE_WIRE_SIZE_ATTR,
             vec![("http.status_code", "200".to_owned())],
             None,
             streaming_body(&[b"Bearer supersecret"]),
