@@ -81,7 +81,12 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   (`--secret-binding`, broker via `--secret-broker-url` + `HILOOP_SECRET_BROKER_TOKEN`, and the
   `RunOptions::with_secret_bindings` builder). On a request to the bound host the proxy resolves the
   secret from the broker and writes `<scheme> <value>` into the header; the value is scrubbed from the
-  captured telemetry, zeroized after use, and a broker failure fails the request closed.
+  captured telemetry, zeroized after use, and a broker failure fails the request closed. A host can
+  carry several bindings as long as each writes a different header (e.g. an `authorization` bearer
+  plus a separate `x-api-key`); two bindings writing the *same* header on one host are rejected at
+  build (`SecretConfigError::DuplicateBinding`, replacing the one-binding-per-host `DuplicateHost`
+  limit), and `SecretInjector::inject` now returns every resolved value
+  (`Vec<Zeroizing<String>>`) so all injected credentials are scrubbed from the capture.
 - gRPC export now flushes on a size **or** age trigger, whichever comes first: a partial batch ships
   once it has waited `--export-flush-interval-ms` (default 1000 ms; `0` disables the timer) even
   before it reaches `--export-batch-size` (default 128). This bounds export latency so a long-running

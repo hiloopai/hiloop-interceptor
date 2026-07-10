@@ -353,10 +353,11 @@ struct CaptureHandler {
     /// The canonicalized host from this clone's CONNECT (the SNI host), stashed so the
     /// decrypted request can reject a `Host`/`:authority` that disagrees with it.
     connect_host: Option<CanonicalHost>,
-    /// The credential value injected into the current request, retained only long
-    /// enough to scrub it from this exchange's captured request/response copies.
-    /// Zeroized when the handler clone is dropped at end of exchange.
-    injected_secret: Option<zeroize::Zeroizing<String>>,
+    /// The credential values injected into the current request (one per binding on
+    /// the host), retained only long enough to scrub them from this exchange's
+    /// captured request/response copies. Zeroized when the handler clone is dropped
+    /// at end of exchange.
+    injected_secrets: Vec<zeroize::Zeroizing<String>>,
     /// Exchange id for the request currently being handled by this clone,
     /// minted in `on_request` and read back in `on_response`.
     exchange_id: Option<String>,
@@ -390,7 +391,7 @@ impl CaptureHandler {
             anomaly,
             injector,
             connect_host: None,
-            injected_secret: None,
+            injected_secrets: Vec::new(),
             exchange_id: None,
             exchange_host: None,
         }
@@ -462,9 +463,9 @@ impl CaptureHandler {
             return denied.into();
         }
 
-        // Inject the bound credential, if any; fail the request closed on broker error.
+        // Inject the bound credentials, if any; fail the request closed on broker error.
         // `inject` borrows the injector (no per-request HashMap clone); the borrow ends
-        // before `capture_request`/`injected_secret` take `&mut self`.
+        // before `capture_request`/`injected_secrets` take `&mut self`.
         if self.injector.is_some() {
             let mut request = request;
             let injected = {
@@ -472,7 +473,7 @@ impl CaptureHandler {
                 injector.inject(destination.host(), &mut request).await
             };
             match injected {
-                Ok(value) => self.injected_secret = value,
+                Ok(values) => self.injected_secrets = values,
                 Err(error) => {
                     eprintln!(
                         "hiloop-interceptor: credential broker resolve failed; failing request closed: {error}"
@@ -648,16 +649,11 @@ impl CaptureHandler {
         let _ = self.signal_tx.try_send(Ok(raw));
     }
 
-    /// Redact a captured body: the configured pattern policy plus any credential this
-    /// exchange injected (scrubbed as an exact literal so it never reaches telemetry,
+    /// Redact a captured body: the configured pattern policy plus any credentials this
+    /// exchange injected (scrubbed as exact literals so they never reach telemetry,
     /// even when pattern redaction is disabled).
     fn redact_capture(&self, body: Bytes) -> Bytes {
-        match &self.injected_secret {
-            Some(secret) => self
-                .redaction
-                .redact_body_with_literals(body, &[secret.as_bytes()]),
-            None => self.redaction.redact_body(body),
-        }
+        redact_with_injected(self.redaction, body, &self.injected_secrets)
     }
 
     fn on_response(&mut self, response: Response<Body>) -> Response<Body> {
@@ -704,7 +700,7 @@ impl CaptureHandler {
             max_capture_bytes: self.max_capture_bytes,
             truncated: false,
             redaction: self.redaction,
-            injected_secret: self.injected_secret.clone(),
+            injected_secrets: self.injected_secrets.clone(),
             capped: false,
             media_type,
             attributes,
@@ -763,9 +759,9 @@ struct TeeState {
     /// Scrubs secrets from the buffered capture before it reaches the blob; the
     /// bytes forwarded downstream are never touched.
     redaction: RedactionPolicy,
-    /// A credential injected into this exchange, scrubbed as an exact literal from the
-    /// captured copy so it never reaches telemetry (even if pattern redaction is off).
-    injected_secret: Option<zeroize::Zeroizing<String>>,
+    /// Credentials injected into this exchange, scrubbed as exact literals from the
+    /// captured copy so they never reach telemetry (even if pattern redaction is off).
+    injected_secrets: Vec<zeroize::Zeroizing<String>>,
     /// Set once the cap is hit and further bytes stop being captured.
     capped: bool,
     media_type: Option<String>,
@@ -812,7 +808,7 @@ impl TeeState {
             blob_store: self.blob_store.as_ref(),
             captured: std::mem::take(&mut self.captured),
             redaction: self.redaction,
-            injected_secret: self.injected_secret.take(),
+            injected_secrets: std::mem::take(&mut self.injected_secrets),
             media_type: self.media_type.take(),
             truncated: truncated || self.truncated || self.capped,
         })
@@ -837,7 +833,7 @@ impl Drop for TeeState {
         let blob_store = Arc::clone(&self.blob_store);
         let captured = std::mem::take(&mut self.captured);
         let redaction = self.redaction;
-        let injected_secret = self.injected_secret.take();
+        let injected_secrets = std::mem::take(&mut self.injected_secrets);
         let media_type = self.media_type.take();
         let signal_tx = self.signal_tx.clone();
         tokio::spawn(async move {
@@ -849,7 +845,7 @@ impl Drop for TeeState {
                 blob_store: blob_store.as_ref(),
                 captured,
                 redaction,
-                injected_secret,
+                injected_secrets,
                 media_type,
                 truncated: true,
             })
@@ -869,9 +865,24 @@ struct FinalizeTee<'a> {
     blob_store: &'a dyn BlobStore,
     captured: Vec<u8>,
     redaction: RedactionPolicy,
-    injected_secret: Option<zeroize::Zeroizing<String>>,
+    injected_secrets: Vec<zeroize::Zeroizing<String>>,
     media_type: Option<String>,
     truncated: bool,
+}
+
+/// Redact `body` with the configured pattern policy plus the exchange's injected
+/// credentials as exact literals (scrubbed even when pattern redaction is disabled,
+/// so an injected secret can never reach telemetry).
+fn redact_with_injected(
+    redaction: RedactionPolicy,
+    body: Bytes,
+    secrets: &[zeroize::Zeroizing<String>],
+) -> Bytes {
+    if secrets.is_empty() {
+        return redaction.redact_body(body);
+    }
+    let literals: Vec<&[u8]> = secrets.iter().map(|secret| secret.as_bytes()).collect();
+    redaction.redact_body_with_literals(body, &literals)
 }
 
 /// Redact the buffered capture once, offload it to the blob store, and build the
@@ -886,16 +897,13 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         blob_store,
         captured,
         redaction,
-        injected_secret,
+        injected_secrets,
         media_type,
         truncated,
     } = args;
 
     let captured = Bytes::from(captured);
-    let stored = match &injected_secret {
-        Some(secret) => redaction.redact_body_with_literals(captured, &[secret.as_bytes()]),
-        None => redaction.redact_body(captured),
-    };
+    let stored = redact_with_injected(redaction, captured, &injected_secrets);
     let host = attributes
         .iter()
         .find_map(|(key, value)| (*key == "http.host").then(|| value.clone()));
