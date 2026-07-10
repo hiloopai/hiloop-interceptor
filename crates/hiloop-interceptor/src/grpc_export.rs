@@ -16,6 +16,13 @@ use proto::telemetry_ingest_service_client::TelemetryIngestServiceClient;
 
 type AuthedClient = TelemetryIngestServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 
+/// Deadline on one `Ingest` RPC, covering the lazy (re)connect it may perform. The exporter is
+/// exercised on the teardown drain after the child exits; without a deadline a black-holed gateway
+/// stalls that drain — and the wrapper's exit — indefinitely. 10 s matches the export path's
+/// per-attempt convention (the spool's `attempt_timeout`, the blob `HasBlobs` probe). A timed-out
+/// call classifies as [`ExportError::Unavailable`] so a spooling wrapper parks and retries it.
+const INGEST_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Ships events to the telemetry gateway over gRPC.
 pub struct GrpcIngestExporter {
     client: AuthedClient,
@@ -27,11 +34,14 @@ impl GrpcIngestExporter {
     /// Build a lazily-connected exporter for `endpoint` (e.g.
     /// `https://telemetry.example.com:443`). The channel connects on first export, not here,
     /// so a gateway that is briefly unreachable at startup doesn't abort the run (and any local
-    /// JSONL sink keeps capturing). TLS (native + webpki trust roots) is used unless `insecure` is set (h2c,
-    /// local dev only). The Bearer token is read from `HILOOP_API_KEY`; absent/empty means no auth
-    /// header (an unauthenticated dev gateway). Pass `None` for `tenant_id` against an authenticated
-    /// gateway (it derives the tenant from the token); pass `Some(tenant)` only against a no-auth
-    /// local gateway. `project_id` selects the project.
+    /// JSONL sink keeps capturing). Every export is deadline-bounded (10 s per `Ingest` RPC,
+    /// covering the lazy connect), so an unreachable gateway fails the export as
+    /// [`ExportError::Unavailable`] instead of stalling the caller — the teardown drain must
+    /// never outlive the child unboundedly. TLS (native + webpki trust roots) is used unless
+    /// `insecure` is set (h2c, local dev only). The Bearer token is read from `HILOOP_API_KEY`;
+    /// absent/empty means no auth header (an unauthenticated dev gateway). Pass `None` for
+    /// `tenant_id` against an authenticated gateway (it derives the tenant from the token); pass
+    /// `Some(tenant)` only against a no-auth local gateway. `project_id` selects the project.
     pub fn connect(
         endpoint: impl Into<String>,
         tenant_id: Option<String>,
@@ -50,25 +60,37 @@ impl GrpcIngestExporter {
     }
 }
 
-#[async_trait]
-impl Exporter for GrpcIngestExporter {
-    async fn export(&self, events: &[Event]) -> Result<(), ExportError> {
+impl GrpcIngestExporter {
+    /// One deadline-bounded `Ingest` RPC. The deadline is a parameter so a regression test can
+    /// exercise the timeout path against a stalling gateway without waiting out the production
+    /// [`INGEST_RPC_TIMEOUT`].
+    async fn ingest_within(
+        &self,
+        events: &[Event],
+        deadline: std::time::Duration,
+    ) -> Result<(), ExportError> {
         if events.is_empty() {
             return Ok(());
         }
         let proto_events: Vec<proto::Event> = events.iter().map(to_proto_event).collect();
         let expected = u64::try_from(proto_events.len()).unwrap_or(u64::MAX);
         let mut client = self.client.clone();
-        let accepted = client
-            .ingest(Request::new(proto::IngestRequest {
-                events: proto_events,
-                // proto3 has no optional scalar here: the empty string is the wire form of
-                // "absent", which is exactly what an authenticated gateway expects (it derives
-                // the tenant from the Bearer token).
-                tenant_id: self.tenant_id.clone().unwrap_or_default(),
-                project_id: self.project_id.clone(),
-            }))
+        let rpc = client.ingest(Request::new(proto::IngestRequest {
+            events: proto_events,
+            // proto3 has no optional scalar here: the empty string is the wire form of
+            // "absent", which is exactly what an authenticated gateway expects (it derives
+            // the tenant from the Bearer token).
+            tenant_id: self.tenant_id.clone().unwrap_or_default(),
+            project_id: self.project_id.clone(),
+        }));
+        let accepted = tokio::time::timeout(deadline, rpc)
             .await
+            .map_err(|_elapsed| {
+                ExportError::unavailable(
+                    "grpc",
+                    format!("ingest timed out after {}s", deadline.as_secs_f64()),
+                )
+            })?
             .map_err(|status| ingest_error(&status))?
             .into_inner()
             .accepted;
@@ -79,6 +101,13 @@ impl Exporter for GrpcIngestExporter {
             ));
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl Exporter for GrpcIngestExporter {
+    async fn export(&self, events: &[Event]) -> Result<(), ExportError> {
+        self.ingest_within(events, INGEST_RPC_TIMEOUT).await
     }
 }
 
@@ -426,6 +455,40 @@ mod tests {
             let error = ingest_error(&Status::new(*code, "boom"));
             assert!(expected(&error), "code {code:?} classified as {error:?}");
         }
+    }
+
+    /// Regression test for the unbounded teardown stall: a gateway that accepts the TCP
+    /// connection but never completes the HTTP/2 handshake (a black-holed/hung endpoint) must
+    /// fail the export within the deadline as a transient `Unavailable` — never hang the
+    /// caller's drain.
+    #[tokio::test]
+    async fn export_times_out_against_a_stalling_gateway() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // Keep the listener alive so connects succeed, but never accept/answer: the
+        // OS-level backlog holds the connection open and the h2 handshake stalls.
+        let exporter = GrpcIngestExporter::connect(format!("http://{addr}"), None, "proj", true)
+            .expect("exporter");
+
+        let started = std::time::Instant::now();
+        let error = exporter
+            .ingest_within(&[sample_event()], std::time::Duration::from_millis(200))
+            .await
+            .expect_err("stalling gateway must time out");
+
+        assert!(
+            matches!(error, ExportError::Unavailable { .. }),
+            "timeout classified as {error:?}"
+        );
+        assert!(
+            error.to_string().contains("timed out"),
+            "timeout attributed: {error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "export returned within the deadline, not the kernel's"
+        );
+        drop(listener);
     }
 
     #[tokio::test]
