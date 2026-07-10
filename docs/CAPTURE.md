@@ -209,9 +209,20 @@ emitting into one run collided on the same id — a ULID is globally unique acro
 hudsucker clones the handler per request (`serve_stream` → `self.clone().proxy(req)`) and that one
 clone drives both `handle_request` and `handle_response`, so the id minted on the request is read
 back from per-instance state on the matching response — robust even under HTTP/2 multiplexing, since
-each multiplexed request still gets its own clone and `proxy()` future. Limit: when the upstream
-errors before a response, hudsucker calls `handle_error` (not `handle_response`), so a request event
-is recorded with no paired response — absent rather than mis-correlated.
+each multiplexed request still gets its own clone and `proxy()` future.
+
+**Terminal `http.abort` for exchanges without a response (shipped).** An exchange that never
+reaches a response is closed by a terminal `http.abort` event sharing the request's
+`http.exchange_id`, carrying the method/target/host actually sent plus `http.abort.reason`:
+`upstream_connect_error` (origin unreachable) or `upstream_error` (forward leg broke) with the
+folded error chain in `http.abort.detail` when hudsucker invokes `handle_error`;
+`blocked` when a policy short-circuit (anomaly block) ended the exchange after its request event;
+`incomplete` when the exchange was still open as its handler dropped (client abort, capture end).
+A reader never has to guess a dangling request's fate from interceptor-external evidence.
+Captured `http.target` values are also normalized consistently: the scheme-default port is
+stripped (`https://host:443/x` → `https://host/x`), since hudsucker rebuilds intercepted HTTP/1.1
+URIs from the port-carrying CONNECT authority while HTTP/2 keeps the port-less `:authority`, which
+otherwise splits one endpoint into two target values.
 
 **Remaining gaps (tracked in TESTING.md):** both request and response captured copies are buffered
 whole (within the capture cap) before offload; on a blob-write failure either degrades to metadata

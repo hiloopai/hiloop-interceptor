@@ -10,6 +10,14 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- Aborted/failed HTTP exchanges now reach an explicit terminal record: an `http.abort` event
+  sharing the request's `http.exchange_id`, carrying the method/target/host actually sent and an
+  `http.abort.reason` — `upstream_connect_error` / `upstream_error` (with the folded error chain
+  in `http.abort.detail`) when the origin leg fails, `blocked` when a policy short-circuit ends
+  the exchange after its request event, `incomplete` when the exchange is still open as capture
+  ends or the client aborts. Previously such exchanges dangled as a request event with no
+  response and no explanation. Purely additive to the event schema.
+
 - The gRPC event export now survives telemetry-gateway outages: export failures are classified by
   gRPC status — a transient failure (`UNAVAILABLE`, `RESOURCE_EXHAUSTED`, transport errors) parks
   the batch in a bounded in-memory spool (8192 events / 32 MiB; over the caps the oldest events
@@ -96,6 +104,10 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Fixed
 
+- Captured `http.target` values are normalized consistently: the scheme-default port is stripped
+  (`https://host:443/x` → `https://host/x`). Intercepted HTTP/1.1 requests carry the CONNECT
+  authority's explicit `:443` while HTTP/2 requests keep their port-less `:authority`, so the same
+  endpoint previously split into two target values across protocol versions.
 - The gRPC event export is now deadline-bounded end to end: the gateway channel bounds its
   (re)connect at 10 s and every `Ingest` RPC — including the lazy connect it may perform — is
   capped at 10 s, classifying a timeout as a transient (retryable) failure. Previously the
