@@ -91,6 +91,14 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Fixed
 
+- The gRPC event export is now deadline-bounded end to end: the gateway channel bounds its
+  (re)connect at 10 s and every `Ingest` RPC — including the lazy connect it may perform — is
+  capped at 10 s, classifying a timeout as a transient (retryable) failure. Previously the
+  channel connected with no connect or RPC timeout, so an unreachable/black-holed gateway could
+  stall the wrapper's teardown drain — and the child's exit-status propagation — indefinitely;
+  the run-level spool and drain budgets bounded the wrapper's own paths, but the exporter seam
+  itself was unbounded for any direct (embedder) caller.
+
 - The wrapper installs its SIGINT/SIGTERM forwarding handlers before spawning the child, closing
   a startup window where a terminating signal could kill the wrapper by its default disposition —
   ending the wrap without the signal ever being forwarded and leaving the just-spawned child's

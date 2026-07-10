@@ -28,6 +28,13 @@ pub mod proto {
 /// stays out of process provenance (`process.argv`).
 pub const TOKEN_ENV: &str = "HILOOP_API_KEY";
 
+/// Bound on establishing the gateway connection (DNS + TCP + TLS). The channel is lazy, so the
+/// connect happens inside the first RPC after an outage; without this bound a black-holed gateway
+/// (unroutable address, dropped SYNs) holds that RPC — and the teardown drain awaiting it — at the
+/// mercy of kernel TCP timeouts. 10 s matches the export path's per-attempt convention (the spool's
+/// `attempt_timeout`, the blob `HasBlobs` probe).
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Errors building a gateway client (invalid endpoint, TLS setup, malformed token).
 #[derive(Debug, Error)]
 pub enum GrpcClientError {
@@ -66,7 +73,7 @@ pub(crate) fn build_channel(endpoint: &str, insecure: bool) -> Result<Channel, G
             .tls_config(ClientTlsConfig::new().with_enabled_roots())
             .map_err(|error| GrpcClientError::Tls(Box::new(error)))?;
     }
-    Ok(builder.connect_lazy())
+    Ok(builder.connect_timeout(CONNECT_TIMEOUT).connect_lazy())
 }
 
 /// Read the Bearer token from [`TOKEN_ENV`]. Absent/empty means no auth header (an
