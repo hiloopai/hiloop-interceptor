@@ -20,7 +20,9 @@
 //! a request signal is recorded even when the upstream never consumes the body, then
 //! capped to the same limit, redacted, and offloaded. The cap bounds only the captured
 //! copy; the bytes forwarded to the origin are always complete and never capped.
-//! Request and response events are linked by an `http.exchange_id` attribute — see the
+//! Request and response events are linked by an `http.exchange_id` attribute; an
+//! exchange that ends without a response (upstream failure, client abort, policy
+//! block) is closed by a terminal `http.abort` event sharing the same id — see the
 //! `CaptureHandler` docs for the correlation mechanism and its reliability limits.
 
 use std::collections::HashMap;
@@ -75,6 +77,17 @@ const PROXY_SOURCE: &str = "proxy";
 const REQUEST_KIND: &str = "http.request";
 const RESPONSE_KIND: &str = "http.response";
 const EGRESS_DENIED_KIND: &str = "egress.denied";
+/// Terminal event for an exchange that ended without a response: it shares the
+/// request's `http.exchange_id` and names why the exchange never completed
+/// ([`ABORT_REASON_ATTR`]), so a captured request can never dangle ambiguously.
+const ABORT_KIND: &str = "http.abort";
+/// Why the exchange aborted: `upstream_connect_error` (the origin was unreachable),
+/// `upstream_error` (the forward leg failed after connecting), `blocked` (a policy
+/// short-circuit ended the exchange after its request event), or `incomplete` (the
+/// exchange was still open when its handler was dropped — client abort or capture end).
+const ABORT_REASON_ATTR: &str = "http.abort.reason";
+/// Human-readable detail for an aborted exchange (the folded upstream error chain).
+const ABORT_DETAIL_ATTR: &str = "http.abort.detail";
 const EXCHANGE_ID_ATTR: &str = "http.exchange_id";
 const GEN_AI_REQUEST_MODEL_ATTR: &str = "gen_ai.request.model";
 const GEN_AI_RESPONSE_MODEL_ATTR: &str = "gen_ai.response.model";
@@ -325,12 +338,15 @@ impl ProxyServer {
 /// # Reliability limits
 ///
 /// The link is exact for any exchange that flows request → response through one
-/// `proxy()` call. It is *absent* (no response event, hence nothing to mismatch)
-/// when the upstream errors before a response — `handle_error` is invoked instead
-/// of `handle_response`. It does not survive request/response *reordering* across
-/// distinct exchanges because each exchange has an independent clone, which is the
-/// correct behavior: there is no shared mutable handler that could cross-link two
-/// in-flight exchanges.
+/// `proxy()` call. When no response ever arrives the exchange is closed by a
+/// terminal `http.abort` event sharing the same id: `handle_error` (invoked
+/// instead of `handle_response` when the upstream leg fails) emits it with the
+/// upstream failure as reason/detail, and a clone dropped with its exchange still
+/// open (client abort, capture end, policy short-circuit) emits it from `Drop` —
+/// so a captured request never dangles with an ambiguous fate. The link does not
+/// survive request/response *reordering* across distinct exchanges because each
+/// exchange has an independent clone, which is the correct behavior: there is no
+/// shared mutable handler that could cross-link two in-flight exchanges.
 #[derive(Clone)]
 struct CaptureHandler {
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
@@ -364,6 +380,14 @@ struct CaptureHandler {
     /// Request host for the current exchange, carried onto the matching response so
     /// response telemetry can be classified and queried by the same host dimension.
     exchange_host: Option<String>,
+    /// Method of the current exchange's request, carried onto a terminal
+    /// `http.abort` so an aborted exchange still records what was actually sent.
+    exchange_method: Option<String>,
+    /// Normalized target of the current exchange's request, for the same purpose.
+    exchange_target: Option<String>,
+    /// Set when a policy short-circuit (anomaly block) ends the exchange after its
+    /// request event, so the Drop-emitted terminal abort names the real reason.
+    abort_reason: Option<&'static str>,
 }
 
 impl CaptureHandler {
@@ -394,6 +418,9 @@ impl CaptureHandler {
             injected_secrets: Vec::new(),
             exchange_id: None,
             exchange_host: None,
+            exchange_method: None,
+            exchange_target: None,
+            abort_reason: None,
         }
     }
 
@@ -528,10 +555,14 @@ impl CaptureHandler {
             .inspect(parts.method.as_str(), content_type.as_deref(), &bytes);
         let blocked = !flags.is_empty() && self.anomaly.blocks_on_match();
 
+        let method = parts.method.as_str().to_owned();
+        let target = telemetry_target(&parts.uri);
+        self.exchange_method = Some(method.clone());
+        self.exchange_target = Some(target.clone());
         let mut attributes = vec![
             (EXCHANGE_ID_ATTR, exchange_id),
-            ("http.method", parts.method.as_str().to_owned()),
-            ("http.target", parts.uri.to_string()),
+            ("http.method", method),
+            ("http.target", target),
         ];
         let host = request_host(&parts.uri, &parts.headers).map(|host| telemetry_host(&host));
         self.exchange_host.clone_from(&host);
@@ -579,9 +610,44 @@ impl CaptureHandler {
         let _ = self.signal_tx.send(Ok(raw)).await;
 
         if blocked {
+            // The 403 short-circuit never reaches `on_response`, so the exchange's
+            // terminal record is the Drop-emitted abort; name its reason honestly.
+            self.abort_reason = Some("blocked");
             return forbidden().into();
         }
         Request::from_parts(parts, Body::from(bytes)).into()
+    }
+
+    /// Build the terminal `http.abort` signal for the currently open exchange (if
+    /// any), consuming the exchange state so the terminal is emitted exactly once.
+    fn take_abort_signal(&mut self, reason: &str, detail: Option<String>) -> Option<RawSignal> {
+        let exchange_id = self.exchange_id.take()?;
+        let mut raw = RawSignal::new(PROXY_SOURCE, ABORT_KIND, self.clock.tick(), Bytes::new())
+            .with_attribute(EXCHANGE_ID_ATTR, exchange_id)
+            .with_attribute(ABORT_REASON_ATTR, reason);
+        if let Some(host) = self.exchange_host.take() {
+            raw = raw.with_attribute("http.host", host);
+        }
+        if let Some(method) = self.exchange_method.take() {
+            raw = raw.with_attribute("http.method", method);
+        }
+        if let Some(target) = self.exchange_target.take() {
+            raw = raw.with_attribute("http.target", target);
+        }
+        if let Some(detail) = detail {
+            raw = raw.with_attribute(ABORT_DETAIL_ATTR, detail);
+        }
+        Some(raw)
+    }
+
+    /// Record the terminal abort for an exchange whose upstream leg failed:
+    /// hudsucker calls `handle_error` instead of `handle_response` there, so
+    /// without this the request event would dangle with no terminal record.
+    /// Inherent (not the trait method) to stay testable without an `HttpContext`.
+    async fn on_upstream_error(&mut self, reason: &'static str, detail: String) {
+        if let Some(raw) = self.take_abort_signal(reason, Some(detail)) {
+            let _ = self.signal_tx.send(Ok(raw)).await;
+        }
     }
 
     /// Evaluate `destination` against the egress policy at `layer`; on a deny, emit the
@@ -739,6 +805,21 @@ impl CaptureHandler {
         });
 
         Body::from(StreamBody::new(teed))
+    }
+}
+
+impl Drop for CaptureHandler {
+    /// A clone dropped with its exchange still open (no response, no upstream-error
+    /// terminal) means the exchange ended without a terminal record — the client
+    /// aborted, capture ended mid-flight, or a policy short-circuit closed it after
+    /// its request event. Emit the terminal `http.abort` so no captured request
+    /// dangles ambiguously. `try_send`, since Drop cannot await: losing this
+    /// best-effort marker under backpressure is acceptable; blocking Drop is not.
+    fn drop(&mut self) {
+        let reason = self.abort_reason.take().unwrap_or("incomplete");
+        if let Some(raw) = self.take_abort_signal(reason, None) {
+            let _ = self.signal_tx.try_send(Ok(raw));
+        }
     }
 }
 
@@ -1052,15 +1133,63 @@ impl HttpHandler for CaptureHandler {
     }
 
     /// An upstream forwarding failure fails closed with `502` (hudsucker's default),
-    /// so a request whose origin connection broke never leaks downstream as success.
+    /// so a request whose origin connection broke never leaks downstream as success —
+    /// and the exchange reaches its terminal record: an `http.abort` event naming
+    /// whether the origin was unreachable or the forward leg broke mid-exchange.
     async fn handle_error(
         &mut self,
         _ctx: &HttpContext,
         error: hudsucker::hyper_util::client::legacy::Error,
     ) -> Response<Body> {
         eprintln!("hiloop-interceptor: proxy upstream request failed: {error}");
+        let reason = if error.is_connect() {
+            "upstream_connect_error"
+        } else {
+            "upstream_error"
+        };
+        self.on_upstream_error(reason, error_chain_message(&error))
+            .await;
         bad_gateway()
     }
+}
+
+/// Fold an error and its source chain into one `: `-separated line. hyper's legacy
+/// client `Display` names only the failing phase (e.g. `client error (Connect)`);
+/// the actionable cause lives down the chain.
+fn error_chain_message(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(hop) = source {
+        parts.push(hop.to_string());
+        source = hop.source();
+    }
+    parts.join(": ")
+}
+
+/// Render a request target for telemetry with the scheme-default port stripped
+/// (`https://host:443/x` → `https://host/x`). hudsucker rebuilds an intercepted
+/// HTTP/1.1 request's URI from the CONNECT authority (which carries an explicit
+/// `:443`), while an HTTP/2 request keeps its port-less `:authority` — without
+/// normalization the same endpoint splits into two target values.
+fn telemetry_target(uri: &hudsucker::hyper::Uri) -> String {
+    let default_port: u16 = match uri.scheme_str() {
+        Some("https") => 443,
+        Some("http") => 80,
+        _ => return uri.to_string(),
+    };
+    let (Some(port), Some(authority)) = (uri.port_u16(), uri.authority()) else {
+        return uri.to_string();
+    };
+    if port != default_port {
+        return uri.to_string();
+    }
+    let scheme = uri.scheme_str().unwrap_or_default();
+    let host = authority
+        .as_str()
+        .strip_suffix(&format!(":{port}"))
+        .unwrap_or(authority.as_str());
+    let path = uri.path_and_query().map_or("", |pq| pq.as_str());
+    format!("{scheme}://{host}{path}")
 }
 
 /// Canonicalize a request's destination authority — the CONNECT authority for a
@@ -1337,7 +1466,7 @@ impl Normalizer for ProxyNormalizer {
         if raw.source == PROXY_SOURCE
             && matches!(
                 raw.kind.as_str(),
-                REQUEST_KIND | RESPONSE_KIND | EGRESS_DENIED_KIND
+                REQUEST_KIND | RESPONSE_KIND | ABORT_KIND | EGRESS_DENIED_KIND
             )
         {
             NormalizerSupport::Exact
@@ -2033,6 +2162,197 @@ mod tests {
             signal.attributes.get(BLOCKED_ATTR).map(String::as_str),
             Some("true")
         );
+
+        // The 403 short-circuit never reaches `on_response`, so the exchange's
+        // terminal record is the Drop-emitted abort, named with the real reason.
+        drop(handler);
+        let abort = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(abort.kind, ABORT_KIND);
+        assert_eq!(
+            abort.attributes.get(EXCHANGE_ID_ATTR),
+            signal.attributes.get(EXCHANGE_ID_ATTR),
+            "the abort closes the blocked exchange"
+        );
+        assert_eq!(
+            abort.attributes.get(ABORT_REASON_ATTR).map(String::as_str),
+            Some("blocked")
+        );
+    }
+
+    /// Regression test for dangling aborted exchanges: an upstream failure must
+    /// produce a terminal `http.abort` sharing the request's exchange id and
+    /// carrying the method/target actually sent (was: no terminal event at all —
+    /// hudsucker calls `handle_error`, which only logged).
+    #[tokio::test]
+    async fn upstream_error_emits_terminal_abort_with_exchange_context() {
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://api.openai.com:443/v1/responses")
+            .body(Body::from(Bytes::from_static(b"{}")))
+            .expect("request");
+        let _forwarded = expect_forwarded(handler.on_request(request).await);
+        let request_signal = rx.recv().await.expect("signal").expect("raw");
+        let exchange_id = request_signal
+            .attributes
+            .get(EXCHANGE_ID_ATTR)
+            .cloned()
+            .expect("exchange id");
+
+        handler
+            .on_upstream_error(
+                "upstream_connect_error",
+                "client error (Connect): tcp connect error: Connection refused".to_owned(),
+            )
+            .await;
+
+        let abort = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(abort.kind, ABORT_KIND);
+        assert_eq!(
+            abort.attributes.get(EXCHANGE_ID_ATTR),
+            Some(&exchange_id),
+            "the abort joins the dangling request"
+        );
+        assert_eq!(
+            abort.attributes.get(ABORT_REASON_ATTR).map(String::as_str),
+            Some("upstream_connect_error")
+        );
+        assert_eq!(
+            abort.attributes.get("http.method").map(String::as_str),
+            Some("POST"),
+            "the method actually sent is recorded, never a placeholder"
+        );
+        assert_eq!(
+            abort.attributes.get("http.target").map(String::as_str),
+            Some("https://api.openai.com/v1/responses")
+        );
+        assert_eq!(
+            abort.attributes.get("http.host").map(String::as_str),
+            Some("api.openai.com")
+        );
+        assert!(
+            abort
+                .attributes
+                .get(ABORT_DETAIL_ATTR)
+                .expect("detail")
+                .contains("Connection refused")
+        );
+
+        // The terminal is emitted exactly once: dropping the handler afterwards
+        // must not mint a second abort for the same exchange.
+        drop(handler);
+        assert!(rx.recv().await.is_none(), "no duplicate terminal event");
+    }
+
+    #[tokio::test]
+    async fn dropped_open_exchange_emits_incomplete_abort() {
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("GET")
+            .uri("https://example.com/stream")
+            .body(Body::empty())
+            .expect("request");
+        let _forwarded = expect_forwarded(handler.on_request(request).await);
+        let request_signal = rx.recv().await.expect("signal").expect("raw");
+
+        // Client abort / capture end: the clone is dropped before any response.
+        drop(handler);
+
+        let abort = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(abort.kind, ABORT_KIND);
+        assert_eq!(
+            abort.attributes.get(EXCHANGE_ID_ATTR),
+            request_signal.attributes.get(EXCHANGE_ID_ATTR)
+        );
+        assert_eq!(
+            abort.attributes.get(ABORT_REASON_ATTR).map(String::as_str),
+            Some("incomplete")
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_exchange_emits_no_abort() {
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("GET")
+            .uri("https://example.com/ok")
+            .body(Body::empty())
+            .expect("request");
+        let _forwarded = expect_forwarded(handler.on_request(request).await);
+        let response = Response::builder()
+            .status(200)
+            .body(streaming_body(&[b"done"]))
+            .expect("response");
+        let teed = handler.on_response(response);
+        drain_body(teed.into_body()).await;
+        drop(handler);
+
+        let kinds: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|signal| signal.expect("raw").kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [REQUEST_KIND, RESPONSE_KIND],
+            "a request → response exchange must not grow a terminal abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_target_strips_the_scheme_default_port() {
+        // hudsucker rebuilds an intercepted HTTP/1.1 URI from the CONNECT authority
+        // (`host:443`) while HTTP/2 keeps the port-less `:authority`; the captured
+        // target must not split one endpoint into two values.
+        let (mut handler, mut rx, _store) = handler();
+        let request = Request::builder()
+            .method("GET")
+            .uri("https://api.openai.com:443/v1/responses")
+            .body(Body::empty())
+            .expect("request");
+        let _forwarded = expect_forwarded(handler.on_request(request).await);
+        let signal = rx.recv().await.expect("signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get("http.target").map(String::as_str),
+            Some("https://api.openai.com/v1/responses")
+        );
+    }
+
+    #[test]
+    fn telemetry_target_strips_only_the_scheme_default_port() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "https://api.openai.com:443/v1/responses",
+                "https://api.openai.com/v1/responses",
+            ),
+            ("http://example.com:80/x", "http://example.com/x"),
+            ("https://example.com:8443/x", "https://example.com:8443/x"),
+            ("http://example.com:8080/x", "http://example.com:8080/x"),
+            ("https://example.com/x", "https://example.com/x"),
+            ("https://[::1]:443/x", "https://[::1]/x"),
+            ("/origin-form-only", "/origin-form-only"),
+        ];
+        for (input, expected) in cases {
+            let uri: hudsucker::hyper::Uri = input.parse().expect("uri");
+            assert_eq!(telemetry_target(&uri), *expected, "for {input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn normalizes_abort_as_a_terminal_event() {
+        let raw = proxy_signal(
+            ABORT_KIND,
+            &[
+                ("http.host", "api.openai.com"),
+                (ABORT_REASON_ATTR, "upstream_connect_error"),
+            ],
+        );
+        let context = NormalizationContext::new(RunContext::new_local_root());
+        let outcome = ProxyNormalizer
+            .normalize(&context, raw)
+            .await
+            .expect("normalize");
+        let events = outcome.into_events();
+        assert_eq!(events[0].name.as_str(), "http.abort");
+        assert_eq!(events[0].signal, SignalType::Llm);
     }
 
     #[tokio::test]
