@@ -282,13 +282,26 @@ impl CertificateAuthority for ProxyAuthority {
 /// public root is always present, so an extra anchor can only add trust, never
 /// replace or weaken it, and verification itself is never relaxed.
 ///
-/// An extra anchor that does not parse as a CA certificate is skipped with a loud
-/// warning rather than failing the proxy — the public roots must keep anchoring
-/// spliced capture.
+/// An extra anchor that is not a real CA certificate — unparseable, or parseable but
+/// without `BasicConstraints CA=true` (and `keyCertSign` when a `KeyUsage` extension is
+/// present) — is skipped with a loud warning rather than failing the proxy or being
+/// trusted anyway: `RootCertStore::add` accepts a parseable end-entity certificate as
+/// an anchor, so a mis-provisioned leaf would silently *widen* trust instead of
+/// triggering the fail-safe. The public roots keep anchoring spliced capture either
+/// way.
 fn upstream_root_store(extra_trust_anchors: &[CertificateDer<'static>]) -> RootCertStore {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for anchor in extra_trust_anchors {
+        if !is_ca_certificate(anchor) {
+            eprintln!(
+                "hiloop-interceptor: warning: skipping an extra upstream trust anchor that is \
+                 not a CA certificate (BasicConstraints CA=true, plus keyCertSign when a \
+                 KeyUsage extension is present, are required); continuing with public roots \
+                 only for it"
+            );
+            continue;
+        }
         if let Err(error) = roots.add(anchor.clone()) {
             eprintln!(
                 "hiloop-interceptor: warning: skipping an extra upstream trust anchor that is \
@@ -297,6 +310,23 @@ fn upstream_root_store(extra_trust_anchors: &[CertificateDer<'static>]) -> RootC
         }
     }
     roots
+}
+
+/// Whether `anchor` is a certificate actually authorized to act as a CA:
+/// `BasicConstraints CA=true` (absent means end-entity, per RFC 5280) and, when a
+/// `KeyUsage` extension is present, `keyCertSign`. Trust-anchor construction must
+/// check this itself — `RootCertStore::add` does not, and an anchor is trusted
+/// directly, so an end-entity certificate added there would verify itself.
+fn is_ca_certificate(anchor: &CertificateDer<'_>) -> bool {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(anchor.as_ref()) else {
+        return false;
+    };
+    let key_cert_sign = match cert.key_usage() {
+        Ok(Some(key_usage)) => key_usage.value.key_cert_sign(),
+        Ok(None) => true,
+        Err(_) => false,
+    };
+    cert.is_ca() && key_cert_sign
 }
 
 /// Build the rustls config for the proxy's upstream TLS client from
@@ -1938,6 +1968,34 @@ mod tests {
             webpki_roots::TLS_SERVER_ROOTS.len(),
             "a bad extra anchor is skipped; the public roots keep anchoring spliced capture"
         );
+    }
+
+    #[test]
+    fn upstream_root_store_rejects_end_entity_certificates_as_anchors() {
+        // A parseable end-entity certificate would be accepted by `RootCertStore::add`
+        // and then trusted directly — mis-provisioning a leaf where the interception CA
+        // belongs must instead trigger the fail-safe (public roots only).
+        let ca = ProxyCa::generate().expect("generate CA");
+        let leaf = ca
+            .authority
+            .gen_cert(&Authority::from_static("api.example.com"));
+        assert!(
+            !is_ca_certificate(&leaf),
+            "an end-entity certificate is not a CA"
+        );
+
+        let store = upstream_root_store(&[leaf]);
+        assert_eq!(
+            store.roots.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "a mis-provisioned leaf never becomes a trust anchor"
+        );
+    }
+
+    #[test]
+    fn is_ca_certificate_accepts_a_real_ca() {
+        let ca = ProxyCa::generate().expect("generate CA");
+        assert!(is_ca_certificate(&ca_trust_anchor(&ca)));
     }
 
     #[test]

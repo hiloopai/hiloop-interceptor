@@ -921,11 +921,12 @@ fn mint_interception_ca() -> (
 
 /// A TLS upstream whose `localhost` leaf chains to `issuer` — the exact upstream the
 /// proxy's forward hop sees on a bound route a host-side egress proxy terminated.
-/// Serves one canned HTTP/1.1 200 per connection.
+/// Serves one canned HTTP/1.1 200 per connection. Also returns the leaf's PEM, for
+/// the mis-provisioning test that plants a leaf where the CA belongs.
 async fn interception_terminated_upstream(
     issuer: &hudsucker::rcgen::Issuer<'static, hudsucker::rcgen::KeyPair>,
     body: &'static str,
-) -> u16 {
+) -> (u16, String) {
     use hudsucker::rcgen::{CertificateParams, KeyPair};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -938,6 +939,7 @@ async fn interception_terminated_upstream(
         .expect("leaf params")
         .signed_by(&leaf_key, issuer)
         .expect("signed leaf");
+    let leaf_pem = leaf.pem();
 
     let server_cfg = ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
         .with_safe_default_protocol_versions()
@@ -973,7 +975,7 @@ async fn interception_terminated_upstream(
             });
         }
     });
-    port
+    (port, leaf_pem)
 }
 
 #[tokio::test]
@@ -983,7 +985,7 @@ async fn proxy_upstream_trusts_the_provisioned_interception_ca_on_bound_routes()
     // public root anchors. With `HILOOP_EGRESS_INTERCEPTION_CA` provisioned, the
     // upstream client unions that CA with the public roots and the exchange completes.
     let (ca_pem, issuer) = mint_interception_ca();
-    let port = interception_terminated_upstream(&issuer, "bound-ok").await;
+    let (port, _leaf_pem) = interception_terminated_upstream(&issuer, "bound-ok").await;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let ca_path = temp.path().join("egress-interception-ca.pem");
@@ -1027,7 +1029,8 @@ async fn proxy_upstream_still_rejects_leaves_from_an_unprovisioned_ca() {
     // the CA `HILOOP_EGRESS_INTERCEPTION_CA` names, so this handshake must fail
     // closed exactly as with public roots only — the union never relaxes verification.
     let (_upstream_ca_pem, upstream_issuer) = mint_interception_ca();
-    let port = interception_terminated_upstream(&upstream_issuer, "must-not-arrive").await;
+    let (port, _leaf_pem) =
+        interception_terminated_upstream(&upstream_issuer, "must-not-arrive").await;
     let (provisioned_ca_pem, _provisioned_issuer) = mint_interception_ca();
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1066,6 +1069,55 @@ async fn proxy_upstream_still_rejects_leaves_from_an_unprovisioned_ca() {
     assert!(
         !events.iter().any(|event| event["name"] == "http.response"),
         "no response can complete against an untrusted upstream: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_rejects_a_mis_provisioned_leaf_as_interception_ca_and_fails_closed() {
+    // `HILOOP_EGRESS_INTERCEPTION_CA` points at the upstream's own END-ENTITY leaf
+    // instead of a CA. A leaf must never become a trust anchor (that would WIDEN
+    // trust on mis-provisioning): the proxy warns loudly, degrades to public roots
+    // only, and the bound route fails closed.
+    let (_ca_pem, issuer) = mint_interception_ca();
+    let (port, leaf_pem) = interception_terminated_upstream(&issuer, "must-not-arrive").await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ca_path = temp.path().join("egress-interception-ca.pem");
+    std::fs::write(&ca_path, &leaf_pem).expect("write mis-provisioned leaf");
+    let events_path = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--blob-dir")
+        .arg(&blob_dir)
+        .env("HILOOP_EGRESS_INTERCEPTION_CA", &ca_path);
+    let url = format!("https://localhost:{port}/v1/leaf-as-ca");
+    append_mock_harness(&mut command, "proxy", &[&url]);
+
+    let output = run(command).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("not a CA certificate"),
+        "the mis-provisioned leaf must warn loudly, stderr: {stderr}"
+    );
+
+    let events = read_jsonl(&events_path);
+    let abort = events
+        .iter()
+        .find(|event| event["name"] == "http.abort")
+        .expect("the exchange fails closed instead of trusting the leaf");
+    assert_eq!(
+        abort["attributes"]["http.abort.reason"],
+        "upstream_connect_error"
+    );
+    assert!(
+        !events.iter().any(|event| event["name"] == "http.response"),
+        "a mis-provisioned leaf must not verify its own upstream: {events:?}"
     );
 }
 

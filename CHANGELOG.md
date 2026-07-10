@@ -120,9 +120,11 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   though the child's own trust bundle accepted the leaf (rustls has no `SSL_CERT_FILE` behavior,
   so the bundle never reached this hop). The union is strictly additive — every public root stays,
   publicly-anchored (spliced) routes verify exactly as before, and verification is never relaxed —
-  and fail-safe: an unset variable adds nothing, while a missing/unreadable/non-certificate file
-  warns loudly and degrades to public-roots-only, so capture of publicly-anchored traffic survives
-  a broken provisioning and deployment-terminated routes fail closed as before.
+  and fail-safe: an unset variable adds nothing, while a missing/unreadable/non-certificate file —
+  or a certificate that is not actually a CA (`BasicConstraints CA=true`, plus `keyCertSign` when a
+  KeyUsage extension is present; an end-entity leaf planted where the CA belongs must not become a
+  trust anchor) — warns loudly and degrades to public-roots-only, so capture of publicly-anchored
+  traffic survives a broken provisioning and deployment-terminated routes fail closed as before.
 - Captured `http.target` values are normalized consistently: the scheme-default port is stripped
   (`https://host:443/x` → `https://host/x`). Intercepted HTTP/1.1 requests carry the CONNECT
   authority's explicit `:443` while HTTP/2 requests keep their port-less `:authority`, so the same
