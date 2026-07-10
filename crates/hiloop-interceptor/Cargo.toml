@@ -44,6 +44,9 @@ tonic.workspace = true
 tonic-prost.workspace = true
 ulid.workspace = true
 url.workspace = true
+# Validates CA-ness (BasicConstraints/KeyUsage) before a certificate becomes an
+# upstream trust anchor; also backs the test-side certificate assertions.
+x509-parser.workspace = true
 zeroize.workspace = true
 
 # Signal forwarding and process-group teardown are Unix-only (the wrapper's
@@ -64,7 +67,6 @@ criterion.workspace = true
 # spool's backoff tests; a dev-only feature, never part of the shipped build.
 tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls.workspace = true
-x509-parser.workspace = true
 
 [[bench]]
 name = "stdio_path"

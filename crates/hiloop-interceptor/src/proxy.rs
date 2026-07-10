@@ -43,10 +43,11 @@ use hudsucker::rcgen::{
     KeyUsagePurpose, SanType, string::Ia5String,
 };
 use hudsucker::rustls::{
-    ServerConfig,
+    ClientConfig, RootCertStore, ServerConfig,
     crypto::{CryptoProvider, aws_lc_rs},
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
+use hudsucker::tokio_tungstenite::Connector;
 use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -268,6 +269,82 @@ impl CertificateAuthority for ProxyAuthority {
     }
 }
 
+/// Trust anchors for the proxy's upstream TLS client: the compiled-in webpki public
+/// roots, unioned with `extra_trust_anchors`.
+///
+/// The public roots anchor spliced routes, where the upstream hop sees the real
+/// origin certificate (they are compiled in because native roots are empty in the
+/// minimal sandbox bases the interceptor runs in). The extra anchors admit
+/// deployment-terminated routes: a host-side egress proxy that terminates TLS for
+/// bound destinations serves leaves chained to its own interception CA, which no
+/// public root anchors — without it those exchanges fail this hop's verification
+/// even though the child's own trust bundle accepts them. Strictly additive: every
+/// public root is always present, so an extra anchor can only add trust, never
+/// replace or weaken it, and verification itself is never relaxed.
+///
+/// An extra anchor that is not a real CA certificate — unparseable, or parseable but
+/// without `BasicConstraints CA=true` (and `keyCertSign` when a `KeyUsage` extension is
+/// present) — is skipped with a loud warning rather than failing the proxy or being
+/// trusted anyway: `RootCertStore::add` accepts a parseable end-entity certificate as
+/// an anchor, so a mis-provisioned leaf would silently *widen* trust instead of
+/// triggering the fail-safe. The public roots keep anchoring spliced capture either
+/// way.
+fn upstream_root_store(extra_trust_anchors: &[CertificateDer<'static>]) -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for anchor in extra_trust_anchors {
+        if !is_ca_certificate(anchor) {
+            eprintln!(
+                "hiloop-interceptor: warning: skipping an extra upstream trust anchor that is \
+                 not a CA certificate (BasicConstraints CA=true, plus keyCertSign when a \
+                 KeyUsage extension is present, are required); continuing with public roots \
+                 only for it"
+            );
+            continue;
+        }
+        if let Err(error) = roots.add(anchor.clone()) {
+            eprintln!(
+                "hiloop-interceptor: warning: skipping an extra upstream trust anchor that is \
+                 not a usable CA certificate: {error}"
+            );
+        }
+    }
+    roots
+}
+
+/// Whether `anchor` is a certificate actually authorized to act as a CA:
+/// `BasicConstraints CA=true` (absent means end-entity, per RFC 5280) and, when a
+/// `KeyUsage` extension is present, `keyCertSign`. Trust-anchor construction must
+/// check this itself — `RootCertStore::add` does not, and an anchor is trusted
+/// directly, so an end-entity certificate added there would verify itself.
+fn is_ca_certificate(anchor: &CertificateDer<'_>) -> bool {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(anchor.as_ref()) else {
+        return false;
+    };
+    let key_cert_sign = match cert.key_usage() {
+        Ok(Some(key_usage)) => key_usage.value.key_cert_sign(),
+        Ok(None) => true,
+        Err(_) => false,
+    };
+    cert.is_ca() && key_cert_sign
+}
+
+/// Build the rustls config for the proxy's upstream TLS client from
+/// [`upstream_root_store`], on the same `aws-lc-rs` provider as the rest of the
+/// proxy.
+fn upstream_client_config(
+    extra_trust_anchors: &[CertificateDer<'static>],
+) -> Result<ClientConfig, ProxyError> {
+    ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| ProxyError::Server(error.to_string()))
+        .map(|builder| {
+            builder
+                .with_root_certificates(upstream_root_store(extra_trust_anchors))
+                .with_no_client_auth()
+        })
+}
+
 /// An intercepting proxy bound to an ephemeral localhost port.
 pub struct ProxyServer {
     listener: TcpListener,
@@ -292,9 +369,12 @@ impl ProxyServer {
     /// `egress` enforces the run's egress policy (default allow-all is a no-op),
     /// `anomaly` inspects original request bodies (default disabled is a no-op), and
     /// `injector`, when set, injects bound credentials into matching requests.
+    /// `upstream_extra_trust_anchors` are unioned with the public webpki roots for
+    /// the upstream TLS client (see `upstream_root_store` for the trust model);
+    /// empty means public roots only, the previous behavior.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the proxy's capture, redaction, egress, anomaly, and injection seams are all configured per run; a config struct is deferred while there is a single in-tree caller (the supervisor)"
+        reason = "the proxy's capture, redaction, egress, anomaly, injection, and upstream-trust seams are all configured per run; a config struct is deferred while there is a single in-tree caller (the supervisor)"
     )]
     pub async fn serve<F>(
         self,
@@ -306,6 +386,7 @@ impl ProxyServer {
         egress: Arc<EgressPolicy>,
         anomaly: Arc<AnomalyConfig>,
         injector: Option<SecretInjector>,
+        upstream_extra_trust_anchors: Vec<CertificateDer<'static>>,
         shutdown: F,
     ) -> Result<(), ProxyError>
     where
@@ -321,10 +402,21 @@ impl ProxyServer {
             anomaly,
             injector,
         );
+        // Mirrors hudsucker's `with_rustls_connector` (HTTPS-or-HTTP, http1+http2 ALPN
+        // on the HTTP connector, the un-ALPN'd config on the websocket connector),
+        // except the root store is [`upstream_root_store`] instead of webpki-only.
+        let tls_config = upstream_client_config(&upstream_extra_trust_anchors)?;
+        let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config.clone())
+            .https_or_http()
+            .enable_http1()
+            .enable_http2()
+            .build();
         let proxy = Proxy::builder()
             .with_listener(self.listener)
             .with_ca(ca.authority)
-            .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_http_connector(https_connector)
+            .with_websocket_connector(Connector::Rustls(Arc::new(tls_config)))
             .with_http_handler(handler)
             .with_graceful_shutdown(shutdown)
             .build()
@@ -1842,6 +1934,98 @@ mod tests {
     fn ca_generation_produces_a_cert_pem() {
         let ca = ProxyCa::generate().expect("generate CA");
         assert!(ca.cert_pem().contains("BEGIN CERTIFICATE"));
+    }
+
+    fn ca_trust_anchor(ca: &ProxyCa) -> CertificateDer<'static> {
+        use hudsucker::rustls::pki_types::pem::PemObject as _;
+        CertificateDer::from_pem_slice(ca.cert_pem().as_bytes()).expect("CA cert DER")
+    }
+
+    #[test]
+    fn upstream_root_store_unions_extra_anchors_over_all_public_roots() {
+        let public_only = upstream_root_store(&[]);
+        assert_eq!(
+            public_only.roots.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "no extra anchors means exactly the public webpki roots"
+        );
+
+        let ca = ProxyCa::generate().expect("generate CA");
+        let unioned = upstream_root_store(&[ca_trust_anchor(&ca)]);
+        assert_eq!(
+            unioned.roots.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len() + 1,
+            "an extra anchor is added on top of every public root, never instead of them"
+        );
+    }
+
+    #[test]
+    fn upstream_root_store_survives_an_unparseable_extra_anchor() {
+        let garbage = CertificateDer::from(vec![0_u8; 16]);
+        let store = upstream_root_store(&[garbage]);
+        assert_eq!(
+            store.roots.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "a bad extra anchor is skipped; the public roots keep anchoring spliced capture"
+        );
+    }
+
+    #[test]
+    fn upstream_root_store_rejects_end_entity_certificates_as_anchors() {
+        // A parseable end-entity certificate would be accepted by `RootCertStore::add`
+        // and then trusted directly — mis-provisioning a leaf where the interception CA
+        // belongs must instead trigger the fail-safe (public roots only).
+        let ca = ProxyCa::generate().expect("generate CA");
+        let leaf = ca
+            .authority
+            .gen_cert(&Authority::from_static("api.example.com"));
+        assert!(
+            !is_ca_certificate(&leaf),
+            "an end-entity certificate is not a CA"
+        );
+
+        let store = upstream_root_store(&[leaf]);
+        assert_eq!(
+            store.roots.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "a mis-provisioned leaf never becomes a trust anchor"
+        );
+    }
+
+    #[test]
+    fn is_ca_certificate_accepts_a_real_ca() {
+        let ca = ProxyCa::generate().expect("generate CA");
+        assert!(is_ca_certificate(&ca_trust_anchor(&ca)));
+    }
+
+    #[test]
+    fn upstream_trust_verifies_interception_ca_leaves_and_still_rejects_unknown_cas() {
+        use hudsucker::rustls::client::danger::ServerCertVerifier as _;
+        use hudsucker::rustls::pki_types::{ServerName, UnixTime};
+
+        let host = Authority::from_static("api.example.com");
+        // The deployment interception CA and a leaf it terminated `host` with —
+        // the exact shape a host-side egress proxy presents on bound routes.
+        let interception_ca = ProxyCa::generate().expect("generate interception CA");
+        let bound_leaf = interception_ca.authority.gen_cert(&host);
+        // A CA the deployment never provisioned.
+        let unknown_ca = ProxyCa::generate().expect("generate unknown CA");
+        let unknown_leaf = unknown_ca.authority.gen_cert(&host);
+
+        let verifier = hudsucker::rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(upstream_root_store(&[ca_trust_anchor(&interception_ca)])),
+            Arc::new(aws_lc_rs::default_provider()),
+        )
+        .build()
+        .expect("build verifier");
+        let server_name = ServerName::try_from(host.host()).expect("server name");
+
+        verifier
+            .verify_server_cert(&bound_leaf, &[], &server_name, &[], UnixTime::now())
+            .expect("a leaf chained to the provisioned interception CA verifies");
+        verifier
+            .verify_server_cert(&unknown_leaf, &[], &server_name, &[], UnixTime::now())
+            .expect_err("a leaf chained to an unknown CA still fails closed");
     }
 
     #[test]

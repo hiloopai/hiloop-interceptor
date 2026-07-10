@@ -893,6 +893,289 @@ async fn proxy_mitm_captures_decrypted_https_request() {
     );
 }
 
+/// Mint a deployment-style egress interception CA: the CA PEM is what a deployment
+/// provisions at `HILOOP_EGRESS_INTERCEPTION_CA`, the issuer signs the leaves its
+/// host-side egress proxy would terminate bound routes with.
+fn mint_interception_ca() -> (
+    String,
+    hudsucker::rcgen::Issuer<'static, hudsucker::rcgen::KeyPair>,
+) {
+    use hudsucker::rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+
+    let ca_key = KeyPair::generate().expect("ca key");
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, "test egress interception CA");
+    ca_params.distinguished_name = distinguished_name;
+    let ca_pem = ca_params.self_signed(&ca_key).expect("ca cert").pem();
+
+    let issuer_key = KeyPair::from_pem(&ca_key.serialize_pem()).expect("issuer key");
+    let issuer = Issuer::from_ca_cert_pem(&ca_pem, issuer_key).expect("issuer");
+    (ca_pem, issuer)
+}
+
+/// A TLS upstream whose `localhost` leaf chains to `issuer` — the exact upstream the
+/// proxy's forward hop sees on a bound route a host-side egress proxy terminated.
+/// Serves one canned HTTP/1.1 200 per connection. Also returns the leaf's PEM, for
+/// the mis-provisioning test that plants a leaf where the CA belongs.
+async fn interception_terminated_upstream(
+    issuer: &hudsucker::rcgen::Issuer<'static, hudsucker::rcgen::KeyPair>,
+    body: &'static str,
+) -> (u16, String) {
+    use hudsucker::rcgen::{CertificateParams, KeyPair};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::{ServerConfig, crypto::aws_lc_rs};
+
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let leaf = CertificateParams::new(vec!["localhost".to_owned()])
+        .expect("leaf params")
+        .signed_by(&leaf_key, issuer)
+        .expect("signed leaf");
+    let leaf_pem = leaf.pem();
+
+    let server_cfg = ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("server versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+        )
+        .expect("server cert");
+    let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind upstream");
+    let port = listener.local_addr().expect("upstream addr").port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0_u8; 4096];
+                let _ = tls.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = tls.write_all(response.as_bytes()).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    (port, leaf_pem)
+}
+
+#[tokio::test]
+async fn proxy_upstream_trusts_the_provisioned_interception_ca_on_bound_routes() {
+    // Bound routes reach the proxy's upstream hop TLS-terminated by the deployment's
+    // egress proxy: the leaf chains to the deployment's interception CA, which no
+    // public root anchors. With `HILOOP_EGRESS_INTERCEPTION_CA` provisioned, the
+    // upstream client unions that CA with the public roots and the exchange completes.
+    let (ca_pem, issuer) = mint_interception_ca();
+    let (port, _leaf_pem) = interception_terminated_upstream(&issuer, "bound-ok").await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ca_path = temp.path().join("egress-interception-ca.pem");
+    std::fs::write(&ca_path, &ca_pem).expect("write ca");
+    let events_path = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--blob-dir")
+        .arg(&blob_dir)
+        .env("HILOOP_EGRESS_INTERCEPTION_CA", &ca_path);
+    let url = format!("https://localhost:{port}/v1/bound");
+    append_mock_harness(&mut command, "proxy", &[&url]);
+
+    let output = run(command).await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = read_jsonl(&events_path);
+    let response = events
+        .iter()
+        .find(|event| event["name"] == "http.response")
+        .expect("the bound-route exchange completes against the interception-CA leaf");
+    assert_eq!(response["attributes"]["http.status_code"], "200");
+    assert!(
+        !events.iter().any(|event| event["name"] == "http.abort"),
+        "no exchange aborts: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_upstream_still_rejects_leaves_from_an_unprovisioned_ca() {
+    // The upstream's CA is NOT the provisioned one. Extra upstream trust is strictly
+    // the CA `HILOOP_EGRESS_INTERCEPTION_CA` names, so this handshake must fail
+    // closed exactly as with public roots only — the union never relaxes verification.
+    let (_upstream_ca_pem, upstream_issuer) = mint_interception_ca();
+    let (port, _leaf_pem) =
+        interception_terminated_upstream(&upstream_issuer, "must-not-arrive").await;
+    let (provisioned_ca_pem, _provisioned_issuer) = mint_interception_ca();
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ca_path = temp.path().join("egress-interception-ca.pem");
+    std::fs::write(&ca_path, &provisioned_ca_pem).expect("write ca");
+    let events_path = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--blob-dir")
+        .arg(&blob_dir)
+        .env("HILOOP_EGRESS_INTERCEPTION_CA", &ca_path);
+    let url = format!("https://localhost:{port}/v1/unknown-ca");
+    append_mock_harness(&mut command, "proxy", &[&url]);
+
+    let output = run(command).await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = read_jsonl(&events_path);
+    let abort = events
+        .iter()
+        .find(|event| event["name"] == "http.abort")
+        .expect("the unknown-CA handshake fails closed with a terminal abort");
+    assert_eq!(
+        abort["attributes"]["http.abort.reason"],
+        "upstream_connect_error"
+    );
+    assert!(
+        !events.iter().any(|event| event["name"] == "http.response"),
+        "no response can complete against an untrusted upstream: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_rejects_a_mis_provisioned_leaf_as_interception_ca_and_fails_closed() {
+    // `HILOOP_EGRESS_INTERCEPTION_CA` points at the upstream's own END-ENTITY leaf
+    // instead of a CA. A leaf must never become a trust anchor (that would WIDEN
+    // trust on mis-provisioning): the proxy warns loudly, degrades to public roots
+    // only, and the bound route fails closed.
+    let (_ca_pem, issuer) = mint_interception_ca();
+    let (port, leaf_pem) = interception_terminated_upstream(&issuer, "must-not-arrive").await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let ca_path = temp.path().join("egress-interception-ca.pem");
+    std::fs::write(&ca_path, &leaf_pem).expect("write mis-provisioned leaf");
+    let events_path = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--blob-dir")
+        .arg(&blob_dir)
+        .env("HILOOP_EGRESS_INTERCEPTION_CA", &ca_path);
+    let url = format!("https://localhost:{port}/v1/leaf-as-ca");
+    append_mock_harness(&mut command, "proxy", &[&url]);
+
+    let output = run(command).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("not a CA certificate"),
+        "the mis-provisioned leaf must warn loudly, stderr: {stderr}"
+    );
+
+    let events = read_jsonl(&events_path);
+    let abort = events
+        .iter()
+        .find(|event| event["name"] == "http.abort")
+        .expect("the exchange fails closed instead of trusting the leaf");
+    assert_eq!(
+        abort["attributes"]["http.abort.reason"],
+        "upstream_connect_error"
+    );
+    assert!(
+        !events.iter().any(|event| event["name"] == "http.response"),
+        "a mis-provisioned leaf must not verify its own upstream: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_survives_a_dangling_interception_ca_pointer_and_keeps_capturing() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    // A plain-HTTP upstream: the publicly-reachable capture path that must survive a
+    // broken CA provisioning. The dangling pointer warns loudly and degrades to
+    // public-roots-only; it never fails the proxy or the run.
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = upstream.accept().await {
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+    });
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+
+    let mut command = interceptor_command();
+    command
+        .arg("--proxy")
+        .arg("--events-jsonl")
+        .arg(&events_path)
+        .arg("--blob-dir")
+        .arg(&blob_dir)
+        .env(
+            "HILOOP_EGRESS_INTERCEPTION_CA",
+            temp.path().join("no-such-ca.pem"),
+        );
+    let url = format!("http://127.0.0.1:{upstream_port}/v1/ok");
+    append_mock_harness(&mut command, "proxy-http", &[&url]);
+
+    let output = run(command).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("egress interception CA"),
+        "the dangling CA pointer must warn loudly, stderr: {stderr}"
+    );
+
+    let events = read_jsonl(&events_path);
+    let response = events
+        .iter()
+        .find(|event| event["name"] == "http.response")
+        .expect("capture must survive a broken CA provisioning");
+    assert_eq!(response["attributes"]["http.status_code"], "200");
+}
+
 #[tokio::test]
 async fn proxy_correlates_request_and_response_over_chunked_upstream() {
     // A plain-HTTP upstream the proxy forwards to: it returns a chunked body so

@@ -35,6 +35,7 @@ use hiloop_core::{
     event::{AttributeKey, AttributeValue, Attributes, Event, EventName, SignalType},
     identity::{Hlc, RunContext},
 };
+use hudsucker::rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use std::{
     ffi::OsString,
     future::Future,
@@ -133,6 +134,71 @@ fn union_ca_bundle(system_roots: Option<&[u8]>, interception_ca_pem: &str) -> Ve
     }
     bundle.extend_from_slice(interception_ca_pem.as_bytes());
     bundle
+}
+
+/// Names the PEM file of a deployment's egress interception CA, when the wrapper runs
+/// behind a host-side egress proxy that terminates TLS for bound (credential-injecting)
+/// destinations. Deployments that provision such a proxy also provision this variable
+/// and file into the sandbox; both are absent everywhere else.
+///
+/// The proxy's *upstream* TLS client must trust that CA explicitly: rustls has no
+/// `SSL_CERT_FILE` behavior, so the union bundle exported to the child does not reach
+/// this hop. See [`load_extra_upstream_trust_anchors`].
+const EGRESS_INTERCEPTION_CA_ENV: &str = "HILOOP_EGRESS_INTERCEPTION_CA";
+
+/// Load the deployment egress interception CA named by [`EGRESS_INTERCEPTION_CA_ENV`]
+/// for the proxy's upstream trust union.
+///
+/// Fail-safe by contract: an unset/empty variable means no deployment CA is
+/// provisioned (the common case outside managed sandboxes) and contributes nothing,
+/// silently; a set variable whose file is unreadable, empty, or not certificate PEM
+/// warns loudly and contributes nothing — capture of publicly-anchored traffic must
+/// survive a broken CA provisioning, while deployment-terminated routes then fail
+/// closed at the upstream handshake exactly as if the CA had never been provisioned.
+fn load_extra_upstream_trust_anchors() -> Vec<CertificateDer<'static>> {
+    match std::env::var_os(EGRESS_INTERCEPTION_CA_ENV) {
+        Some(path) if !path.is_empty() => interception_ca_anchors(Path::new(&path)),
+        _ => Vec::new(),
+    }
+}
+
+/// Parse the interception CA file into upstream trust anchors, warning loudly (and
+/// returning no anchors) on any failure. See [`load_extra_upstream_trust_anchors`]
+/// for the fail-safe contract.
+fn interception_ca_anchors(path: &Path) -> Vec<CertificateDer<'static>> {
+    let pem = match std::fs::read(path) {
+        Ok(pem) => pem,
+        Err(error) => {
+            eprintln!(
+                "hiloop-interceptor: warning: egress interception CA {} is unreadable; \
+                 continuing with public roots only, so TLS the egress proxy terminates for \
+                 bound routes will fail upstream verification: {error}",
+                path.display()
+            );
+            return Vec::new();
+        }
+    };
+    match CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>() {
+        Ok(anchors) if anchors.is_empty() => {
+            eprintln!(
+                "hiloop-interceptor: warning: egress interception CA {} contains no \
+                 certificates; continuing with public roots only, so TLS the egress proxy \
+                 terminates for bound routes will fail upstream verification",
+                path.display()
+            );
+            Vec::new()
+        }
+        Ok(anchors) => anchors,
+        Err(error) => {
+            eprintln!(
+                "hiloop-interceptor: warning: egress interception CA {} is not certificate \
+                 PEM; continuing with public roots only, so TLS the egress proxy terminates \
+                 for bound routes will fail upstream verification: {error}",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
 }
 
 type CaptureFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
@@ -921,6 +987,7 @@ where
                 Arc::clone(&egress),
                 Arc::clone(&anomaly),
                 injector,
+                load_extra_upstream_trust_anchors(),
                 async move {
                     let _ = shutdown_rx.await;
                 },
@@ -2369,6 +2436,40 @@ mod tests {
             text.contains("-END CERTIFICATE-----\n-----BEGIN"),
             "a newline separates the two PEM blocks"
         );
+    }
+
+    #[test]
+    fn interception_ca_anchors_loads_certificate_pem() {
+        let ca = crate::proxy::ProxyCa::generate().expect("generate CA");
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(file.path(), ca.cert_pem()).expect("write CA");
+
+        let anchors = interception_ca_anchors(file.path());
+        assert_eq!(anchors.len(), 1, "one certificate PEM block, one anchor");
+    }
+
+    #[test]
+    fn interception_ca_anchors_is_empty_when_the_file_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let anchors = interception_ca_anchors(&dir.path().join("no-such-ca.pem"));
+        assert!(
+            anchors.is_empty(),
+            "a dangling CA pointer degrades to public-roots-only, it never fails the proxy"
+        );
+    }
+
+    #[test]
+    fn interception_ca_anchors_is_empty_for_non_certificate_content() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(file.path(), "not a pem certificate").expect("write junk");
+        assert!(interception_ca_anchors(file.path()).is_empty());
+
+        std::fs::write(
+            file.path(),
+            "-----BEGIN CERTIFICATE-----\n%%%not-base64%%%\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write malformed pem");
+        assert!(interception_ca_anchors(file.path()).is_empty());
     }
 
     #[cfg(unix)]
