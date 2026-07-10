@@ -2746,7 +2746,7 @@ mod tests {
             "echo"
         );
         assert_eq!(
-            value["attributes"][provenance_keys::PROCESS_ARGV],
+            value["attributes"][provenance_keys::PROCESS_COMMAND_ARGS],
             r#"["echo","hi"]"#
         );
         assert_eq!(
@@ -2909,7 +2909,7 @@ mod tests {
             "exec-123"
         );
         assert_eq!(
-            value["attributes"][provenance_keys::PROCESS_ARGV],
+            value["attributes"][provenance_keys::PROCESS_COMMAND_ARGS],
             r#"["/missing/harness","--flag"]"#
         );
         let recorded = value["attributes"][crate::exec_events::keys::PROCESS_ERROR]

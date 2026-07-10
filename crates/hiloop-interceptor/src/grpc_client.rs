@@ -25,7 +25,7 @@ pub mod proto {
 }
 
 /// Env var holding the API key. Sourced from the environment only — never a CLI argument, so it
-/// stays out of process provenance (`process.argv`).
+/// stays out of process provenance (`process.command_args`).
 pub const TOKEN_ENV: &str = "HILOOP_API_KEY";
 
 /// Bound on establishing the gateway connection (DNS + TCP + TLS). The channel is lazy, so the

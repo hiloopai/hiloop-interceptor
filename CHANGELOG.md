@@ -8,6 +8,14 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking (event schema):** the process provenance attribute `process.argv` is renamed to
+  `process.command_args`, the OpenTelemetry semantic-convention name for the same fact. The value is
+  unchanged (the full argv JSON-encoded into a string attribute, including `argv[0]`). Events
+  recorded by earlier versions keep the old key; consumers that special-case the attribute should
+  read `process.command_args` from this version on.
+
 ### Added
 
 - Wire-capture fidelity metadata on proxy request/response events: `http.request.wire_size` /

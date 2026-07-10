@@ -768,7 +768,7 @@ mod tests {
             "example"
         );
         assert_eq!(
-            value["attributes"][provenance_keys::PROCESS_ARGV],
+            value["attributes"][provenance_keys::PROCESS_COMMAND_ARGS],
             r#"["example","--flag"]"#
         );
         assert_eq!(

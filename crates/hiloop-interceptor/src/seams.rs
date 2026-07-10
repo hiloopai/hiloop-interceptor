@@ -22,8 +22,8 @@ pub mod provenance_keys {
     pub const NORMALIZER_NAME: &str = "normalizer.name";
     pub const NORMALIZER_VERSION: &str = "normalizer.version";
     pub const NORMALIZER_OUTPUT_SCHEMA_VERSION: &str = "normalizer.output_schema_version";
-    pub const PROCESS_ARGV: &str = "process.argv";
     pub const PROCESS_COMMAND: &str = "process.command";
+    pub const PROCESS_COMMAND_ARGS: &str = "process.command_args";
     pub const PROCESS_CWD: &str = "process.cwd";
     pub const PROCESS_PID: &str = "process.pid";
     pub const RAW_OBSERVATION_ID: &str = "raw.observation_id";
@@ -493,7 +493,8 @@ impl NormalizationContext {
         if !process.argv.is_empty() {
             let argv = serde_json::to_string(&process.argv)
                 .expect("serializing an in-memory argv list cannot fail");
-            event = event.with_attribute(AttributeKey::from_static(keys::PROCESS_ARGV), argv);
+            event =
+                event.with_attribute(AttributeKey::from_static(keys::PROCESS_COMMAND_ARGS), argv);
         }
         if let Some(cwd) = &process.cwd
             && !cwd.as_os_str().is_empty()

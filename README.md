@@ -76,7 +76,7 @@ run end (digest-first: only content the gateway is missing is sent), so `--blob-
 optional — omitted, bodies stage in a per-run scratch store that is removed once every blob has
 shipped (kept, and named in the run's warning, if any upload fails). The
 API key is read from the `HILOOP_API_KEY` environment variable — never a flag, so
-it stays out of `process.argv`. An authenticated gateway derives the tenant from that token, so leave
+it stays out of `process.command_args`. An authenticated gateway derives the tenant from that token, so leave
 `--tenant-id` empty there; `--project-id` selects the project to record under. Use `--insecure-grpc`
 for a cleartext local gateway (and `--tenant-id` to assert tenancy when it has no auth).
 
