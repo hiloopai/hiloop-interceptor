@@ -212,7 +212,9 @@ impl AnomalyConfig {
     /// low-cardinality [`AnomalyFlag`]s (a rule name and a size) reach telemetry.
     ///
     /// Returns an empty vec when the policy is disabled or nothing matches; the common
-    /// clean-body case allocates nothing.
+    /// clean-body case allocates nothing. For a body that streams through frame by
+    /// frame instead of arriving whole, feed a [`BodyScan`] and call
+    /// [`AnomalyConfig::evaluate`] at end-of-stream — the rules are identical.
     pub fn inspect(
         &self,
         method: &str,
@@ -222,8 +224,28 @@ impl AnomalyConfig {
         if !self.enabled {
             return Vec::new();
         }
+        let mut scan = BodyScan::default();
+        scan.observe(body);
+        self.evaluate(method, content_type, &scan)
+    }
+
+    /// Evaluate every rule against an incrementally observed body (see [`BodyScan`]).
+    ///
+    /// The scan must have observed the **original** body — its full pre-truncation
+    /// length and unredacted bytes, counted past any capture cap — preserving the same
+    /// "a capture cap cannot hide a large upload" contract as
+    /// [`AnomalyConfig::inspect`].
+    pub fn evaluate(
+        &self,
+        method: &str,
+        content_type: Option<&str>,
+        scan: &BodyScan,
+    ) -> Vec<AnomalyFlag> {
+        if !self.enabled {
+            return Vec::new();
+        }
         let mut flags = Vec::new();
-        let body_len = body.len() as u64;
+        let body_len = scan.total_bytes;
 
         if self.is_suspicious_content_type(content_type) {
             flags.push(AnomalyFlag {
@@ -237,7 +259,7 @@ impl AnomalyConfig {
                 observed_bytes: body_len,
             });
         }
-        if body_len >= self.min_base64_bytes && is_base64_dominated(body, self.base64_ratio) {
+        if body_len >= self.min_base64_bytes && scan.is_base64_dominated(self.base64_ratio) {
             flags.push(AnomalyFlag {
                 rule: AnomalyRule::LargeBase64Blob,
                 observed_bytes: body_len,
@@ -274,30 +296,52 @@ fn is_write_method(method: &str) -> bool {
         || method.eq_ignore_ascii_case("PATCH")
 }
 
-/// Whether at least `ratio` of `body`'s bytes belong to the base64 alphabet (standard
-/// and URL-safe alphabets, plus `=` padding and ASCII whitespace, which line-wrapped
-/// encoders interleave). An empty body is never base64-dominated.
-///
-/// This is a character-ratio heuristic, not a decode: it is O(n) with no allocation,
-/// so it stays cheap on the proxy hot path, and it deliberately tolerates the
-/// whitespace real encoders emit. It over-counts a body that merely happens to be all
-/// alphanumeric, which is why the rule also gates on a size floor.
-fn is_base64_dominated(body: &[u8], ratio: f64) -> bool {
-    if body.is_empty() {
-        return false;
+/// Incrementally observed body statistics — the byte counters every rule needs,
+/// accumulated frame by frame so a streamed (teed) body can be evaluated at
+/// end-of-stream without ever buffering it in full. Feed each chunk to
+/// [`BodyScan::observe`]; evaluate with [`AnomalyConfig::evaluate`].
+#[derive(Debug, Clone, Default)]
+pub struct BodyScan {
+    /// Total observed body bytes.
+    total_bytes: u64,
+    /// Observed bytes belonging to the base64 alphabet (see [`is_base64_byte`]).
+    base64_alphabet_bytes: u64,
+}
+
+impl BodyScan {
+    /// Fold one body chunk into the counters. O(n) over the chunk, no allocation.
+    pub fn observe(&mut self, chunk: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
+        self.base64_alphabet_bytes = self
+            .base64_alphabet_bytes
+            .saturating_add(chunk.iter().filter(|byte| is_base64_byte(**byte)).count() as u64);
     }
-    let alphabet = body.iter().filter(|byte| is_base64_byte(**byte)).count();
-    // Compare counts as an integer threshold to avoid a float division: the body is
-    // base64-dominated when `alphabet >= len * ratio`. `ratio` is clamped to `0.0..=1.0`
-    // at construction, so the product never exceeds `len` and the ceil is a valid usize.
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation,
-        reason = "ratio is clamped to 0.0..=1.0, so `len as f64 * ratio` is in 0..=len and its ceil fits usize; sub-mantissa precision loss only shifts the threshold by at most one byte on multi-petabyte bodies the capture cap forbids"
-    )]
-    let threshold = (body.len() as f64 * ratio).ceil() as usize;
-    alphabet >= threshold
+
+    /// Whether at least `ratio` of the observed bytes belong to the base64 alphabet
+    /// (standard and URL-safe alphabets, plus `=` padding and ASCII whitespace, which
+    /// line-wrapped encoders interleave). An empty body is never base64-dominated.
+    ///
+    /// This is a character-ratio heuristic, not a decode: it is O(n) with no
+    /// allocation, so it stays cheap on the proxy hot path, and it deliberately
+    /// tolerates the whitespace real encoders emit. It over-counts a body that merely
+    /// happens to be all alphanumeric, which is why the rule also gates on a size
+    /// floor.
+    fn is_base64_dominated(&self, ratio: f64) -> bool {
+        if self.total_bytes == 0 {
+            return false;
+        }
+        // Compare counts as an integer threshold to avoid a float division: the body is
+        // base64-dominated when `alphabet >= len * ratio`. `ratio` is clamped to
+        // `0.0..=1.0` at construction, so the product never exceeds `len`.
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "ratio is clamped to 0.0..=1.0, so `len as f64 * ratio` is in 0..=len and its ceil fits u64; sub-mantissa precision loss only shifts the threshold by at most one byte on multi-petabyte bodies the capture cap forbids"
+        )]
+        let threshold = (self.total_bytes as f64 * ratio).ceil() as u64;
+        self.base64_alphabet_bytes >= threshold
+    }
 }
 
 /// Whether `byte` is a member of the base64 alphabet (either alphabet), padding, or the

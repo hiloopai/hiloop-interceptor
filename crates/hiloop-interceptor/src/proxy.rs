@@ -9,17 +9,22 @@
 //! (the [`crate::blob`] seam) so the event carries only a `payload_ref`. See
 //! `docs/CAPTURE.md`.
 //!
-//! Response bodies are forwarded as a streaming tee: each frame is passed
-//! downstream the moment it arrives (so SSE/chunked responses are not blocked on
-//! full-body buffering) while the *captured copy* is accumulated separately, bounded
-//! by the capture cap ([`DEFAULT_MAX_CAPTURE_BYTES`] by default, `--max-capture-bytes`
-//! to override; this finite default bounds interceptor memory). When the stream ends
-//! the captured copy is redacted once (see [`crate::redact`] — so a secret straddling
+//! Bodies are forwarded as a streaming tee in both directions: each frame is passed
+//! along the moment it arrives (so SSE/chunked responses are not blocked on
+//! full-body buffering, and client-streaming/bidi gRPC — which holds the request
+//! stream open while reading responses — is never blocked on request-body EOF)
+//! while the *captured copy* is accumulated separately, bounded by the capture cap
+//! ([`DEFAULT_MAX_CAPTURE_BYTES`] by default, `--max-capture-bytes` to override;
+//! this finite default bounds interceptor memory). When the stream ends the
+//! captured copy is redacted once (see [`crate::redact`] — so a secret straddling
 //! two frames is still caught) and offloaded to the blob store, and the `RawSignal`
-//! (empty `body` + `payload_ref`) is emitted. Request bodies are buffered eagerly so
-//! a request signal is recorded even when the upstream never consumes the body, then
-//! capped to the same limit, redacted, and offloaded. The cap bounds only the captured
-//! copy; the bytes forwarded to the origin are always complete and never capped.
+//! (empty `body` + `payload_ref`) is emitted; a peer that dies before the body ends
+//! drops the tee, which finalizes the partial capture (marked truncated) instead of
+//! losing it. The cap bounds only the captured copy; the bytes forwarded to the
+//! client/origin are always complete and never capped. Two request shapes buffer
+//! eagerly instead of teeing — already-ended bodies (buffering is free) and
+//! block-on-match anomaly mode (rejecting *before* the origin sees the body
+//! requires store-and-forward); see `CaptureHandler::capture_request`.
 //! Request and response events are linked by an `http.exchange_id` attribute; an
 //! exchange that ends without a response (upstream failure, client abort, policy
 //! block) is closed by a terminal `http.abort` event sharing the same id — see the
@@ -57,7 +62,7 @@ use hiloop_core::event::{AttributeKey, Event, EventName, MediaType, PayloadRef, 
 use hiloop_core::identity::HlcClock;
 use thiserror::Error;
 
-use crate::anomaly::{AnomalyConfig, AnomalyFlag};
+use crate::anomaly::{AnomalyConfig, AnomalyFlag, BodyScan};
 use crate::blob::BlobStore;
 use crate::egress::{CanonicalHost, Destination, EgressPolicy, canonicalize_host};
 use crate::redact::RedactionPolicy;
@@ -529,17 +534,13 @@ impl CaptureHandler {
         }
     }
 
-    /// The request body is buffered eagerly, not teed like the response: a teed
-    /// signal only fires once the body drains downstream, which a failed upstream
-    /// never does. Inherent (not the trait method) to stay testable without an
-    /// `HttpContext`.
-    ///
     /// Enforces egress and (on a match) credential injection before capture: a CONNECT
     /// to a denied host short-circuits with `403` before any tunnel is established; a
     /// decrypted request to a denied host (or one whose `Host` disagrees with the
     /// CONNECT's SNI host) also short-circuits with `403`; a broker failure on an
     /// injected request fails closed with `502` so the request is never forwarded
-    /// without its credential.
+    /// without its credential. Inherent (not the trait method) to stay testable
+    /// without an `HttpContext`.
     async fn on_request(&mut self, request: Request<Body>) -> RequestOrResponse {
         // CONNECT only establishes the TLS tunnel; the real request arrives after
         // interception. Capture nothing here, but enforce egress on the SNI host and
@@ -619,7 +620,75 @@ impl CaptureHandler {
         self.capture_request(request).await
     }
 
-    /// Buffer, capture, and forward a (post-egress, post-injection) request.
+    /// Capture and forward a (post-egress, post-injection) request.
+    ///
+    /// The request body is teed like the response: each frame is forwarded upstream
+    /// the moment the client sends it while the captured copy accumulates separately
+    /// (bounded by the capture cap), so client-streaming/bidi gRPC — which holds the
+    /// request stream open and interleaves sends with reading responses — is never
+    /// blocked on request-body EOF. Capture, redaction, offload, and anomaly
+    /// evaluation run at tee completion; an upstream that fails before draining the
+    /// body drops the tee, whose `Drop` finalizes the partial capture (marked
+    /// truncated) instead of losing the request signal.
+    ///
+    /// Two request shapes buffer eagerly instead ([`Self::capture_request_buffered`]):
+    ///
+    /// - a body that has already ended (`is_end_stream`): collecting it cannot block,
+    ///   and the forwarded body keeps its exact wire shape;
+    /// - block-on-match anomaly mode: rejecting a request *before* the origin sees it
+    ///   requires inspecting the whole body pre-forward — store-and-forward is that
+    ///   contract, a tee streaming prefixes upstream would defeat the block.
+    async fn capture_request(&mut self, request: Request<Body>) -> RequestOrResponse {
+        use hudsucker::hyper::body::Body as _;
+
+        let exchange_id = next_exchange_id();
+        self.exchange_id = Some(exchange_id.clone());
+
+        let (parts, body) = request.into_parts();
+
+        let content_type = header_str(&parts.headers, &CONTENT_TYPE);
+        let method = parts.method.as_str().to_owned();
+        let target = telemetry_target(&parts.uri);
+        self.exchange_method = Some(method.clone());
+        self.exchange_target = Some(target.clone());
+        let host = request_host(&parts.uri, &parts.headers).map(|host| telemetry_host(&host));
+        self.exchange_host.clone_from(&host);
+
+        let mut attributes = vec![
+            (EXCHANGE_ID_ATTR, exchange_id),
+            ("http.method", method.clone()),
+            ("http.target", target),
+        ];
+        if let Some(encoding) = header_str(&parts.headers, &CONTENT_ENCODING) {
+            attributes.push((REQUEST_CONTENT_ENCODING_ATTR, encoding));
+        }
+        if let Some(host) = &host {
+            attributes.push(("http.host", host.clone()));
+        }
+        if let Some(content_type) = &content_type {
+            attributes.push(("http.request.content_type", content_type.clone()));
+        }
+
+        if self.anomaly.blocks_on_match() || body.is_end_stream() {
+            return self
+                .capture_request_buffered(parts, body, attributes, content_type)
+                .await;
+        }
+
+        // The scan observes every forwarded byte — past the capture cap — so a capped
+        // capture cannot hide a large upload from (audit-mode) anomaly evaluation.
+        let inspection = self.anomaly.is_enabled().then(|| RequestBodyInspection {
+            config: Arc::clone(&self.anomaly),
+            method,
+            scan: BodyScan::default(),
+        });
+        let teed = self.tee_body(REQUEST_TEE, attributes, content_type, inspection, body);
+        Request::from_parts(parts, teed).into()
+    }
+
+    /// Buffer, capture, and forward a request whose body either already ended or must
+    /// be inspected in full before forwarding (block-on-match anomaly mode); see
+    /// [`Self::capture_request`] for when this path is taken.
     ///
     /// Anomaly detection runs over the original request body (so a capture cap cannot
     /// truncate an upload out of detection); matches are flagged onto the request signal,
@@ -627,11 +696,13 @@ impl CaptureHandler {
     /// [`AnomalyConfig::blocks_on_match`] a match short-circuits with a `403` and the
     /// request is never forwarded (the signal still records the flagged, blocked
     /// exchange).
-    async fn capture_request(&mut self, request: Request<Body>) -> RequestOrResponse {
-        let exchange_id = next_exchange_id();
-        self.exchange_id = Some(exchange_id.clone());
-
-        let (parts, body) = request.into_parts();
+    async fn capture_request_buffered(
+        &mut self,
+        parts: hudsucker::hyper::http::request::Parts,
+        body: Body,
+        mut attributes: Vec<(&'static str, String)>,
+        content_type: Option<String>,
+    ) -> RequestOrResponse {
         let (bytes, mut truncated) = collect_body(body).await;
 
         // Capture at most `cap` bytes, but always forward the full body upstream.
@@ -647,8 +718,6 @@ impl CaptureHandler {
         // off, so the placeholder — not the secret — is all that reaches telemetry.
         let captured = self.redact_capture(captured);
 
-        let content_type = header_str(&parts.headers, &CONTENT_TYPE);
-
         // Inspect the ORIGINAL body (full pre-truncation length, unredacted bytes) for
         // exfiltration-shaped anomalies, so a capture cap below a threshold cannot
         // truncate a large upload out of detection. Inspection is read-only; only the
@@ -660,32 +729,12 @@ impl CaptureHandler {
             .inspect(parts.method.as_str(), content_type.as_deref(), &bytes);
         let blocked = !flags.is_empty() && self.anomaly.blocks_on_match();
 
-        let method = parts.method.as_str().to_owned();
-        let target = telemetry_target(&parts.uri);
-        self.exchange_method = Some(method.clone());
-        self.exchange_target = Some(target.clone());
-        let mut attributes = vec![
-            (EXCHANGE_ID_ATTR, exchange_id),
-            ("http.method", method),
-            ("http.target", target),
-            // The true transfer size, distinct from the stored (capped + redacted)
-            // `body_size`: reconstruction and traffic accounting survive truncation.
-            (REQUEST_WIRE_SIZE_ATTR, bytes.len().to_string()),
-        ];
-        if let Some(encoding) = header_str(&parts.headers, &CONTENT_ENCODING) {
-            attributes.push((REQUEST_CONTENT_ENCODING_ATTR, encoding));
-        }
-        let host = request_host(&parts.uri, &parts.headers).map(|host| telemetry_host(&host));
-        self.exchange_host.clone_from(&host);
-        if let Some(host) = &host {
-            attributes.push(("http.host", host.clone()));
-        }
-        if let Some(content_type) = &content_type {
-            attributes.push(("http.request.content_type", content_type.clone()));
-        }
+        // The true transfer size, distinct from the stored (capped + redacted)
+        // `body_size`: reconstruction and traffic accounting survive truncation.
+        attributes.push((REQUEST_WIRE_SIZE_ATTR, bytes.len().to_string()));
         append_llm_capture_attributes(
             &mut attributes,
-            host.as_deref(),
+            self.exchange_host.as_deref(),
             content_type.as_deref(),
             &captured,
             LlmCaptureDirection::Request,
@@ -851,28 +900,22 @@ impl CaptureHandler {
             attributes.push((RESPONSE_CONTENT_ENCODING_ATTR, encoding));
         }
 
-        let teed = self.tee_body(
-            RESPONSE_KIND,
-            "http.response.body_size",
-            RESPONSE_WIRE_SIZE_ATTR,
-            attributes,
-            content_type,
-            body,
-        );
+        let teed = self.tee_body(RESPONSE_TEE, attributes, content_type, None, body);
         Response::from_parts(parts, teed)
     }
 
-    /// Build a forwarded [`Body`] that streams each frame downstream as it arrives
-    /// while buffering the captured copy; once the upstream body ends the buffer is
+    /// Build a forwarded [`Body`] that streams each frame onward as it arrives
+    /// while buffering the captured copy; once the source body ends the buffer is
     /// redacted, offloaded to the blob store, and the `RawSignal` (empty body plus a
-    /// `payload_ref`) is emitted.
+    /// `payload_ref`) is emitted. `inspection`, set only on request tees with anomaly
+    /// detection enabled, observes every forwarded byte and stamps matched rules onto
+    /// the signal at finalize.
     fn tee_body(
         &self,
-        kind: &'static str,
-        size_attr: &'static str,
-        wire_size_attr: &'static str,
+        channel: TeeChannel,
         attributes: Vec<(&'static str, String)>,
         media_type: Option<String>,
+        inspection: Option<RequestBodyInspection>,
         body: Body,
     ) -> Body {
         let state = TeeState {
@@ -888,9 +931,8 @@ impl CaptureHandler {
             attributes,
             signal_tx: self.signal_tx.clone(),
             clock: Arc::clone(&self.clock),
-            kind,
-            size_attr,
-            wire_size_attr,
+            channel,
+            inspection,
             wire_bytes: 0,
             emitted: false,
         };
@@ -941,22 +983,69 @@ impl Drop for CaptureHandler {
     }
 }
 
+/// The per-direction constants of one body tee: which signal kind it emits, which
+/// attribute names carry its sizes, and which LLM-metadata direction applies.
+#[derive(Clone, Copy)]
+struct TeeChannel {
+    kind: &'static str,
+    size_attr: &'static str,
+    /// Attribute name for the observed wire size (e.g. [`RESPONSE_WIRE_SIZE_ATTR`]).
+    wire_size_attr: &'static str,
+    direction: LlmCaptureDirection,
+}
+
+/// The request-leg tee: `http.request` signals sized by the request attributes.
+const REQUEST_TEE: TeeChannel = TeeChannel {
+    kind: REQUEST_KIND,
+    size_attr: "http.request.body_size",
+    wire_size_attr: REQUEST_WIRE_SIZE_ATTR,
+    direction: LlmCaptureDirection::Request,
+};
+
+/// The response-leg tee: `http.response` signals sized by the response attributes.
+const RESPONSE_TEE: TeeChannel = TeeChannel {
+    kind: RESPONSE_KIND,
+    size_attr: "http.response.body_size",
+    wire_size_attr: RESPONSE_WIRE_SIZE_ATTR,
+    direction: LlmCaptureDirection::Response,
+};
+
+/// Anomaly inspection carried through a request tee: the policy, the request method
+/// (rules are method-sensitive), and the running scan that observes every forwarded
+/// byte — past the capture cap — so a capped capture cannot hide a large upload.
+/// Evaluated once at tee finalize, over the same original-body statistics the
+/// buffered path inspects.
+struct RequestBodyInspection {
+    config: Arc<AnomalyConfig>,
+    method: String,
+    scan: BodyScan,
+}
+
+impl RequestBodyInspection {
+    /// Evaluate the rules over everything observed so far, as the `anomaly.flagged`
+    /// attribute to stamp onto the request signal (`None` when nothing matched).
+    fn flag_attribute(&self, content_type: Option<&str>) -> Option<(&'static str, String)> {
+        let flags = self.config.evaluate(&self.method, content_type, &self.scan);
+        (!flags.is_empty()).then(|| (FLAGGED_ATTR, join_flag_names(&flags)))
+    }
+}
+
 /// State for one streaming body tee. The captured copy is buffered (bounded by
 /// `max_capture_bytes`) and redacted as a whole at finalize, so a secret straddling
 /// two DATA frames is still caught. `Drop` finalizes a partial blob and emits its
-/// signal if the client disconnects before the body ends.
+/// signal if the receiving peer disconnects before the body ends.
 struct TeeState {
     upstream: Option<BodyStream<Body>>,
     blob_store: Arc<dyn BlobStore>,
-    /// Captured response bytes, bounded by `max_capture_bytes`. Redacted once at
-    /// finalize; never the bytes forwarded downstream.
+    /// Captured body bytes, bounded by `max_capture_bytes`. Redacted once at
+    /// finalize; never the bytes forwarded onward.
     captured: Vec<u8>,
     /// Cap on captured bytes; `None` is unlimited. Forwarding is unaffected.
     max_capture_bytes: Option<u64>,
     /// Set when capture was cut short (cap hit or upstream error).
     truncated: bool,
     /// Scrubs secrets from the buffered capture before it reaches the blob; the
-    /// bytes forwarded downstream are never touched.
+    /// bytes forwarded onward are never touched.
     redaction: RedactionPolicy,
     /// Credentials injected into this exchange, scrubbed as exact literals from the
     /// captured copy so they never reach telemetry (even if pattern redaction is off).
@@ -967,10 +1056,9 @@ struct TeeState {
     attributes: Vec<(&'static str, String)>,
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
     clock: Arc<HlcClock>,
-    kind: &'static str,
-    size_attr: &'static str,
-    /// Attribute name for the observed wire size ([`RESPONSE_WIRE_SIZE_ATTR`]).
-    wire_size_attr: &'static str,
+    channel: TeeChannel,
+    /// Request-tee anomaly scan; `None` on response tees or when detection is off.
+    inspection: Option<RequestBodyInspection>,
     /// Body bytes observed on the wire so far — counted past the capture cap, so a
     /// truncated capture still records the true transfer size.
     wire_bytes: u64,
@@ -980,8 +1068,12 @@ struct TeeState {
 impl TeeState {
     fn capture(&mut self, data: &[u8]) {
         // The wire count keeps running past the capture cap: the stored copy is
-        // bounded, the true transfer size is not.
+        // bounded, the true transfer size is not. The anomaly scan likewise observes
+        // every byte, so the cap cannot hide a large upload from detection.
         self.wire_bytes = self.wire_bytes.saturating_add(data.len() as u64);
+        if let Some(inspection) = &mut self.inspection {
+            inspection.scan.observe(data);
+        }
         if self.capped {
             return;
         }
@@ -1009,8 +1101,7 @@ impl TeeState {
         self.emitted = true;
         let raw = finalize_tee(FinalizeTee {
             clock: &self.clock,
-            kind: self.kind,
-            size_attr: self.size_attr,
+            channel: self.channel,
             attributes: std::mem::take(&mut self.attributes),
             blob_store: self.blob_store.as_ref(),
             captured: std::mem::take(&mut self.captured),
@@ -1018,7 +1109,7 @@ impl TeeState {
             injected_secrets: std::mem::take(&mut self.injected_secrets),
             media_type: self.media_type.take(),
             truncated: truncated || self.truncated || self.capped,
-            wire_size_attr: self.wire_size_attr,
+            inspection: self.inspection.take(),
             wire_bytes: self.wire_bytes,
         })
         .await;
@@ -1036,9 +1127,7 @@ impl Drop for TeeState {
         // TeeState is always dropped inside the proxy's tokio runtime, so spawn is
         // safe here.
         let clock = Arc::clone(&self.clock);
-        let kind = self.kind;
-        let size_attr = self.size_attr;
-        let wire_size_attr = self.wire_size_attr;
+        let channel = self.channel;
         let wire_bytes = self.wire_bytes;
         let attributes = std::mem::take(&mut self.attributes);
         let blob_store = Arc::clone(&self.blob_store);
@@ -1046,12 +1135,12 @@ impl Drop for TeeState {
         let redaction = self.redaction;
         let injected_secrets = std::mem::take(&mut self.injected_secrets);
         let media_type = self.media_type.take();
+        let inspection = self.inspection.take();
         let signal_tx = self.signal_tx.clone();
         tokio::spawn(async move {
             let raw = finalize_tee(FinalizeTee {
                 clock: &clock,
-                kind,
-                size_attr,
+                channel,
                 attributes,
                 blob_store: blob_store.as_ref(),
                 captured,
@@ -1059,7 +1148,7 @@ impl Drop for TeeState {
                 injected_secrets,
                 media_type,
                 truncated: true,
-                wire_size_attr,
+                inspection,
                 wire_bytes,
             })
             .await;
@@ -1069,11 +1158,10 @@ impl Drop for TeeState {
 }
 
 /// Inputs to [`finalize_tee`]: the buffered capture plus the metadata needed to
-/// redact, offload, and stamp one response body's signal.
+/// redact, offload, and stamp one teed body's signal.
 struct FinalizeTee<'a> {
     clock: &'a HlcClock,
-    kind: &'static str,
-    size_attr: &'static str,
+    channel: TeeChannel,
     attributes: Vec<(&'static str, String)>,
     blob_store: &'a dyn BlobStore,
     captured: Vec<u8>,
@@ -1081,8 +1169,8 @@ struct FinalizeTee<'a> {
     injected_secrets: Vec<zeroize::Zeroizing<String>>,
     media_type: Option<String>,
     truncated: bool,
-    /// Attribute name for the observed wire size ([`RESPONSE_WIRE_SIZE_ATTR`]).
-    wire_size_attr: &'static str,
+    /// Request-tee anomaly scan to evaluate and stamp; `None` on response tees.
+    inspection: Option<RequestBodyInspection>,
     /// Body bytes observed on the wire (counted past the capture cap); on a
     /// mid-stream abort, what was seen before the stream ended.
     wire_bytes: u64,
@@ -1111,8 +1199,7 @@ fn redact_with_injected(
 async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
     let FinalizeTee {
         clock,
-        kind,
-        size_attr,
+        channel,
         mut attributes,
         blob_store,
         captured,
@@ -1120,7 +1207,7 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         injected_secrets,
         media_type,
         truncated,
-        wire_size_attr,
+        inspection,
         wire_bytes,
     } = args;
 
@@ -1134,20 +1221,25 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         host.as_deref(),
         media_type.as_deref(),
         &stored,
-        LlmCaptureDirection::Response,
+        channel.direction,
     );
+    if let Some(flag) =
+        inspection.and_then(|inspection| inspection.flag_attribute(media_type.as_deref()))
+    {
+        attributes.push(flag);
+    }
     let size = stored.len() as u64;
     let payload_ref = match offload_bytes(blob_store, &stored, media_type.as_deref()).await {
         Ok(payload_ref) => Some(payload_ref),
         Err(error) => {
-            eprintln!("hiloop-interceptor: proxy response blob offload failed: {error}");
+            eprintln!("hiloop-interceptor: proxy body blob offload failed: {error}");
             None
         }
     };
 
-    let mut raw = RawSignal::new(PROXY_SOURCE, kind, clock.tick(), Bytes::new())
-        .with_attribute(size_attr, size.to_string())
-        .with_attribute(wire_size_attr, wire_bytes.to_string());
+    let mut raw = RawSignal::new(PROXY_SOURCE, channel.kind, clock.tick(), Bytes::new())
+        .with_attribute(channel.size_attr, size.to_string())
+        .with_attribute(channel.wire_size_attr, wire_bytes.to_string());
     if truncated {
         raw = raw.with_attribute(TRUNCATED_ATTR, "true");
     }
@@ -2177,14 +2269,7 @@ mod tests {
 
         let body = streaming_body(&[b"event: a\n", b"data: 1\n\n", b"data: 2\n\n"]);
         let attributes = vec![("http.status_code", "200".to_owned())];
-        let teed = handler.tee_body(
-            RESPONSE_KIND,
-            "http.response.body_size",
-            RESPONSE_WIRE_SIZE_ATTR,
-            attributes,
-            None,
-            body,
-        );
+        let teed = handler.tee_body(RESPONSE_TEE, attributes, None, None, body);
 
         // Three source frames must arrive downstream as three distinct frames,
         // proving frame boundaries are preserved rather than coalesced after a
@@ -2232,10 +2317,9 @@ mod tests {
         // Cap 10 bytes splits mid second frame (7 + 7 = 14 > 10).
         let (handler, mut rx, store) = handler_with_cap(Some(10));
         let teed = handler.tee_body(
-            RESPONSE_KIND,
-            "http.response.body_size",
-            RESPONSE_WIRE_SIZE_ATTR,
+            RESPONSE_TEE,
             vec![("http.status_code", "200".to_owned())],
+            None,
             None,
             streaming_body(&[b"chunk-1", b"chunk-2", b"chunk-3"]),
         );
@@ -2280,10 +2364,9 @@ mod tests {
     async fn response_under_cap_is_not_truncated() {
         let (handler, mut rx, _store) = handler_with_cap(Some(1024));
         let teed = handler.tee_body(
-            RESPONSE_KIND,
-            "http.response.body_size",
-            RESPONSE_WIRE_SIZE_ATTR,
+            RESPONSE_TEE,
             vec![("http.status_code", "200".to_owned())],
+            None,
             None,
             streaming_body(&[b"chunk-1", b"chunk-2"]),
         );
@@ -2364,7 +2447,8 @@ mod tests {
             .header(CONTENT_ENCODING, "gzip")
             .body(Body::from(Bytes::from_static(b"\x1f\x8b\x08fake")))
             .expect("request");
-        let _forwarded = expect_forwarded(handler.on_request(request).await);
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        drain_body(forwarded.into_body()).await;
         let request_signal = rx.recv().await.expect("signal").expect("raw");
         assert_eq!(
             request_signal
@@ -2518,7 +2602,10 @@ mod tests {
             .uri("https://api.openai.com:443/v1/responses")
             .body(Body::from(Bytes::from_static(b"{}")))
             .expect("request");
-        let _forwarded = expect_forwarded(handler.on_request(request).await);
+        // The upstream drains the (tiny, already-complete) request body before the
+        // forward leg fails, so the request signal precedes the abort.
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        drain_body(forwarded.into_body()).await;
         let request_signal = rx.recv().await.expect("signal").expect("raw");
         let exchange_id = request_signal
             .attributes
@@ -3108,10 +3195,9 @@ mod tests {
     async fn response_body_secret_is_redacted_in_capture_but_forwarded_intact() {
         let (handler, mut rx, store) = handler_with(None, RedactionPolicy::enabled());
         let teed = handler.tee_body(
-            RESPONSE_KIND,
-            "http.response.body_size",
-            RESPONSE_WIRE_SIZE_ATTR,
+            RESPONSE_TEE,
             vec![("http.status_code", "200".to_owned())],
+            None,
             None,
             streaming_body(&[b"token=sk-abc123 ", b"and AKIA0123456789ABCDEF"]),
         );
@@ -3136,10 +3222,9 @@ mod tests {
         // still caught; the forwarded frames stay byte-for-byte intact.
         let (handler, mut rx, store) = handler_with(None, RedactionPolicy::enabled());
         let teed = handler.tee_body(
-            RESPONSE_KIND,
-            "http.response.body_size",
-            RESPONSE_WIRE_SIZE_ATTR,
+            RESPONSE_TEE,
             vec![("http.status_code", "200".to_owned())],
+            None,
             None,
             streaming_body(&[b"Bearer super", b"secret-token-here"]),
         );
@@ -3165,10 +3250,9 @@ mod tests {
         // the zero-extra-copy disabled branch behaviorally.
         let (handler, mut rx, store) = handler_with(None, RedactionPolicy::disabled());
         let teed = handler.tee_body(
-            RESPONSE_KIND,
-            "http.response.body_size",
-            RESPONSE_WIRE_SIZE_ATTR,
+            RESPONSE_TEE,
             vec![("http.status_code", "200".to_owned())],
+            None,
             None,
             streaming_body(&[b"Bearer super", b"secret"]),
         );
@@ -3183,10 +3267,9 @@ mod tests {
     async fn response_body_is_persisted_verbatim_when_redaction_disabled() {
         let (handler, mut rx, store) = handler_with(None, RedactionPolicy::disabled());
         let teed = handler.tee_body(
-            RESPONSE_KIND,
-            "http.response.body_size",
-            RESPONSE_WIRE_SIZE_ATTR,
+            RESPONSE_TEE,
             vec![("http.status_code", "200".to_owned())],
+            None,
             None,
             streaming_body(&[b"Bearer supersecret"]),
         );
@@ -3602,6 +3685,576 @@ mod tests {
             response.status(),
             StatusCode::BAD_GATEWAY,
             "a broker failure must fail the request closed, not forward it"
+        );
+    }
+
+    // --- streaming request bodies (client-streaming / bidi gRPC shape) ---
+
+    /// A body whose frames the test drives through a channel: the stream stays open
+    /// until the sender is dropped, exactly like a gRPC client-streaming/bidi call
+    /// that interleaves sends with reading responses.
+    fn channel_body() -> (mpsc::Sender<Bytes>, Body) {
+        let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(8);
+        let frames = tokio_stream::wrappers::ReceiverStream::new(frame_rx)
+            .map(|data| Ok::<_, hudsucker::Error>(Frame::data(data)));
+        (frame_tx, Body::from(StreamBody::new(frames)))
+    }
+
+    /// The gRPC client-streaming/bidi pattern: the client holds its request stream
+    /// open, interleaving sends with reading responses. `on_request` must hand the
+    /// request to the upstream leg without waiting for request-body EOF — buffering
+    /// the whole body first deadlocks every such RPC, because the response the
+    /// client is waiting on can never arrive before the request is forwarded.
+    #[tokio::test(start_paused = true)]
+    async fn on_request_forwards_before_the_request_body_ends() {
+        let (mut handler, _rx, _store) = handler();
+        let (frame_tx, body) = channel_body();
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://example.com/pkg.Service/BidiCall")
+            .header(CONTENT_TYPE, "application/grpc")
+            .body(body)
+            .expect("request");
+        frame_tx
+            .try_send(Bytes::from_static(b"first message"))
+            .expect("send first frame");
+
+        // The request stream deliberately stays open (`frame_tx` is alive): the
+        // forwarded request must come back regardless.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.on_request(request),
+        )
+        .await
+        .expect("on_request must not wait for request-body EOF (streaming deadlock)");
+        let _forwarded = expect_forwarded(outcome);
+    }
+
+    /// Mirror of `streaming_response_is_forwarded_incrementally_and_offloaded` for
+    /// the request leg: each client frame reaches the upstream side while the stream
+    /// is still open, and the request signal fires only at body EOF with the full
+    /// captured copy.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_request_is_forwarded_incrementally_and_captured_at_eof() {
+        let timeout = std::time::Duration::from_secs(5);
+        let (mut handler, mut rx, _store) = handler();
+        let (frame_tx, body) = channel_body();
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://example.com/upload")
+            .body(body)
+            .expect("request");
+
+        let outcome = tokio::time::timeout(timeout, handler.on_request(request))
+            .await
+            .expect("on_request must not wait for request-body EOF");
+        let forwarded = expect_forwarded(outcome);
+        let mut upstream = BodyStream::new(forwarded.into_body());
+
+        frame_tx
+            .send(Bytes::from_static(b"part-1,"))
+            .await
+            .expect("send part-1");
+        let first = tokio::time::timeout(timeout, upstream.next())
+            .await
+            .expect("first frame must be forwarded while the stream is open")
+            .expect("frame")
+            .expect("ok")
+            .into_data()
+            .expect("data");
+        assert_eq!(first.as_ref(), b"part-1,");
+        assert!(
+            rx.try_recv().is_err(),
+            "signal must not fire before the body ends"
+        );
+
+        frame_tx
+            .send(Bytes::from_static(b"part-2"))
+            .await
+            .expect("send part-2");
+        let second = tokio::time::timeout(timeout, upstream.next())
+            .await
+            .expect("second frame must be forwarded while the stream is open")
+            .expect("frame")
+            .expect("ok")
+            .into_data()
+            .expect("data");
+        assert_eq!(second.as_ref(), b"part-2");
+
+        drop(frame_tx);
+        assert!(
+            tokio::time::timeout(timeout, upstream.next())
+                .await
+                .expect("EOF must be forwarded")
+                .is_none(),
+            "the forwarded body ends when the client stream ends"
+        );
+
+        let signal = tokio::time::timeout(timeout, rx.recv())
+            .await
+            .expect("request signal at EOF")
+            .expect("signal")
+            .expect("raw");
+        assert_eq!(signal.kind, REQUEST_KIND);
+        assert!(signal.body.is_empty(), "offloaded body must be empty");
+        assert_eq!(
+            signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(b"part-1,part-2").as_str())
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get("http.request.body_size")
+                .map(String::as_str),
+            Some("13")
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get(REQUEST_WIRE_SIZE_ATTR)
+                .map(String::as_str),
+            Some("13")
+        );
+        assert!(!signal.attributes.contains_key(TRUNCATED_ATTR));
+    }
+
+    /// Regression for the deliberate guard the eager buffering used to provide: an
+    /// upstream that dies before draining the request body must not lose the request
+    /// capture — the tee finalizes with what was forwarded so far, marked truncated —
+    /// and the exchange still reaches its terminal abort.
+    #[tokio::test(start_paused = true)]
+    async fn upstream_drop_mid_request_stream_finalizes_a_truncated_capture() {
+        let timeout = std::time::Duration::from_secs(5);
+        let (mut handler, mut rx, _store) = handler();
+        let (frame_tx, body) = channel_body();
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://example.com/upload")
+            .body(body)
+            .expect("request");
+
+        let outcome = tokio::time::timeout(timeout, handler.on_request(request))
+            .await
+            .expect("on_request must not wait for request-body EOF");
+        let forwarded = expect_forwarded(outcome);
+        let mut upstream = BodyStream::new(forwarded.into_body());
+        frame_tx
+            .send(Bytes::from_static(b"sent-before-death"))
+            .await
+            .expect("send frame");
+        let first = tokio::time::timeout(timeout, upstream.next())
+            .await
+            .expect("frame forwarded")
+            .expect("frame")
+            .expect("ok")
+            .into_data()
+            .expect("data");
+        assert_eq!(first.as_ref(), b"sent-before-death");
+
+        // The upstream leg dies: hyper drops the request body mid-stream, then
+        // hudsucker reports the failed forward leg via `handle_error`.
+        drop(upstream);
+        handler
+            .on_upstream_error("upstream_error", "connection reset by peer".to_owned())
+            .await;
+
+        // The dropped tee finalizes on a detached task, so the request signal and
+        // the abort race; collect both and assert by kind.
+        let mut by_kind = HashMap::new();
+        for _ in 0..2 {
+            let signal = tokio::time::timeout(timeout, rx.recv())
+                .await
+                .expect("capture must finalize even when the upstream never drains the body")
+                .expect("signal")
+                .expect("raw");
+            by_kind.insert(signal.kind.clone(), signal);
+        }
+
+        let request_signal = by_kind
+            .get(REQUEST_KIND)
+            .expect("the partial request capture is emitted, never lost");
+        assert_eq!(
+            request_signal
+                .attributes
+                .get(TRUNCATED_ATTR)
+                .map(String::as_str),
+            Some("true"),
+            "a capture cut short by upstream death is marked truncated"
+        );
+        assert_eq!(
+            request_signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(b"sent-before-death").as_str()),
+            "what was teed before the death is captured"
+        );
+        assert_eq!(
+            request_signal
+                .attributes
+                .get(REQUEST_WIRE_SIZE_ATTR)
+                .map(String::as_str),
+            Some("17")
+        );
+
+        let abort = by_kind
+            .get(ABORT_KIND)
+            .expect("the exchange still reaches its terminal abort");
+        assert_eq!(
+            abort.attributes.get(ABORT_REASON_ATTR).map(String::as_str),
+            Some("upstream_error")
+        );
+        assert_eq!(
+            abort.attributes.get(EXCHANGE_ID_ATTR),
+            request_signal.attributes.get(EXCHANGE_ID_ATTR),
+            "the abort closes the truncated request's exchange"
+        );
+    }
+
+    // --- full-proxy streaming integration (real CONNECT + MITM TLS + h2 legs) ---
+
+    /// Run the real proxy (`ProxyServer::serve`) with default policies, trusting
+    /// `upstream_ca` on the upstream hop. Returns the proxy address, its CA PEM (the
+    /// client's trust anchor), and the capture-signal receiver.
+    async fn spawn_proxy_trusting(
+        upstream_ca: &ProxyCa,
+    ) -> (
+        SocketAddr,
+        String,
+        mpsc::Receiver<Result<RawSignal, SourceError>>,
+    ) {
+        let server = ProxyServer::bind(Arc::new(HlcClock::new()))
+            .await
+            .expect("bind proxy");
+        let addr = server.local_addr().expect("proxy addr");
+        let ca = ProxyCa::generate().expect("proxy CA");
+        let ca_pem = ca.cert_pem().to_owned();
+        let (signal_tx, signal_rx) = mpsc::channel(64);
+        tokio::spawn(server.serve(
+            ca,
+            signal_tx,
+            Arc::new(MemoryBlobStore::default()),
+            None,
+            RedactionPolicy::default(),
+            Arc::new(EgressPolicy::default()),
+            Arc::new(AnomalyConfig::default()),
+            None,
+            vec![ca_trust_anchor(upstream_ca)],
+            std::future::pending(),
+        ));
+        (addr, ca_pem, signal_rx)
+    }
+
+    /// Bind a TLS+h2 upstream whose `localhost` leaf chains to `upstream_ca`, serving
+    /// `service` on every connection. Returns the bound port.
+    async fn spawn_h2_upstream<S, B>(upstream_ca: &ProxyCa, service: S) -> u16
+    where
+        S: hyper::service::Service<
+                Request<hyper::body::Incoming>,
+                Response = Response<B>,
+                Error = std::convert::Infallible,
+                Future: Send,
+            > + Clone
+            + Send
+            + 'static,
+        B: hyper::body::Body<Data = Bytes, Error: Into<Box<dyn std::error::Error + Send + Sync>>>
+            + Send
+            + 'static,
+    {
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+
+        let leaf = upstream_ca
+            .authority
+            .gen_cert(&Authority::from_static("localhost"));
+        let mut server_cfg =
+            ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("server versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![leaf], upstream_ca.authority.private_key.clone_key())
+                .expect("server cert");
+        server_cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind upstream");
+        let port = listener.local_addr().expect("upstream addr").port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    /// CONNECT through the proxy, complete the MITM TLS handshake (trusting the
+    /// proxy's CA) with h2 ALPN, and hand back an h2 request sender.
+    async fn h2_client_through_proxy(
+        proxy_addr: SocketAddr,
+        proxy_ca_pem: &str,
+        authority: &str,
+    ) -> hyper::client::conn::http2::SendRequest<Body> {
+        use hudsucker::rustls::pki_types::ServerName;
+        use hudsucker::rustls::pki_types::pem::PemObject as _;
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut tcp = tokio::net::TcpStream::connect(proxy_addr)
+            .await
+            .expect("connect proxy");
+        tcp.write_all(
+            format!("CONNECT {authority} HTTP/1.1\r\nhost: {authority}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .expect("send CONNECT");
+        let mut response = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            let n = tcp.read(&mut byte).await.expect("read CONNECT response");
+            assert!(n > 0, "proxy closed the connection during CONNECT");
+            response.extend_from_slice(&byte[..n]);
+        }
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "CONNECT must succeed, got: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(proxy_ca_pem.as_bytes()).expect("proxy CA der"))
+            .expect("trust proxy CA");
+        let mut tls_config =
+            ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("client versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let host = authority
+            .split(':')
+            .next()
+            .expect("authority host")
+            .to_owned();
+        let server_name = ServerName::try_from(host).expect("server name");
+        let tls = connector.connect(server_name, tcp).await.expect("MITM TLS");
+
+        let (sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                .await
+                .expect("h2 handshake");
+        tokio::spawn(connection);
+        sender
+    }
+
+    /// Accumulate DATA frames until `expected` bytes arrived (h2 legs may re-frame,
+    /// so equality is on bytes, never on frame boundaries), bounded by `deadline`.
+    async fn read_body_bytes(
+        stream: &mut BodyStream<hyper::body::Incoming>,
+        expected: usize,
+        deadline: std::time::Duration,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while bytes.len() < expected {
+            let frame = tokio::time::timeout(deadline, stream.next())
+                .await
+                .expect("response frame must arrive while the request stream is open")
+                .expect("body ended before the expected bytes arrived")
+                .expect("frame");
+            if let Ok(data) = frame.into_data() {
+                bytes.extend_from_slice(&data);
+            }
+        }
+        bytes
+    }
+
+    /// End-to-end through the real proxy — CONNECT, MITM TLS, h2 on both legs: a
+    /// gRPC-shaped bidirectional exchange whose client holds the request stream
+    /// open, reads echoed response frames mid-stream, and only then finishes the
+    /// upload. Eagerly buffering the request body deadlocks exactly this shape.
+    #[tokio::test]
+    async fn bidi_streaming_exchange_completes_through_the_proxy() {
+        let deadline = std::time::Duration::from_secs(30);
+        let upstream_ca = ProxyCa::generate().expect("upstream CA");
+        // Echo upstream: response headers immediately, then the request body streamed
+        // straight back — request and response frames interleave like bidi gRPC.
+        let echo = hyper::service::service_fn(|request: Request<hyper::body::Incoming>| async {
+            Ok::<_, std::convert::Infallible>(Response::new(StreamBody::new(BodyStream::new(
+                request.into_body(),
+            ))))
+        });
+        let upstream_port = spawn_h2_upstream(&upstream_ca, echo).await;
+        let (proxy_addr, proxy_ca_pem, mut signal_rx) = spawn_proxy_trusting(&upstream_ca).await;
+
+        let authority = format!("localhost:{upstream_port}");
+        let mut sender = tokio::time::timeout(
+            deadline,
+            h2_client_through_proxy(proxy_addr, &proxy_ca_pem, &authority),
+        )
+        .await
+        .expect("CONNECT + MITM handshake");
+
+        let (frame_tx, body) = channel_body();
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("https://{authority}/echo"))
+            .body(body)
+            .expect("request");
+        let response = sender.send_request(request);
+        frame_tx
+            .send(Bytes::from_static(b"ping-1,"))
+            .await
+            .expect("send ping-1");
+
+        // The response must arrive while the request stream is still open — the
+        // exact shape the eager request buffering deadlocked.
+        let response = tokio::time::timeout(deadline, response)
+            .await
+            .expect("response headers must arrive before request-body EOF (streaming deadlock)")
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut echoed = BodyStream::new(response.into_body());
+        let first = read_body_bytes(&mut echoed, b"ping-1,".len(), deadline).await;
+        assert_eq!(first, b"ping-1,");
+
+        frame_tx
+            .send(Bytes::from_static(b"ping-2"))
+            .await
+            .expect("send ping-2");
+        let second = read_body_bytes(&mut echoed, b"ping-2".len(), deadline).await;
+        assert_eq!(second, b"ping-2");
+
+        // Half-close the request stream, gRPC-style, and drain the echo to EOF.
+        drop(frame_tx);
+        while tokio::time::timeout(deadline, echoed.next())
+            .await
+            .expect("response EOF")
+            .is_some()
+        {}
+
+        // Both capture signals still land, linked by one exchange id, with the full
+        // streamed bodies.
+        let mut by_kind = HashMap::new();
+        for _ in 0..2 {
+            let signal = tokio::time::timeout(deadline, signal_rx.recv())
+                .await
+                .expect("capture signal")
+                .expect("signal")
+                .expect("raw");
+            by_kind.insert(signal.kind.clone(), signal);
+        }
+        let request_signal = by_kind.get(REQUEST_KIND).expect("request captured");
+        let response_signal = by_kind.get(RESPONSE_KIND).expect("response captured");
+        assert_eq!(
+            request_signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(b"ping-1,ping-2").as_str()),
+            "the streamed request body is captured in full"
+        );
+        assert_eq!(
+            response_signal.payload_ref().map(|p| p.digest.as_str()),
+            Some(expected_digest(b"ping-1,ping-2").as_str()),
+            "the echoed response body is captured in full"
+        );
+        assert_eq!(
+            request_signal.attributes.get(EXCHANGE_ID_ATTR),
+            response_signal.attributes.get(EXCHANGE_ID_ATTR),
+            "one exchange id links the streamed pair"
+        );
+    }
+
+    /// End-to-end regression for the deliberate guard: an upstream that reads the
+    /// first request frame and then kills the connection mid-stream must yield a
+    /// prompt error to the client (never a hang) while the partial request capture
+    /// and the terminal abort both still land.
+    #[tokio::test]
+    async fn upstream_death_mid_request_stream_errors_promptly_and_captures() {
+        let deadline = std::time::Duration::from_secs(30);
+        let upstream_ca = ProxyCa::generate().expect("upstream CA");
+        // A service that consumes one request frame, then panics: the panic tears
+        // down this connection's serve task mid-exchange — the response never
+        // arrives, and the proxy's forward leg errors.
+        let dying = hyper::service::service_fn(|request: Request<hyper::body::Incoming>| async {
+            let mut frames = BodyStream::new(request.into_body());
+            let _ = frames.next().await;
+            panic!("upstream dies mid-request-stream");
+            #[allow(unreachable_code, reason = "types the service future's Ok arm")]
+            Ok::<Response<StreamBody<BodyStream<hyper::body::Incoming>>>, std::convert::Infallible>(
+                unreachable!(),
+            )
+        });
+        let upstream_port = spawn_h2_upstream(&upstream_ca, dying).await;
+        let (proxy_addr, proxy_ca_pem, mut signal_rx) = spawn_proxy_trusting(&upstream_ca).await;
+
+        let authority = format!("localhost:{upstream_port}");
+        let mut sender = tokio::time::timeout(
+            deadline,
+            h2_client_through_proxy(proxy_addr, &proxy_ca_pem, &authority),
+        )
+        .await
+        .expect("CONNECT + MITM handshake");
+
+        let (frame_tx, body) = channel_body();
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("https://{authority}/upload"))
+            .body(body)
+            .expect("request");
+        let response = sender.send_request(request);
+        frame_tx
+            .send(Bytes::from_static(b"partial upload"))
+            .await
+            .expect("send frame");
+
+        // The client's pending call must resolve promptly — hudsucker fails the
+        // exchange closed (502) or resets the stream; it must never hang.
+        let outcome = tokio::time::timeout(deadline, response)
+            .await
+            .expect("upstream death must fail the exchange promptly, not hang it");
+        if let Ok(response) = outcome {
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "a dead upstream must fail closed"
+            );
+        }
+
+        // The partial capture and the terminal abort both land; the dropped tee
+        // finalizes on a detached task, so collect by kind.
+        let mut by_kind = HashMap::new();
+        for _ in 0..2 {
+            let signal = tokio::time::timeout(deadline, signal_rx.recv())
+                .await
+                .expect("capture must finalize even when the upstream never drains the body")
+                .expect("signal")
+                .expect("raw");
+            by_kind.insert(signal.kind.clone(), signal);
+        }
+        let request_signal = by_kind
+            .get(REQUEST_KIND)
+            .expect("the partial request capture is emitted, never lost");
+        assert_eq!(
+            request_signal
+                .attributes
+                .get(TRUNCATED_ATTR)
+                .map(String::as_str),
+            Some("true"),
+            "a capture cut short by upstream death is marked truncated"
+        );
+        let abort = by_kind
+            .get(ABORT_KIND)
+            .expect("the exchange still reaches its terminal abort");
+        assert_eq!(
+            abort.attributes.get(EXCHANGE_ID_ATTR),
+            request_signal.attributes.get(EXCHANGE_ID_ATTR),
+            "the abort closes the truncated request's exchange"
         );
     }
 }
