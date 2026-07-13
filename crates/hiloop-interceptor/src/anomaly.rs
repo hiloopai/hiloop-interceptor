@@ -213,8 +213,8 @@ impl AnomalyConfig {
     ///
     /// Returns an empty vec when the policy is disabled or nothing matches; the common
     /// clean-body case allocates nothing. For a body that streams through frame by
-    /// frame instead of arriving whole, feed a [`BodyScan`] and call
-    /// [`AnomalyConfig::evaluate`] at end-of-stream — the rules are identical.
+    /// frame instead of arriving whole, the proxy feeds a `BodyScan` and calls
+    /// `AnomalyConfig::evaluate` at end-of-stream — the rules are identical.
     pub fn inspect(
         &self,
         method: &str,
@@ -235,7 +235,7 @@ impl AnomalyConfig {
     /// length and unredacted bytes, counted past any capture cap — preserving the same
     /// "a capture cap cannot hide a large upload" contract as
     /// [`AnomalyConfig::inspect`].
-    pub fn evaluate(
+    pub(crate) fn evaluate(
         &self,
         method: &str,
         content_type: Option<&str>,
@@ -301,7 +301,7 @@ fn is_write_method(method: &str) -> bool {
 /// end-of-stream without ever buffering it in full. Feed each chunk to
 /// [`BodyScan::observe`]; evaluate with [`AnomalyConfig::evaluate`].
 #[derive(Debug, Clone, Default)]
-pub struct BodyScan {
+pub(crate) struct BodyScan {
     /// Total observed body bytes.
     total_bytes: u64,
     /// Observed bytes belonging to the base64 alphabet (see [`is_base64_byte`]).
@@ -310,7 +310,7 @@ pub struct BodyScan {
 
 impl BodyScan {
     /// Fold one body chunk into the counters. O(n) over the chunk, no allocation.
-    pub fn observe(&mut self, chunk: &[u8]) {
+    pub(crate) fn observe(&mut self, chunk: &[u8]) {
         self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
         self.base64_alphabet_bytes = self
             .base64_alphabet_bytes
