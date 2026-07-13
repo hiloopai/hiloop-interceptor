@@ -181,19 +181,24 @@ e2e (curl tunnels HTTPS through the proxy, the decrypted request is captured bef
 attempt) and a plain-HTTP e2e against a chunked upstream (request/response correlation + streaming
 capture + blob offload).
 
-**Streaming passthrough + content-addressed offload (shipped).** *Response* bodies are forwarded as a
-streaming tee: each frame is passed downstream the instant it arrives (SSE/chunked responses are not
-blocked on buffering) while the *captured copy* is accumulated separately, bounded by the capture cap
+**Streaming passthrough + content-addressed offload (shipped).** Bodies are forwarded as a
+streaming tee in *both directions*: each frame is passed along the instant it arrives (SSE/chunked
+responses are not blocked on buffering, and client-streaming/bidi gRPC — which holds the request
+stream open while reading responses — is not blocked on request-body EOF) while the *captured copy*
+is accumulated separately, bounded by the capture cap
 (8 MiB by default, `--max-capture-bytes` to override, `0` for unlimited — the finite default bounds
 interceptor memory so a large body can't OOM the wrapper). When the stream ends the captured copy is redacted once (so a secret split
 across frames is still caught — see redaction below) and offloaded to the content-addressed blob
 store (`crate::blob`, blake3-keyed, `--blob-dir`), and the event carries only a `payload_ref` (empty
-inline `body`). On client disconnect a `Drop` finalizes the partial blob on a detached task and emits
-a `http.capture.truncated` signal. *Request* bodies are buffered eagerly (the small side of an
-exchange; buffering guarantees a request signal even when the upstream fails before draining the body)
-then redacted and offloaded too, with an inline-body fallback if the blob write fails. Capturing the
-response copy in a buffer (rather than streaming it frame-by-frame into the blob) is the deliberate
-cost of correct cross-frame redaction; the cap bounds the buffer, and forwarding to the origin still
+inline `body`), with an inline-body fallback if the blob write fails. When a peer disconnects before
+the body ends — a client abort on the response leg, or an upstream that fails before draining the
+request — a `Drop` finalizes the partial blob on a detached task and emits the signal marked
+`http.capture.truncated`, so the capture is never lost. Two request shapes buffer eagerly instead of
+teeing: bodies that already ended (collecting is free and keeps the exact wire shape) and
+block-on-match anomaly mode (rejecting a request before the origin sees it requires
+store-and-forward). Capturing the
+copy in a buffer (rather than streaming it frame-by-frame into the blob) is the deliberate
+cost of correct cross-frame redaction; the cap bounds the buffer, and forwarding to the peer still
 streams a frame at a time.
 
 **Capture-side redaction (shipped, on by default).** Before a captured request/response body is
