@@ -10,6 +10,75 @@ use tokio::{
 const DNS_QUERY_ID: u16 = 0x6869;
 const DNS_PORT: u16 = 53;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DnsTransport {
+    Udp,
+    Tcp,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ResolverConfig {
+    resolvers: Vec<SocketAddr>,
+    workload_contents: Vec<u8>,
+}
+
+impl ResolverConfig {
+    pub(super) fn parse(contents: &str) -> io::Result<Self> {
+        Ok(Self {
+            resolvers: parse_nameservers(contents)?,
+            workload_contents: workload_resolv_conf(contents),
+        })
+    }
+
+    pub(super) fn workload_contents(&self) -> &[u8] {
+        &self.workload_contents
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct HostResolver {
+    resolvers: Vec<SocketAddr>,
+    timeout: Duration,
+}
+
+impl HostResolver {
+    #[cfg(test)]
+    pub(super) fn new(resolvers: Vec<SocketAddr>, timeout: Duration) -> io::Result<Self> {
+        if resolvers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS relay requires at least one host resolver",
+            ));
+        }
+        Ok(Self { resolvers, timeout })
+    }
+
+    pub(super) fn from_config(config: &ResolverConfig, timeout: Duration) -> Self {
+        Self {
+            resolvers: config.resolvers.clone(),
+            timeout,
+        }
+    }
+
+    pub(super) async fn query(&self, transport: DnsTransport, query: &[u8]) -> io::Result<Vec<u8>> {
+        let mut diagnostics = Vec::new();
+        for resolver in &self.resolvers {
+            let result = match transport {
+                DnsTransport::Udp => query_udp(*resolver, query, self.timeout).await,
+                DnsTransport::Tcp => query_tcp(*resolver, query, self.timeout).await,
+            };
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => diagnostics.push(format!("{resolver}: {error}")),
+            }
+        }
+        Err(io::Error::other(format!(
+            "no configured resolver answered the DNS relay query ({})",
+            diagnostics.join("; ")
+        )))
+    }
+}
+
 pub(super) async fn probe_resolver(path: &Path, timeout: Duration) -> io::Result<()> {
     let contents = fs::read_to_string(path).await?;
     let resolvers = parse_nameservers(&contents)?;
@@ -72,6 +141,16 @@ fn parse_nameservers(contents: &str) -> io::Result<Vec<SocketAddr>> {
 }
 
 async fn probe_udp(resolver: SocketAddr, query: &[u8], timeout: Duration) -> io::Result<()> {
+    let response = query_udp(resolver, query, timeout).await?;
+    validate_response(&response)
+}
+
+async fn probe_tcp(resolver: SocketAddr, query: &[u8], timeout: Duration) -> io::Result<()> {
+    let response = query_tcp(resolver, query, timeout).await?;
+    validate_response(&response)
+}
+
+async fn query_udp(resolver: SocketAddr, query: &[u8], timeout: Duration) -> io::Result<Vec<u8>> {
     time::timeout(timeout, async {
         let bind = if resolver.is_ipv4() {
             "0.0.0.0:0"
@@ -80,16 +159,20 @@ async fn probe_udp(resolver: SocketAddr, query: &[u8], timeout: Duration) -> io:
         };
         let socket = UdpSocket::bind(bind).await?;
         socket.connect(resolver).await?;
-        socket.send(query).await?;
-        let mut response = [0_u8; 4096];
+        if socket.send(query).await? != query.len() {
+            return Err(io::Error::other("UDP DNS query was partially sent"));
+        }
+        let mut response = vec![0_u8; usize::from(u16::MAX)];
         let length = socket.recv(&mut response).await?;
-        validate_response(&response[..length])
+        response.truncate(length);
+        validate_transaction(query, &response)?;
+        Ok(response)
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP DNS probe timed out"))?
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP DNS relay timed out"))?
 }
 
-async fn probe_tcp(resolver: SocketAddr, query: &[u8], timeout: Duration) -> io::Result<()> {
+async fn query_tcp(resolver: SocketAddr, query: &[u8], timeout: Duration) -> io::Result<Vec<u8>> {
     time::timeout(timeout, async {
         let mut stream = TcpStream::connect(resolver).await?;
         let length = u16::try_from(query.len())
@@ -99,10 +182,11 @@ async fn probe_tcp(resolver: SocketAddr, query: &[u8], timeout: Duration) -> io:
         let response_length = stream.read_u16().await?;
         let mut response = vec![0_u8; usize::from(response_length)];
         stream.read_exact(&mut response).await?;
-        validate_response(&response)
+        validate_transaction(query, &response)?;
+        Ok(response)
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP DNS probe timed out"))?
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP DNS relay timed out"))?
 }
 
 fn dns_query() -> Vec<u8> {
@@ -144,6 +228,40 @@ fn validate_response(response: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_transaction(query: &[u8], response: &[u8]) -> io::Result<()> {
+    if query.len() < 2 || response.len() < 2 || query[..2] != response[..2] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response transaction id does not match the relayed query",
+        ));
+    }
+    if response.len() < 4 || u16::from_be_bytes([response[2], response[3]]) & 0x8000 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS relay received a query instead of a response",
+        ));
+    }
+    Ok(())
+}
+
+fn workload_resolv_conf(contents: &str) -> Vec<u8> {
+    let mut generated = format!(
+        "# generated by hiloop-interceptor\nnameserver {}\nnameserver {}\n",
+        super::routing::GATEWAY_IPV4,
+        super::routing::GATEWAY_IPV6,
+    )
+    .into_bytes();
+    for line in contents.lines() {
+        let directive = line.split_once('#').map_or(line, |(value, _)| value).trim();
+        let keyword = directive.split_ascii_whitespace().next();
+        if matches!(keyword, Some("search" | "domain" | "options")) {
+            generated.extend_from_slice(directive.as_bytes());
+            generated.push(b'\n');
+        }
+    }
+    generated
+}
+
 fn display_result(result: &io::Result<()>) -> String {
     match result {
         Ok(()) => "ok".to_owned(),
@@ -166,6 +284,19 @@ mod tests {
                 "127.0.0.53:53".parse().expect("test resolver"),
                 "[2001:db8::53]:53".parse().expect("test resolver"),
             ]
+        );
+    }
+
+    #[test]
+    fn workload_resolver_reserves_gateway_and_preserves_search_and_options() {
+        let config = ResolverConfig::parse(
+            "nameserver 127.0.0.53\nsearch corp.example svc.example\noptions ndots:5 timeout:2 attempts:3 rotate\ndomain ignored.example # preserved too\n",
+        )
+        .expect("valid resolver config");
+
+        assert_eq!(
+            String::from_utf8(config.workload_contents().to_vec()).expect("UTF-8 config"),
+            "# generated by hiloop-interceptor\nnameserver 169.254.254.1\nnameserver fd00:6869:6c6f:6f70::1\nsearch corp.example svc.example\noptions ndots:5 timeout:2 attempts:3 rotate\ndomain ignored.example\n"
         );
     }
 

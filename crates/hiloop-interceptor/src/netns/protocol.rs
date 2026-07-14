@@ -22,7 +22,7 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub(super) enum SupervisorMessage {
     IdMapsInstalled,
     PastaReady,
-    Configure(WireProvisionRequest),
+    Configure(Box<WireProvisionRequest>),
     Shutdown,
 }
 
@@ -49,6 +49,7 @@ pub(super) enum WorkloadMessage {
     Configure {
         commands: Vec<WireExecCommand>,
         hosts_path: Vec<u8>,
+        resolv_path: Vec<u8>,
     },
     Start(WireCommand),
     Shutdown,
@@ -140,6 +141,7 @@ pub(super) struct WireProvisionRequest {
     intercept_port: Option<u16>,
     require_ipv6: bool,
     validate_dataplane: bool,
+    resolv_conf: Vec<u8>,
 }
 
 impl WireProvisionRequest {
@@ -147,6 +149,7 @@ impl WireProvisionRequest {
         request: &ProvisionRequest,
         require_ipv6: bool,
         validate_dataplane: bool,
+        resolv_conf: &[u8],
     ) -> Self {
         Self {
             workload: WireCommand::from(request.workload()),
@@ -154,12 +157,11 @@ impl WireProvisionRequest {
             intercept_port: request.intercept_port().map(NonZeroU16::get),
             require_ipv6,
             validate_dataplane,
+            resolv_conf: resolv_conf.to_vec(),
         }
     }
 
-    pub(super) fn into_parts(
-        self,
-    ) -> io::Result<(WireCommand, WireCommand, Option<NonZeroU16>, bool, bool)> {
+    pub(super) fn into_parts(self) -> io::Result<WireProvisionParts> {
         let port = self
             .intercept_port
             .map(|port| {
@@ -168,14 +170,24 @@ impl WireProvisionRequest {
                 })
             })
             .transpose()?;
-        Ok((
-            self.workload,
-            self.gateway_worker,
+        Ok(WireProvisionParts {
+            workload: self.workload,
+            gateway_worker: self.gateway_worker,
             port,
-            self.require_ipv6,
-            self.validate_dataplane,
-        ))
+            require_ipv6: self.require_ipv6,
+            validate_dataplane: self.validate_dataplane,
+            resolv_conf: self.resolv_conf,
+        })
     }
+}
+
+pub(super) struct WireProvisionParts {
+    pub(super) workload: WireCommand,
+    pub(super) gateway_worker: WireCommand,
+    pub(super) port: Option<NonZeroU16>,
+    pub(super) require_ipv6: bool,
+    pub(super) validate_dataplane: bool,
+    pub(super) resolv_conf: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

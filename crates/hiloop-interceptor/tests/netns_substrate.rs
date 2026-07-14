@@ -92,7 +92,7 @@ async fn real_rootless_substrate_contract() {
     use std::{
         fs,
         io::{Read as _, Write as _},
-        net::TcpListener,
+        net::{TcpListener, UdpSocket},
         os::unix::fs::PermissionsExt as _,
         thread,
     };
@@ -126,6 +126,16 @@ async fn real_rootless_substrate_contract() {
         .local_addr()
         .expect("IPv6 host fixture address")
         .port();
+    let host_udp_ipv4 = UdpSocket::bind("127.0.0.1:0").expect("IPv4 UDP host fixture");
+    let host_udp_ipv4_port = host_udp_ipv4
+        .local_addr()
+        .expect("IPv4 UDP fixture address")
+        .port();
+    let host_udp_ipv6 = UdpSocket::bind("[::1]:0").expect("IPv6 UDP host fixture");
+    let host_udp_ipv6_port = host_udp_ipv6
+        .local_addr()
+        .expect("IPv6 UDP fixture address")
+        .port();
     let fixture = thread::spawn(move || {
         for (host, family) in [(host_ipv4, "IPv4"), (host_ipv6, "IPv6")] {
             let (mut stream, _) = host.accept().expect("host fixture accept");
@@ -133,6 +143,14 @@ async fn real_rootless_substrate_contract() {
             stream.read_exact(&mut request).expect("host fixture read");
             assert_eq!(request, *b"ping", "{family} host request");
             stream.write_all(b"pong").expect("host fixture response");
+        }
+    });
+    let udp_fixture = thread::spawn(move || {
+        for (host, family) in [(host_udp_ipv4, "IPv4"), (host_udp_ipv6, "IPv6")] {
+            let mut request = [0_u8; 4];
+            let (length, peer) = host.recv_from(&mut request).expect("UDP fixture receive");
+            assert_eq!(&request[..length], b"ping", "{family} UDP host request");
+            host.send_to(b"pong", peer).expect("UDP fixture response");
         }
     });
     let evidence_dir = tempfile::tempdir().expect("evidence directory");
@@ -143,11 +161,15 @@ async fn real_rootless_substrate_contract() {
         evidence.clone().into_os_string(),
         host_ipv4_port.to_string().into(),
         host_ipv6_port.to_string().into(),
+        host_udp_ipv4_port.to_string().into(),
+        host_udp_ipv6_port.to_string().into(),
     ]);
     let workload = NamespaceCommand::new(&helper).args([
         DATAPLANE_WORKLOAD_ROLE.to_owned(),
         host_ipv4_port.to_string(),
         host_ipv6_port.to_string(),
+        host_udp_ipv4_port.to_string(),
+        host_udp_ipv6_port.to_string(),
     ]);
     let mut session = provisioner
         .provision(ProvisionRequest::new(workload, worker))
@@ -163,6 +185,7 @@ async fn real_rootless_substrate_contract() {
         SubstrateExit::Code(0)
     );
     fixture.join().expect("host fixture thread");
+    udp_fixture.join().expect("UDP host fixture thread");
     wait_for_cleanup(&helper, &[&pasta]);
 
     let evidence = fs::read_to_string(evidence).expect("dataplane evidence");

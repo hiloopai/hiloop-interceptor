@@ -180,6 +180,26 @@ fn capture_fatal_event_shape_is_locked() {
 }
 
 #[test]
+fn udp_capture_fatal_event_shape_is_locked() {
+    let event = Event::capture_fatal_for_destination(
+        &context(),
+        timestamp(),
+        CaptureFatalReason::SecretTransportUnsupported,
+        destination(),
+    );
+
+    assert_event_contract(
+        &event,
+        "capture.fatal",
+        &json!({
+            "original_destination.ip": "203.0.113.10",
+            "original_destination.port": 443,
+            "reason": "secret_transport_unsupported",
+        }),
+    );
+}
+
+#[test]
 fn capture_event_constructors_cannot_embed_sensitive_payloads() {
     let events = [
         Event::tls_interception_failed(
