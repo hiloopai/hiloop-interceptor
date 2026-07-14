@@ -125,6 +125,7 @@ mod linux {
     use crate::netns::{
         NetworkSession, PreflightReport, ProvisionError, ProvisionRequest, StartupStage,
         SubstrateExit, SubstrateInfo,
+        dns_relay::{HostDnsRelay, relay_socket_environment},
         manager::{MANAGER_ROLE, WORKER_PROBE_ROLE, WORKLOAD_PROBE_ROLE},
         pasta::{
             PastaCommand, PastaStartupFailure, classify_startup_stderr, verify_version,
@@ -133,7 +134,7 @@ mod linux {
         protocol::{
             ManagerMessage, SupervisorMessage, WireProvisionRequest, receive_async, send_async,
         },
-        resolver::probe_resolver,
+        resolver::{HostResolver, ResolverConfig, probe_resolver},
         security::PreExecDescriptorSanitizer,
     };
 
@@ -312,10 +313,13 @@ mod linux {
 
     async fn launch(
         provisioner: &SystemNetworkProvisioner,
-        request: ProvisionRequest,
+        mut request: ProvisionRequest,
         require_ipv6: bool,
         validate_dataplane: bool,
     ) -> Result<RealNetworkSession, ProvisionError> {
+        let dns_relay = DnsRelayResources::start(provisioner)?;
+        let (name, value) = relay_socket_environment(dns_relay.socket_path());
+        request.gateway_worker = request.gateway_worker.clone().env(name, value);
         let (parent_control, child_control) = StdUnixStream::pair().map_err(|error| {
             namespace_startup_from_io("create namespace-manager control channel", error)
         })?;
@@ -342,7 +346,7 @@ mod linux {
             .map_err(|error| namespace_startup_from_io("spawn namespace-manager helper", error))?;
         drop(child_control);
 
-        let mut resources = LaunchResources::new(control, bootstrap);
+        let mut resources = LaunchResources::new(control, bootstrap, dns_relay);
         let result = launch_inner(
             &mut resources,
             provisioner,
@@ -455,9 +459,14 @@ mod linux {
                 ))
             })?;
         resources
-            .send(&SupervisorMessage::Configure(
-                WireProvisionRequest::from_request(request, require_ipv6, validate_dataplane),
-            ))
+            .send(&SupervisorMessage::Configure(Box::new(
+                WireProvisionRequest::from_request(
+                    request,
+                    require_ipv6,
+                    validate_dataplane,
+                    resources.workload_resolv_conf(),
+                ),
+            )))
             .await
             .map_err(|error| {
                 LaunchFailure::Error(namespace_startup_from_io(
@@ -574,10 +583,11 @@ mod linux {
         pasta_stderr: Option<JoinHandle<io::Result<String>>>,
         pid_file: Option<fs::File>,
         pid_file_path: Option<PathBuf>,
+        dns_relay: Option<DnsRelayResources>,
     }
 
     impl LaunchResources {
-        fn new(control: UnixStream, bootstrap: Child) -> Self {
+        fn new(control: UnixStream, bootstrap: Child, dns_relay: DnsRelayResources) -> Self {
             let (reader, writer) = control.into_split();
             let (message_sender, messages) = mpsc::channel(8);
             let manager_reader = tokio::spawn(read_manager_messages(reader, message_sender));
@@ -590,7 +600,14 @@ mod linux {
                 pasta_stderr: None,
                 pid_file: None,
                 pid_file_path: None,
+                dns_relay: Some(dns_relay),
             }
+        }
+
+        fn workload_resolv_conf(&self) -> &[u8] {
+            self.dns_relay
+                .as_ref()
+                .map_or(&[], DnsRelayResources::workload_resolv_conf)
         }
 
         fn bootstrap_id(&self) -> Option<u32> {
@@ -832,6 +849,9 @@ mod linux {
             let pasta_stderr = self.pasta_stderr.take().ok_or_else(|| {
                 ProvisionError::dataplane("pasta", "pasta stderr reader is not running")
             })?;
+            let dns_relay = self.dns_relay.take().ok_or_else(|| {
+                ProvisionError::dataplane("dns_relay", "host DNS relay is not running")
+            })?;
             Ok(RealNetworkSession {
                 info,
                 control_writer: Some(writer),
@@ -847,6 +867,7 @@ mod linux {
                 shutdown_requested: false,
                 terminal: false,
                 finished: false,
+                dns_relay: Some(dns_relay),
             })
         }
 
@@ -901,6 +922,7 @@ mod linux {
             let stderr = finish_stderr(&mut self.pasta_stderr, &mut cleanup).await;
             self.pid_file.take();
             self.pid_file_path.take();
+            self.dns_relay.take();
             AbortReport { stderr, cleanup }
         }
     }
@@ -930,6 +952,70 @@ mod linux {
             }
             self.pid_file.take();
             self.pid_file_path.take();
+            self.dns_relay.take();
+        }
+    }
+
+    struct DnsRelayResources {
+        _directory: tempfile::TempDir,
+        socket_path: PathBuf,
+        workload_resolv_conf: Vec<u8>,
+        task: JoinHandle<io::Result<()>>,
+    }
+
+    impl DnsRelayResources {
+        fn start(provisioner: &SystemNetworkProvisioner) -> Result<Self, ProvisionError> {
+            let contents = fs::read_to_string("/etc/resolv.conf").map_err(|error| {
+                unavailable_from_io(
+                    CaptureTransportDegradationReason::ResolverUnavailable,
+                    "read the host resolver configuration",
+                    error,
+                )
+            })?;
+            let config = ResolverConfig::parse(&contents).map_err(|error| {
+                unavailable_from_io(
+                    CaptureTransportDegradationReason::ResolverUnavailable,
+                    "parse the host resolver configuration",
+                    error,
+                )
+            })?;
+            let directory = tempfile::tempdir().map_err(|error| {
+                unavailable_from_io(
+                    CaptureTransportDegradationReason::ResolverUnavailable,
+                    "create the private DNS relay directory",
+                    error,
+                )
+            })?;
+            let socket_path = directory.path().join("dns.sock");
+            let resolver = HostResolver::from_config(&config, provisioner.resolver_timeout);
+            let relay = HostDnsRelay::bind(&socket_path, resolver).map_err(|error| {
+                unavailable_from_io(
+                    CaptureTransportDegradationReason::ResolverUnavailable,
+                    "bind the private host DNS relay",
+                    error,
+                )
+            })?;
+            let workload_resolv_conf = config.workload_contents().to_vec();
+            Ok(Self {
+                _directory: directory,
+                socket_path,
+                workload_resolv_conf,
+                task: tokio::spawn(relay.serve()),
+            })
+        }
+
+        fn socket_path(&self) -> &Path {
+            &self.socket_path
+        }
+
+        fn workload_resolv_conf(&self) -> &[u8] {
+            &self.workload_resolv_conf
+        }
+    }
+
+    impl Drop for DnsRelayResources {
+        fn drop(&mut self) {
+            self.task.abort();
         }
     }
 
@@ -981,6 +1067,7 @@ mod linux {
         shutdown_requested: bool,
         terminal: bool,
         finished: bool,
+        dns_relay: Option<DnsRelayResources>,
     }
 
     impl RealNetworkSession {
@@ -1203,6 +1290,7 @@ mod linux {
             )
             .await;
             let _ = finish_stderr(&mut self.pasta_stderr, &mut self.cleanup).await;
+            self.dns_relay.take();
         }
     }
 
@@ -1218,6 +1306,7 @@ mod linux {
             if let Some(task) = self.pasta_stderr.as_mut() {
                 task.abort();
             }
+            self.dns_relay.take();
 
             if let Some(pasta) = self.pasta.as_mut() {
                 let _ = pasta.start_kill();

@@ -14,6 +14,8 @@ use hiloop_core::capture::{CapturePreflight, CaptureTransportDegradationReason};
 use thiserror::Error;
 
 mod classifier;
+mod dns;
+mod dns_relay;
 mod ingress;
 #[cfg(target_os = "linux")]
 mod listener;
@@ -33,11 +35,14 @@ mod security;
 mod system;
 mod tls_policy;
 mod tls_transport;
+mod udp;
 
 pub use classifier::{
     ClassificationError, ClassificationProgress, ClientHelloIdentity, HttpIdentity, TcpProtocol,
     classify_tcp_prefix,
 };
+pub use dns::DnsAnswerTracker;
+pub use dns_relay::{DNS_RELAY_SOCKET_ENV, DnsQueryTransport, DnsRelayClient, GatewayDnsRelay};
 pub use ingress::{
     AdmittedTcpFlow, ConnectedTcpFlow, DirectTcpConnector, IngressError, TcpUpstreamConnector,
     TransparentTcpIngress, connect_authorized, recover_original_destination,
@@ -54,6 +59,10 @@ pub use tls_policy::{
 pub use tls_transport::{
     TlsTransportError, classify_client_handshake_error, emit_interception_failure, raw_tcp_splice,
     raw_tls_splice,
+};
+pub use udp::{
+    UdpChildDatagram, UdpChildSink, UdpFlowDisposition, UdpFlowKey, UdpFlowRelay, UdpFlowSummary,
+    UdpRelayError, udp_flow_disposition,
 };
 
 #[cfg(any(test, feature = "test-support"))]

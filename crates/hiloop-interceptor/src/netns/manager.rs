@@ -333,7 +333,7 @@ fn gateway_init(mut control: UnixStream) -> io::Result<ExitCode> {
         _ => return Err(protocol_order("expected pasta readiness")),
     }
     let request = match receive_sync(&mut control)? {
-        SupervisorMessage::Configure(request) => request,
+        SupervisorMessage::Configure(request) => *request,
         SupervisorMessage::Shutdown => return Ok(ExitCode::SUCCESS),
         _ => return Err(protocol_order("expected provision request")),
     };
@@ -394,9 +394,15 @@ fn start_gateway(
     control: &mut UnixStream,
     request: WireProvisionRequest,
 ) -> Result<SubstrateExit, ManagerFailure> {
-    let (workload, gateway_worker, requested_port, require_ipv6, validate_dataplane) = request
+    let parts = request
         .into_parts()
         .map_err(|error| ManagerFailure::new(StartupStage::Workload, error))?;
+    let workload = parts.workload;
+    let gateway_worker = parts.gateway_worker;
+    let requested_port = parts.port;
+    let require_ipv6 = parts.require_ipv6;
+    let validate_dataplane = parts.validate_dataplane;
+    let resolv_conf = parts.resolv_conf;
     validate_carrier(require_ipv6)?;
     disable_forwarding().map_err(|error| ManagerFailure::new(StartupStage::Routing, error))?;
     let listeners = TransparentListeners::bind(requested_port).map_err(|error| {
@@ -411,6 +417,13 @@ fn start_gateway(
     let port = listeners.port();
     let hosts_file = generated_hosts_file()
         .map_err(|error| ManagerFailure::new(StartupStage::Workload, error))?;
+    let resolv_file = generated_resolv_file(&resolv_conf).map_err(|error| {
+        ManagerFailure::classified(
+            StartupStage::Workload,
+            CaptureTransportDegradationReason::ResolverUnavailable,
+            error,
+        )
+    })?;
     let (workload_pid, mut workload_control) = spawn_workload_helper()
         .map_err(|error| ManagerFailure::new(StartupStage::Namespace, error))?;
     let routing = RoutingPlan::new(pid_u32(workload_pid)?, port);
@@ -425,7 +438,12 @@ fn start_gateway(
         let _ = cleanup_gateway(&mut running);
         return Err(failure);
     }
-    if let Err(failure) = configure_workload(&mut workload_control, &routing, hosts_file.path()) {
+    if let Err(failure) = configure_workload(
+        &mut workload_control,
+        &routing,
+        hosts_file.path(),
+        resolv_file.path(),
+    ) {
         let mut running = RunningGateway {
             workload_pid,
             worker_pid: None,
@@ -436,6 +454,16 @@ fn start_gateway(
         return Err(failure);
     }
     if let Err(error) = hosts_file.close() {
+        let mut running = RunningGateway {
+            workload_pid,
+            worker_pid: None,
+            routing,
+            listeners: Some(listeners),
+        };
+        let _ = cleanup_gateway(&mut running);
+        return Err(ManagerFailure::new(StartupStage::Workload, error));
+    }
+    if let Err(error) = resolv_file.close() {
         let mut running = RunningGateway {
             workload_pid,
             worker_pid: None,
@@ -685,6 +713,19 @@ fn generated_hosts_file() -> io::Result<NamedTempFile> {
     Ok(file)
 }
 
+fn generated_resolv_file(contents: &[u8]) -> io::Result<NamedTempFile> {
+    if contents.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "generated resolver configuration is empty",
+        ));
+    }
+    let mut file = NamedTempFile::new()?;
+    file.write_all(contents)?;
+    file.flush()?;
+    Ok(file)
+}
+
 fn generated_hosts(existing: &[u8]) -> Vec<u8> {
     const RESERVED_HOST: &[u8] = b"host.hiloop.internal";
 
@@ -784,6 +825,7 @@ fn configure_workload(
     control: &mut UnixStream,
     routing: &RoutingPlan,
     hosts_path: &Path,
+    resolv_path: &Path,
 ) -> Result<(), ManagerFailure> {
     let commands = routing
         .setup_commands()
@@ -796,6 +838,7 @@ fn configure_workload(
         &WorkloadMessage::Configure {
             commands,
             hosts_path: hosts_path.as_os_str().as_bytes().to_vec(),
+            resolv_path: resolv_path.as_os_str().as_bytes().to_vec(),
         },
     )
     .map_err(|error| ManagerFailure::new(StartupStage::Workload, error))?;
@@ -1115,15 +1158,20 @@ fn reap_available_children() -> Vec<(libc::pid_t, SubstrateExit)> {
 fn workload_entrypoint() -> io::Result<ExitCode> {
     close_descriptors_except(&[CONTROL_FD])?;
     let mut control = inherited_control_stream()?;
-    let (commands, hosts_path) = match receive_sync(&mut control)? {
+    let (commands, hosts_path, resolv_path) = match receive_sync(&mut control)? {
         WorkloadMessage::Configure {
             commands,
             hosts_path,
-        } => (commands, PathBuf::from(OsString::from_vec(hosts_path))),
+            resolv_path,
+        } => (
+            commands,
+            PathBuf::from(OsString::from_vec(hosts_path)),
+            PathBuf::from(OsString::from_vec(resolv_path)),
+        ),
         WorkloadMessage::Shutdown => return Ok(ExitCode::SUCCESS),
         WorkloadMessage::Start(_) => return Err(protocol_order("workload start preceded setup")),
     };
-    let setup = configure_workload_namespace(commands, &hosts_path);
+    let setup = configure_workload_namespace(commands, &hosts_path, &resolv_path);
     match setup {
         Ok(()) => send_sync(&mut control, &WorkloadReply::Ready)?,
         Err(failure) => {
@@ -1151,6 +1199,7 @@ fn workload_entrypoint() -> io::Result<ExitCode> {
 fn configure_workload_namespace(
     commands: Vec<WireExecCommand>,
     hosts_path: &Path,
+    resolv_path: &Path,
 ) -> Result<(), WorkloadSetupFailure> {
     for command in commands {
         let (program, args) = command.into_parts();
@@ -1165,6 +1214,12 @@ fn configure_workload_namespace(
     bind_mount_read_only(hosts_path, Path::new("/etc/hosts")).map_err(|error| {
         WorkloadSetupFailure {
             reason: CaptureTransportDegradationReason::NetnsStartupFailed,
+            error,
+        }
+    })?;
+    bind_mount_read_only(resolv_path, Path::new("/etc/resolv.conf")).map_err(|error| {
+        WorkloadSetupFailure {
+            reason: CaptureTransportDegradationReason::ResolverUnavailable,
             error,
         }
     })
