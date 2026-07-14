@@ -3,7 +3,10 @@
 use std::{
     net::Ipv6Addr,
     num::{NonZeroU8, NonZeroU16},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -82,6 +85,7 @@ struct OrderingExporter {
     provisioner: FakeProvisionerHandle,
     events: Mutex<Vec<Event>>,
     calls_at_export: Mutex<Vec<FakeProvisionerCall>>,
+    flushes: AtomicUsize,
 }
 
 impl OrderingExporter {
@@ -90,6 +94,7 @@ impl OrderingExporter {
             provisioner,
             events: Mutex::new(Vec::new()),
             calls_at_export: Mutex::new(Vec::new()),
+            flushes: AtomicUsize::new(0),
         }
     }
 
@@ -106,6 +111,10 @@ impl OrderingExporter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    fn flushes(&self) -> usize {
+        self.flushes.load(Ordering::Acquire)
+    }
 }
 
 #[async_trait]
@@ -119,6 +128,11 @@ impl Exporter for OrderingExporter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend_from_slice(events);
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), ExportError> {
+        self.flushes.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 }
@@ -156,6 +170,7 @@ async fn every_secret_fatal_closes_and_reaps_before_durable_nonzero_result() {
             NonZeroU8::new(1).expect("one is nonzero")
         );
         assert!(fatal.event_persisted(), "{reason}");
+        assert_eq!(exporter.flushes(), 1, "{reason}");
         assert_eq!(
             teardown_calls(&handle),
             [
