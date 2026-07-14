@@ -82,8 +82,13 @@ impl WireExecCommand {
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) enum WorkloadReply {
     Ready,
-    ExecFailed { diagnostic: String },
-    Failed { diagnostic: String },
+    ExecFailed {
+        diagnostic: String,
+    },
+    Failed {
+        reason: WireDegradationReason,
+        diagnostic: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

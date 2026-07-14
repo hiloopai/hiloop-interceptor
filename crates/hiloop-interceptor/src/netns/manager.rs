@@ -24,7 +24,7 @@ use tempfile::NamedTempFile;
 
 use super::{
     FragmentedUdpBehavior, NamespaceCommand, StartupStage, SubstrateExit, SubstrateInfo,
-    listener::{GatewayWorkerBootstrap, TransparentListeners},
+    listener::{GatewayWorkerBootstrap, TransparentListenerError, TransparentListeners},
     pasta::{HOST_LOOPBACK_IPV4, HOST_LOOPBACK_IPV6, PASTA_INTERFACE},
     protocol::{
         ManagerMessage, SupervisorMessage, WireCommand, WireDegradationReason, WireExecCommand,
@@ -400,11 +400,13 @@ fn start_gateway(
     validate_carrier(require_ipv6)?;
     disable_forwarding().map_err(|error| ManagerFailure::new(StartupStage::Routing, error))?;
     let listeners = TransparentListeners::bind(requested_port).map_err(|error| {
-        ManagerFailure::classified(
-            StartupStage::Routing,
-            CaptureTransportDegradationReason::TproxyUnavailable,
-            error,
-        )
+        let reason = match &error {
+            TransparentListenerError::Ipv4(_) => {
+                CaptureTransportDegradationReason::TproxyUnavailable
+            }
+            TransparentListenerError::Ipv6(_) => CaptureTransportDegradationReason::Ipv6Unavailable,
+        };
+        ManagerFailure::classified(StartupStage::Routing, reason, io::Error::other(error))
     })?;
     let port = listeners.port();
     let hosts_file = generated_hosts_file()
@@ -423,7 +425,7 @@ fn start_gateway(
         let _ = cleanup_gateway(&mut running);
         return Err(failure);
     }
-    if let Err(error) = configure_workload(&mut workload_control, &routing, hosts_file.path()) {
+    if let Err(failure) = configure_workload(&mut workload_control, &routing, hosts_file.path()) {
         let mut running = RunningGateway {
             workload_pid,
             worker_pid: None,
@@ -431,7 +433,7 @@ fn start_gateway(
             listeners: Some(listeners),
         };
         let _ = cleanup_gateway(&mut running);
-        return Err(ManagerFailure::new(StartupStage::Workload, error));
+        return Err(failure);
     }
     if let Err(error) = hosts_file.close() {
         let mut running = RunningGateway {
@@ -782,7 +784,7 @@ fn configure_workload(
     control: &mut UnixStream,
     routing: &RoutingPlan,
     hosts_path: &Path,
-) -> io::Result<()> {
+) -> Result<(), ManagerFailure> {
     let commands = routing
         .setup_commands()
         .iter()
@@ -795,11 +797,21 @@ fn configure_workload(
             commands,
             hosts_path: hosts_path.as_os_str().as_bytes().to_vec(),
         },
-    )?;
-    match receive_sync(control)? {
+    )
+    .map_err(|error| ManagerFailure::new(StartupStage::Workload, error))?;
+    match receive_sync(control)
+        .map_err(|error| ManagerFailure::new(StartupStage::Workload, error))?
+    {
         WorkloadReply::Ready => Ok(()),
-        WorkloadReply::Failed { diagnostic } => Err(io::Error::other(diagnostic)),
-        WorkloadReply::ExecFailed { .. } => Err(protocol_order("workload exec preceded start")),
+        WorkloadReply::Failed { reason, diagnostic } => Err(ManagerFailure::classified(
+            StartupStage::Workload,
+            reason.into(),
+            io::Error::other(diagnostic),
+        )),
+        WorkloadReply::ExecFailed { .. } => Err(ManagerFailure::new(
+            StartupStage::Workload,
+            protocol_order("workload exec preceded start"),
+        )),
     }
 }
 
@@ -830,22 +842,34 @@ fn execute_gateway_setup(routing: &RoutingPlan) -> Result<(), ManagerFailure> {
         .enumerate()
     {
         execute_routing_command(command, Some(routing.nft_script())).map_err(|error| {
-            if index < 4 {
-                ManagerFailure::classified(
-                    StartupStage::Veth,
-                    CaptureTransportDegradationReason::NetnsStartupFailed,
-                    error,
-                )
-            } else {
-                ManagerFailure::classified(
-                    StartupStage::Routing,
-                    CaptureTransportDegradationReason::TproxyUnavailable,
-                    error,
-                )
-            }
+            let (stage, reason) = gateway_setup_failure(index, command);
+            ManagerFailure::classified(stage, reason, error)
         })?;
     }
     Ok(())
+}
+
+fn gateway_setup_failure(
+    index: usize,
+    command: &NamespacedCommand,
+) -> (StartupStage, CaptureTransportDegradationReason) {
+    if command.command().arguments().first().map(String::as_str) == Some("-6") {
+        return (
+            StartupStage::Routing,
+            CaptureTransportDegradationReason::Ipv6Unavailable,
+        );
+    }
+    if index < 4 {
+        (
+            StartupStage::Veth,
+            CaptureTransportDegradationReason::NetnsStartupFailed,
+        )
+    } else {
+        (
+            StartupStage::Routing,
+            CaptureTransportDegradationReason::TproxyUnavailable,
+        )
+    }
 }
 
 fn execute_routing_command(
@@ -1036,7 +1060,9 @@ fn cleanup_gateway(running: &mut RunningGateway) -> Vec<String> {
             ));
         }
     }
-    reap_descendants();
+    if let Err(error) = reap_descendants() {
+        failures.push(format!("reap PID-namespace descendants: {error}"));
+    }
     failures
 }
 
@@ -1049,7 +1075,7 @@ fn kill_namespace_descendants() {
     let _ = unsafe { libc::kill(-1, libc::SIGKILL) };
 }
 
-fn reap_descendants() {
+fn reap_descendants() -> io::Result<()> {
     let deadline = Instant::now() + REAP_TIMEOUT;
     loop {
         let reaped = reap_available_children();
@@ -1057,11 +1083,17 @@ fn reap_descendants() {
             let mut status = 0;
             let result = raw_waitpid(-1, &mut status, libc::WNOHANG);
             if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
-                return;
+                return Ok(());
+            }
+            if result == -1 {
+                return Err(io::Error::last_os_error());
             }
         }
         if Instant::now() >= deadline {
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "PID-namespace descendants did not exit after SIGKILL",
+            ));
         }
         thread::sleep(CHILD_POLL_INTERVAL);
     }
@@ -1093,14 +1125,15 @@ fn workload_entrypoint() -> io::Result<ExitCode> {
     let setup = configure_workload_namespace(commands, &hosts_path);
     match setup {
         Ok(()) => send_sync(&mut control, &WorkloadReply::Ready)?,
-        Err(error) => {
+        Err(failure) => {
             let _ = send_sync(
                 &mut control,
                 &WorkloadReply::Failed {
-                    diagnostic: error.to_string(),
+                    reason: WireDegradationReason::from(failure.reason),
+                    diagnostic: failure.error.to_string(),
                 },
             );
-            return Err(error);
+            return Err(failure.error);
         }
     }
     let command = match receive_sync(&mut control)? {
@@ -1117,13 +1150,41 @@ fn workload_entrypoint() -> io::Result<ExitCode> {
 fn configure_workload_namespace(
     commands: Vec<WireExecCommand>,
     hosts_path: &Path,
-) -> io::Result<()> {
+) -> Result<(), WorkloadSetupFailure> {
     for command in commands {
         let (program, args) = command.into_parts();
-        let output = Command::new(&program).args(&args).output()?;
-        require_success(&program.to_string_lossy(), output.status, &output.stderr)?;
+        let reason = workload_setup_reason(&program, &args);
+        let output = Command::new(&program)
+            .args(&args)
+            .output()
+            .map_err(|error| WorkloadSetupFailure { reason, error })?;
+        require_success(&program.to_string_lossy(), output.status, &output.stderr)
+            .map_err(|error| WorkloadSetupFailure { reason, error })?;
     }
-    bind_mount_read_only(hosts_path, Path::new("/etc/hosts"))
+    bind_mount_read_only(hosts_path, Path::new("/etc/hosts")).map_err(|error| {
+        WorkloadSetupFailure {
+            reason: CaptureTransportDegradationReason::NetnsStartupFailed,
+            error,
+        }
+    })
+}
+
+struct WorkloadSetupFailure {
+    reason: CaptureTransportDegradationReason,
+    error: io::Error,
+}
+
+fn workload_setup_reason(
+    program: &OsStr,
+    arguments: &[OsString],
+) -> CaptureTransportDegradationReason {
+    if program == OsStr::new("ip")
+        && arguments.first().and_then(|argument| argument.to_str()) == Some("-6")
+    {
+        CaptureTransportDegradationReason::Ipv6Unavailable
+    } else {
+        CaptureTransportDegradationReason::NetnsStartupFailed
+    }
 }
 
 fn exec_locked_down(
@@ -1237,14 +1298,25 @@ fn validate_transparent_workload_probe() -> io::Result<()> {
 }
 
 fn require_only_open_fds(allowed: &[RawFd]) -> io::Result<()> {
-    for fd in 3..1024 {
+    let candidates = fs::read_dir("/proc/self/fd")?
+        .map(|entry| {
+            let name = entry?.file_name();
+            name.to_string_lossy()
+                .parse::<RawFd>()
+                .map_err(invalid_input)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    for fd in candidates {
+        if fd < 3 || allowed.contains(&fd) {
+            continue;
+        }
         // SAFETY: F_GETFD takes only a scalar candidate descriptor and does not mutate it.
         #[expect(
             unsafe_code,
             reason = "fcntl probes scalar descriptor numbers without pointer arguments; see SAFETY"
         )]
         let result = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if result != -1 && !allowed.contains(&fd) {
+        if result != -1 {
             return Err(io::Error::other(format!(
                 "helper inherited unexpected file descriptor {fd}"
             )));
@@ -1951,6 +2023,46 @@ mod tests {
         assert_eq!(
             terminal_from_reaped(&exits, 10, Some(11)),
             Some(TerminalState::WorkerFailed(SubstrateExit::Code(23)))
+        );
+    }
+
+    #[test]
+    fn ipv6_gateway_setup_failures_keep_the_closed_ipv6_reason() {
+        let plan = RoutingPlan::new(9, NonZeroU16::new(15_001).expect("test port is nonzero"));
+        let (index, command) = plan
+            .setup_commands()
+            .iter()
+            .filter(|command| command.namespace() == NetworkNamespace::Gateway)
+            .enumerate()
+            .find(|(_, command)| {
+                command.command().arguments().first().map(String::as_str) == Some("-6")
+            })
+            .expect("IPv6 gateway command");
+
+        assert_eq!(
+            gateway_setup_failure(index, command),
+            (
+                StartupStage::Routing,
+                CaptureTransportDegradationReason::Ipv6Unavailable,
+            )
+        );
+    }
+
+    #[test]
+    fn ipv6_workload_setup_failures_keep_the_closed_ipv6_reason() {
+        assert_eq!(
+            workload_setup_reason(
+                OsStr::new("ip"),
+                &[OsString::from("-6"), OsString::from("route")]
+            ),
+            CaptureTransportDegradationReason::Ipv6Unavailable
+        );
+        assert_eq!(
+            workload_setup_reason(
+                OsStr::new("ip"),
+                &[OsString::from("link"), OsString::from("set")]
+            ),
+            CaptureTransportDegradationReason::NetnsStartupFailed
         );
     }
 }

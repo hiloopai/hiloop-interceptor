@@ -211,21 +211,19 @@ pub(super) struct TransparentListeners {
     port: NonZeroU16,
 }
 
-impl TransparentListeners {
-    pub(super) fn bind(requested: Option<NonZeroU16>) -> io::Result<Self> {
-        let ipv4 = create_socket(libc::AF_INET)?;
-        set_socket_option(ipv4.as_raw_fd(), libc::SOL_IP, libc::IP_TRANSPARENT, 1)?;
-        set_socket_option(ipv4.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
-        bind_ipv4(ipv4.as_raw_fd(), requested.map_or(0, NonZeroU16::get))?;
-        listen(ipv4.as_raw_fd())?;
-        let port = local_port_ipv4(ipv4.as_raw_fd())?;
+#[derive(Debug, thiserror::Error)]
+pub(super) enum TransparentListenerError {
+    #[error("create IPv4 transparent listener: {0}")]
+    Ipv4(#[source] io::Error),
+    #[error("create IPv6 transparent listener: {0}")]
+    Ipv6(#[source] io::Error),
+}
 
-        let ipv6 = create_socket(libc::AF_INET6)?;
-        set_socket_option(ipv6.as_raw_fd(), libc::IPPROTO_IPV6, IPV6_TRANSPARENT, 1)?;
-        set_socket_option(ipv6.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
-        set_socket_option(ipv6.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
-        bind_ipv6(ipv6.as_raw_fd(), port.get())?;
-        listen(ipv6.as_raw_fd())?;
+impl TransparentListeners {
+    pub(super) fn bind(requested: Option<NonZeroU16>) -> Result<Self, TransparentListenerError> {
+        let (ipv4, port) =
+            create_ipv4_listener(requested).map_err(TransparentListenerError::Ipv4)?;
+        let ipv6 = create_ipv6_listener(port).map_err(TransparentListenerError::Ipv6)?;
 
         Ok(Self { ipv4, ipv6, port })
     }
@@ -237,6 +235,26 @@ impl TransparentListeners {
     pub(super) fn raw_fds(&self) -> [RawFd; 2] {
         [self.ipv4.as_raw_fd(), self.ipv6.as_raw_fd()]
     }
+}
+
+fn create_ipv4_listener(requested: Option<NonZeroU16>) -> io::Result<(OwnedFd, NonZeroU16)> {
+    let ipv4 = create_socket(libc::AF_INET)?;
+    set_socket_option(ipv4.as_raw_fd(), libc::SOL_IP, libc::IP_TRANSPARENT, 1)?;
+    set_socket_option(ipv4.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+    bind_ipv4(ipv4.as_raw_fd(), requested.map_or(0, NonZeroU16::get))?;
+    listen(ipv4.as_raw_fd())?;
+    let port = local_port_ipv4(ipv4.as_raw_fd())?;
+    Ok((ipv4, port))
+}
+
+fn create_ipv6_listener(port: NonZeroU16) -> io::Result<OwnedFd> {
+    let ipv6 = create_socket(libc::AF_INET6)?;
+    set_socket_option(ipv6.as_raw_fd(), libc::IPPROTO_IPV6, IPV6_TRANSPARENT, 1)?;
+    set_socket_option(ipv6.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
+    set_socket_option(ipv6.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+    bind_ipv6(ipv6.as_raw_fd(), port.get())?;
+    listen(ipv6.as_raw_fd())?;
+    Ok(ipv6)
 }
 
 use std::os::fd::AsRawFd as _;
