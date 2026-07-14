@@ -1026,7 +1026,7 @@ mod tests {
             GATEWAY_IPV4,
             GATEWAY_IPV6,
             "169.254.2.2".parse().expect("host IPv4"),
-            "fd00:6869:6c6f:6f70:1::2".parse().expect("host IPv6"),
+            "fd00:6869:6c6f:6f71::2".parse().expect("host IPv6"),
             FragmentedUdpBehavior::Drop,
         )
         .expect("topology");
