@@ -14,6 +14,7 @@ use hiloop_core::capture::{CapturePreflight, CaptureTransportDegradationReason};
 use thiserror::Error;
 
 mod classifier;
+mod ingress;
 #[cfg(target_os = "linux")]
 mod listener;
 #[cfg(target_os = "linux")]
@@ -34,6 +35,10 @@ mod system;
 pub use classifier::{
     ClassificationError, ClassificationProgress, ClientHelloIdentity, HttpIdentity, TcpProtocol,
     classify_tcp_prefix,
+};
+pub use ingress::{
+    AdmittedTcpFlow, ConnectedTcpFlow, DirectTcpConnector, IngressError, TcpUpstreamConnector,
+    TransparentTcpIngress, connect_authorized, recover_original_destination,
 };
 pub use route::{
     AuthorizedRoute, DnsAnswerEvidence, NoDnsAnswerEvidence, RouteDenial, RoutingIdentitySource,

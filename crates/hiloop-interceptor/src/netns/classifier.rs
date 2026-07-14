@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Maximum prefix inspected before classification fails closed.
-const MAX_CLASSIFICATION_BYTES: usize = 64 * 1024;
+pub(super) const MAX_CLASSIFICATION_BYTES: usize = 64 * 1024;
 
 const MAX_TLS_RECORD_BYTES: usize = 18 * 1024;
 const MAX_HTTP_METHOD_BYTES: usize = 32;
