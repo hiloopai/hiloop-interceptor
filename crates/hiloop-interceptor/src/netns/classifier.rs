@@ -294,13 +294,13 @@ fn parse_client_hello(body: &[u8]) -> Result<ClientHelloIdentity, Classification
     let mut normalized = Vec::new();
     normalized.extend_from_slice(b"hiloop-client-hello-v1\0");
     normalized.extend_from_slice(&legacy_version.to_be_bytes());
-    append_u16_set(&mut normalized, 1, &suites);
-    append_u8_set(&mut normalized, 2, &compression);
-    append_u16_set(&mut normalized, 3, &extension_types);
-    append_u16_set(&mut normalized, 4, &groups);
-    append_u16_set(&mut normalized, 5, &signatures);
-    append_u16_set(&mut normalized, 6, &versions);
-    append_byte_strings(&mut normalized, 7, &alpn);
+    append_u16_set(&mut normalized, 1, &suites)?;
+    append_u8_set(&mut normalized, 2, &compression)?;
+    append_u16_set(&mut normalized, 3, &extension_types)?;
+    append_u16_set(&mut normalized, 4, &groups)?;
+    append_u16_set(&mut normalized, 5, &signatures)?;
+    append_u16_set(&mut normalized, 6, &versions)?;
+    append_byte_strings(&mut normalized, 7, &alpn)?;
     let fingerprint = format!("ch1:{}", blake3::hash(&normalized).to_hex());
 
     Ok(ClientHelloIdentity {
@@ -420,31 +420,40 @@ fn is_grease(value: u16) -> bool {
     value & 0x0f0f == 0x0a0a
 }
 
-fn append_u16_set(bytes: &mut Vec<u8>, tag: u8, values: &[u16]) {
+fn append_u16_set(bytes: &mut Vec<u8>, tag: u8, values: &[u16]) -> Result<(), ClassificationError> {
     bytes.push(tag);
-    bytes.extend_from_slice(&usize_u32(values.len()).to_be_bytes());
+    append_length(bytes, values.len())?;
     for value in values {
         bytes.extend_from_slice(&value.to_be_bytes());
     }
+    Ok(())
 }
 
-fn append_u8_set(bytes: &mut Vec<u8>, tag: u8, values: &[u8]) {
+fn append_u8_set(bytes: &mut Vec<u8>, tag: u8, values: &[u8]) -> Result<(), ClassificationError> {
     bytes.push(tag);
-    bytes.extend_from_slice(&usize_u32(values.len()).to_be_bytes());
+    append_length(bytes, values.len())?;
     bytes.extend_from_slice(values);
+    Ok(())
 }
 
-fn append_byte_strings(bytes: &mut Vec<u8>, tag: u8, values: &[Vec<u8>]) {
+fn append_byte_strings(
+    bytes: &mut Vec<u8>,
+    tag: u8,
+    values: &[Vec<u8>],
+) -> Result<(), ClassificationError> {
     bytes.push(tag);
-    bytes.extend_from_slice(&usize_u32(values.len()).to_be_bytes());
+    append_length(bytes, values.len())?;
     for value in values {
-        bytes.extend_from_slice(&usize_u32(value.len()).to_be_bytes());
+        append_length(bytes, value.len())?;
         bytes.extend_from_slice(value);
     }
+    Ok(())
 }
 
-fn usize_u32(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
+fn append_length(bytes: &mut Vec<u8>, value: usize) -> Result<(), ClassificationError> {
+    let value = u64::try_from(value).map_err(|_| ClassificationError::PrefixTooLarge)?;
+    bytes.extend_from_slice(&value.to_be_bytes());
+    Ok(())
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
