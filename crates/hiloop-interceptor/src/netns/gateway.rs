@@ -61,6 +61,7 @@ use super::{
     IngressError, NetworkCapture, RequestAuthorityRejection, SecretRoute, TcpProtocol,
     TlsPolicyEngine, TlsPolicyFlow, TlsTransportDecision, TransparentTcpIngress,
     TransparentUdpChildSink, TransparentUdpIngress, UdpFlowRelay, UdpIngressError,
+    classifier::HTTP2_PREFACE,
     classify_client_handshake_error, connect_authorized,
     event_relay::EventRelayExporter,
     routing::{GATEWAY_IPV4, GATEWAY_IPV6},
@@ -481,10 +482,17 @@ async fn consume_transport_decision(
         }
         TlsTransportDecision::CaptureHttp => {
             let (client, route, _) = admitted.into_parts();
-            serve_http(client, false, false, route, None, secret_route, gateway).await
+            let h2 = cleartext_http2(&client).await?;
+            serve_http(client, false, h2, route, None, secret_route, gateway).await
         }
         TlsTransportDecision::TerminateTls => terminate_tls(gateway, admitted, secret_route).await,
     }
+}
+
+async fn cleartext_http2(client: &tokio::net::TcpStream) -> io::Result<bool> {
+    let mut prefix = [0_u8; HTTP2_PREFACE.len()];
+    let length = client.peek(&mut prefix).await?;
+    Ok(length == prefix.len() && prefix == HTTP2_PREFACE)
 }
 
 async fn terminate_tls(
@@ -870,6 +878,7 @@ mod tests {
     use crate::netns::{
         ClassificationProgress, FragmentedUdpBehavior, SubstrateInfo, classify_tcp_prefix,
     };
+    use tokio::io::AsyncWriteExt as _;
 
     #[tokio::test]
     async fn production_dispatch_consumes_every_tls_transport_decision_variant() {
@@ -904,6 +913,29 @@ mod tests {
         assert!(matches!(visible, TcpProtocol::CleartextHttp(_)));
         let opaque = classified(b"SSH-2.0-fixture\r\n");
         assert_eq!(opaque, TcpProtocol::OtherTcp);
+    }
+
+    #[tokio::test]
+    async fn cleartext_preface_selects_the_matching_hyper_server() {
+        for (request, expected_h2) in [
+            (HTTP2_PREFACE, true),
+            (b"GET / HTTP/1.1\r\nHost: fixture\r\n\r\n".as_slice(), false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let mut sender =
+                tokio::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+                    .await
+                    .expect("connect");
+            let (receiver, _) = listener.accept().await.expect("accept");
+            sender.write_all(request).await.expect("write request");
+
+            assert_eq!(
+                cleartext_http2(&receiver).await.expect("inspect"),
+                expected_h2
+            );
+        }
     }
 
     fn classified(bytes: &[u8]) -> TcpProtocol {

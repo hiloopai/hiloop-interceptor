@@ -46,20 +46,56 @@ impl EventRelayExporter {
 
     async fn request(&self, request: &RelayRequest) -> Result<(), ExportError> {
         let mut stream = self.stream.lock().await;
-        write_frame(&mut *stream, request)
-            .await
-            .map_err(relay_export_error)?;
-        match read_frame(&mut *stream).await.map_err(relay_export_error)? {
-            RelayResponse::Ok => Ok(()),
-            RelayResponse::Error(message) => Err(ExportError::other("netns-event-relay", message)),
-        }
+        request_on(&mut stream, request).await
+    }
+}
+
+async fn request_on(stream: &mut UnixStream, request: &RelayRequest) -> Result<(), ExportError> {
+    write_frame(&mut *stream, request)
+        .await
+        .map_err(relay_export_error)?;
+    match read_frame(&mut *stream).await.map_err(relay_export_error)? {
+        RelayResponse::Ok => Ok(()),
+        RelayResponse::Error(message) => Err(ExportError::other("netns-event-relay", message)),
     }
 }
 
 #[async_trait]
 impl Exporter for EventRelayExporter {
     async fn export(&self, events: &[Event]) -> Result<(), ExportError> {
-        self.request(&RelayRequest::Export(events.to_vec())).await
+        let mut stream = self.stream.lock().await;
+        let empty_frame_bytes = serde_json::to_vec(&RelayRequest::Export(Vec::new()))
+            .map_err(|error| relay_export_error(invalid_data(error)))?
+            .len();
+        let mut batch = Vec::new();
+        let mut frame_bytes = empty_frame_bytes;
+        for event in events {
+            let event_bytes = serde_json::to_vec(event)
+                .map_err(|error| relay_export_error(invalid_data(error)))?
+                .len();
+            let separator = usize::from(!batch.is_empty());
+            if !batch.is_empty()
+                && frame_bytes
+                    .saturating_add(separator)
+                    .saturating_add(event_bytes)
+                    > MAX_FRAME_BYTES
+            {
+                request_on(
+                    &mut stream,
+                    &RelayRequest::Export(std::mem::take(&mut batch)),
+                )
+                .await?;
+                frame_bytes = empty_frame_bytes;
+            }
+            frame_bytes = frame_bytes
+                .saturating_add(usize::from(!batch.is_empty()))
+                .saturating_add(event_bytes);
+            batch.push(event.clone());
+        }
+        if !batch.is_empty() {
+            request_on(&mut stream, &RelayRequest::Export(batch)).await?;
+        }
+        Ok(())
     }
 
     async fn flush(&self) -> Result<(), ExportError> {
@@ -176,7 +212,7 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use hiloop_core::{
-        event::{EventName, SignalType},
+        event::{AttributeKey, EventName, SignalType},
         identity::{Hlc, RunContext},
     };
 
@@ -214,6 +250,43 @@ mod tests {
         let events = memory.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name.as_str(), event.name.as_str());
+
+        shutdown_tx.send(()).expect("send shutdown");
+        task.await.expect("relay task").expect("relay server");
+    }
+
+    #[tokio::test]
+    async fn splits_an_export_batch_before_the_bounded_frame_limit() {
+        let directory = tempfile::tempdir().expect("relay directory");
+        let path = directory.path().join("events.sock");
+        let memory = Arc::new(MemoryExporter::default());
+        let server = EventRelayServer::bind(&path, memory.clone()).expect("bind relay");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let relay = EventRelayExporter::connect(&path)
+            .await
+            .expect("connect relay");
+        let event = Event::new(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            SignalType::Log,
+            EventName::from_static("fixture.large"),
+        )
+        .with_attribute(
+            AttributeKey::from_static("fixture.body"),
+            "x".repeat(64 * 1024),
+        );
+
+        relay
+            .export(&vec![event; 80])
+            .await
+            .expect("chunked export");
+        assert_eq!(memory.events().len(), 80);
 
         shutdown_tx.send(()).expect("send shutdown");
         task.await.expect("relay task").expect("relay server");
