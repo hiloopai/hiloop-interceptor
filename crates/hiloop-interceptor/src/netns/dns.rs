@@ -61,10 +61,14 @@ impl DnsAnswerTracker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         answers.retain(|_, expiry| *expiry > now);
-        for (name, address, ttl) in correlated {
-            if ttl == 0 {
-                continue;
-            }
+        let mut shortest_ttls = HashMap::new();
+        for (name, address, ttl) in correlated.into_iter().filter(|(_, _, ttl)| *ttl > 0) {
+            shortest_ttls
+                .entry((name, address))
+                .and_modify(|current: &mut u32| *current = (*current).min(ttl))
+                .or_insert(ttl);
+        }
+        for ((name, address), ttl) in shortest_ttls {
             if let Some(expiry) = now.checked_add(Duration::from_secs(u64::from(ttl))) {
                 answers.insert((name, address), expiry);
             }
@@ -410,6 +414,28 @@ mod tests {
             !tracker
                 .contains_unexpired("api.example.com", IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)))
         );
+    }
+
+    #[test]
+    fn duplicate_answers_use_the_shortest_returned_ttl() {
+        let now = Instant::now();
+        let tracker = DnsAnswerTracker::default();
+        let query = query("api.example.com", 1);
+        let response = response(
+            &query,
+            &[
+                answer_a("api.example.com", 2, Ipv4Addr::new(192, 0, 2, 10)),
+                answer_a("api.example.com", 20, Ipv4Addr::new(192, 0, 2, 10)),
+            ],
+        );
+
+        tracker.record_response_at(&query, &response, now);
+
+        assert!(!tracker.contains_at(
+            "api.example.com",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            now + Duration::from_secs(2),
+        ));
     }
 
     fn query(name: &str, kind: u16) -> Vec<u8> {
