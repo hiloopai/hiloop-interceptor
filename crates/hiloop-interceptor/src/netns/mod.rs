@@ -24,6 +24,7 @@ mod pasta;
 mod protocol;
 #[cfg(target_os = "linux")]
 mod resolver;
+mod route;
 #[cfg(target_os = "linux")]
 mod routing;
 #[cfg(target_os = "linux")]
@@ -33,6 +34,10 @@ mod system;
 pub use classifier::{
     ClassificationError, ClassificationProgress, ClientHelloIdentity, HttpIdentity, TcpProtocol,
     classify_tcp_prefix,
+};
+pub use route::{
+    AuthorizedRoute, DnsAnswerEvidence, NoDnsAnswerEvidence, RouteDenial, RoutingIdentitySource,
+    authorize_route,
 };
 pub use system::SystemNetworkProvisioner;
 
