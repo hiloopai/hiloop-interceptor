@@ -31,6 +31,8 @@ mod routing;
 #[cfg(target_os = "linux")]
 mod security;
 mod system;
+mod tls_policy;
+mod tls_transport;
 
 pub use classifier::{
     ClassificationError, ClassificationProgress, ClientHelloIdentity, HttpIdentity, TcpProtocol,
@@ -45,6 +47,14 @@ pub use route::{
     authorize_route,
 };
 pub use system::SystemNetworkProvisioner;
+pub use tls_policy::{
+    HandshakeFailure, HandshakeFailureDecision, RequestAuthorityRejection, SecretRoute,
+    TlsPolicyEngine, TlsPolicyFlow, TlsTransportDecision, TrustAlert,
+};
+pub use tls_transport::{
+    TlsTransportError, classify_client_handshake_error, emit_interception_failure, raw_tcp_splice,
+    raw_tls_splice,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;

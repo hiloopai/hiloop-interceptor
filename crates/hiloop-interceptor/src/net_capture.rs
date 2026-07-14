@@ -104,6 +104,20 @@ pub struct CompatibilityRegistry {
 }
 
 impl CompatibilityRegistry {
+    /// Reviewed first-connection compatibility table shipped by this interceptor.
+    pub fn current() -> Self {
+        Self {
+            version: 1,
+            entries: vec![CompatibilityRegistryEntry {
+                host: CanonicalHost::Domain("api.modal.com".to_owned()),
+                port: 443,
+                evidence: "clean-environment Modal certificate-pinning fixture".to_owned(),
+                owner: "capture-runtime".to_owned(),
+                revalidate_on: "2026-10-14".to_owned(),
+            }],
+        }
+    }
+
     /// Validate registry identity and exact-endpoint uniqueness.
     pub fn new(
         version: u32,
@@ -133,6 +147,13 @@ impl CompatibilityRegistry {
     /// Reviewed exact endpoint rows.
     pub fn entries(&self) -> &[CompatibilityRegistryEntry] {
         &self.entries
+    }
+
+    /// Whether the reviewed table contains this exact canonical host and port.
+    pub fn contains(&self, host: &CanonicalHost, port: u16) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.host() == host && entry.port() == port)
     }
 }
 

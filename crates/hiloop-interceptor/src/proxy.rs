@@ -580,12 +580,10 @@ impl CaptureHandler {
             return forbidden().into();
         };
 
-        // Reject a decrypted Host that disagrees with the CONNECT's SNI host *before*
-        // the policy check: a mismatch means the request would reach a host the
-        // CONNECT-time egress check never saw, regardless of whether the decrypted host
-        // would itself pass the policy. Skipped under allow-all (no SNI was policed).
-        if !self.egress.is_allow_all()
-            && let Some(connect_host) = &self.connect_host
+        // Reject a decrypted Host that disagrees with the CONNECT's SNI host before
+        // policy or injection. HTTP/2 connection reuse must not turn one intercepted
+        // authority into an authorization for another origin.
+        if let Some(connect_host) = &self.connect_host
             && connect_host != destination.host()
         {
             self.emit_egress_denied(&destination, "host-mismatch", "request", None);
@@ -3439,6 +3437,35 @@ mod tests {
             .method("GET")
             .uri("/path")
             .header("host", "different.example.com")
+            .body(Body::empty())
+            .expect("request");
+        let response = expect_response(handler.on_request(request).await);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let signal = rx.recv().await.expect("egress signal").expect("raw");
+        assert_eq!(signal.kind, EGRESS_DENIED_KIND);
+        assert_eq!(
+            signal.attributes.get("egress.decision").map(String::as_str),
+            Some("host-mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn sni_host_mismatch_is_rejected_under_allow_all() {
+        let (mut handler, mut rx, _store) = handler_with_egress(
+            None,
+            RedactionPolicy::default(),
+            Arc::new(EgressPolicy::default()),
+            None,
+        );
+        let _ = expect_forwarded(
+            handler
+                .on_request(connect_request("first.example.com:443"))
+                .await,
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri("https://second.example.com/path")
             .body(Body::empty())
             .expect("request");
         let response = expect_response(handler.on_request(request).await);
