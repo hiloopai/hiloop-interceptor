@@ -1037,6 +1037,7 @@ dependencies = [
  "protox",
  "regex",
  "rustls",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
