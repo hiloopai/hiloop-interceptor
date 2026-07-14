@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use hiloop_core::capture::{CapturePreflight, CaptureTransportDegradationReason};
 use thiserror::Error;
 
+mod classifier;
 #[cfg(target_os = "linux")]
 mod listener;
 #[cfg(target_os = "linux")]
@@ -29,6 +30,10 @@ mod routing;
 mod security;
 mod system;
 
+pub use classifier::{
+    ClassificationError, ClassificationProgress, ClientHelloIdentity, HttpIdentity, TcpProtocol,
+    classify_tcp_prefix,
+};
 pub use system::SystemNetworkProvisioner;
 
 #[cfg(any(test, feature = "test-support"))]
