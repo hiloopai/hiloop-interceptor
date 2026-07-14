@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 
 use hiloop_core::capture::{
-    CaptureFatalReason, CapturePolicy, TlsInterceptionFailedReason, TlsPassthroughReason,
+    CaptureFatalReason, CapturePolicy, TlsFlowIdentity, TlsInterceptionFailedReason,
+    TlsPassthroughReason,
 };
 use tokio::sync::RwLock;
 
@@ -12,7 +13,7 @@ use crate::{
     net_capture::CompatibilityRegistry,
 };
 
-use super::{AuthorizedRoute, DnsAnswerEvidence, RouteDenial, TcpProtocol};
+use super::{AuthorizedRoute, DnsAnswerEvidence, FatalReport, RouteDenial, TcpProtocol};
 
 /// Whether the admitted authority is relevant to the run's secret bindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +56,16 @@ pub enum TlsTransportDecision {
     PassthroughTcp,
     /// Fail a binding-strict run with the closed W1 reason.
     Fatal(CaptureFatalReason),
+}
+
+impl TlsTransportDecision {
+    /// Convert a strict transport decision into the report sent through the fatal controller.
+    pub fn fatal_report(&self, flow: TlsFlowIdentity) -> Option<FatalReport> {
+        match self {
+            Self::Fatal(reason) => Some(FatalReport::tls(*reason, flow)),
+            _ => None,
+        }
+    }
 }
 
 /// Explicit client trust alert that can definitively identify interception rejection.
@@ -124,6 +135,11 @@ impl HandshakeFailureDecision {
             Self::Failed { reason, .. } => reason,
         }
     }
+
+    /// Convert a strict handshake failure into the report sent through the fatal controller.
+    pub fn fatal_report(self, flow: TlsFlowIdentity) -> Option<FatalReport> {
+        self.fatal().map(|reason| FatalReport::tls(reason, flow))
+    }
 }
 
 /// Request-time authority mismatch after a successful TLS interception handshake.
@@ -135,6 +151,16 @@ pub enum RequestAuthorityRejection {
     /// A secret-strict request could bypass binding identity.
     #[error("request authority violates secret route identity")]
     Fatal(CaptureFatalReason),
+}
+
+impl RequestAuthorityRejection {
+    /// Convert a strict request-identity rejection into a fatal controller report.
+    pub fn fatal_report(&self, flow: TlsFlowIdentity) -> Option<FatalReport> {
+        match self {
+            Self::Fatal(reason) => Some(FatalReport::tls(*reason, flow)),
+            Self::Denied(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

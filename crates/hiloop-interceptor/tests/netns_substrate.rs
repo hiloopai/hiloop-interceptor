@@ -19,6 +19,7 @@ const DATAPLANE_WORKER_ROLE: &str = "__hiloop-netns-dataplane-worker-probe";
 const DATAPLANE_WORKLOAD_ROLE: &str = "__hiloop-netns-dataplane-workload-probe";
 const CRASHING_WORKER_ROLE: &str = "__hiloop-netns-crashing-worker-probe";
 const DETACHED_WORKLOAD_ROLE: &str = "__hiloop-netns-detached-workload-probe";
+const FATAL_WORKER_ROLE: &str = "__hiloop-netns-fatal-worker-probe";
 const REAL_TEST_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn fake_info() -> SubstrateInfo {
@@ -265,6 +266,25 @@ async fn real_rootless_substrate_contract() {
         .shutdown()
         .await
         .expect("ordered explicit shutdown");
+    wait_for_cleanup(&helper, &[&pasta]);
+
+    fs::remove_file(&descendant_pid).expect("reset descendant fixture");
+    let mut fatal = provisioner
+        .provision(ProvisionRequest::new(
+            NamespaceCommand::new(&helper)
+                .arg(DETACHED_WORKLOAD_ROLE)
+                .arg(&descendant_pid),
+            NamespaceCommand::new(&helper).arg(FATAL_WORKER_ROLE),
+        ))
+        .await
+        .expect("fatal-transition substrate");
+    wait_for_path(&descendant_pid);
+    assert!(matches!(
+        fatal.wait().await,
+        Err(ProvisionError::Fatal { report, .. })
+            if report.reason()
+                == hiloop_core::capture::CaptureFatalReason::SecretBindUnterminatable
+    ));
     wait_for_cleanup(&helper, &[&pasta]);
 
     fs::remove_file(&descendant_pid).expect("reset descendant fixture");

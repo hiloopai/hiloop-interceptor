@@ -1,22 +1,26 @@
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Read, Write},
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU16,
     os::unix::ffi::{OsStrExt as _, OsStringExt as _},
     path::PathBuf,
 };
 
-use hiloop_core::capture::CaptureTransportDegradationReason;
+use hiloop_core::capture::{
+    CaptureFatalReason, CaptureTransportDegradationReason, OriginalDestination, TlsFlowIdentity,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use super::{
-    FragmentedUdpBehavior, NamespaceCommand, ProvisionRequest, StartupStage, SubstrateExit,
-    SubstrateInfo,
+    FatalReport, FragmentedUdpBehavior, NamespaceCommand, ProvisionRequest, StartupStage,
+    SubstrateExit, SubstrateInfo, fatal::FatalRoute,
 };
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_GATEWAY_CONTROL_BYTES: usize = 4 * 1024;
+const GATEWAY_FATAL_VERSION: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) enum SupervisorMessage {
@@ -39,9 +43,168 @@ pub(super) enum ManagerMessage {
         reason: WireDegradationReason,
         diagnostic: String,
     },
+    Fatal(WireFatalReport),
     CleanupComplete {
         failures: Vec<String>,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct WireFatalReport {
+    reason: WireFatalReason,
+    route: WireFatalRoute,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum WireFatalReason {
+    SecretBindUnterminatable,
+    SecretRouteAmbiguous,
+    SecretDestinationMismatch,
+    SecretPassthroughForbidden,
+    SecretRouteIdentityMismatch,
+    SecretTransportInsecure,
+    SecretTransportUnsupported,
+    DataplaneFailed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum WireFatalRoute {
+    None,
+    Tls {
+        destination: WireDestination,
+        server_name: Option<String>,
+        client_hello_fingerprint: Option<String>,
+    },
+    Destination(WireDestination),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct WireDestination {
+    ip: IpAddr,
+    port: u16,
+}
+
+impl From<&FatalReport> for WireFatalReport {
+    fn from(report: &FatalReport) -> Self {
+        let route = match report.route() {
+            FatalRoute::None => WireFatalRoute::None,
+            FatalRoute::Tls(flow) => WireFatalRoute::Tls {
+                destination: WireDestination::from(flow.destination()),
+                server_name: flow.server_name().map(str::to_owned),
+                client_hello_fingerprint: flow.client_hello_fingerprint().map(str::to_owned),
+            },
+            FatalRoute::Destination(destination) => {
+                WireFatalRoute::Destination(WireDestination::from(*destination))
+            }
+        };
+        Self {
+            reason: WireFatalReason::from(report.reason()),
+            route,
+        }
+    }
+}
+
+impl TryFrom<WireFatalReport> for FatalReport {
+    type Error = io::Error;
+
+    fn try_from(report: WireFatalReport) -> Result<Self, Self::Error> {
+        let reason = CaptureFatalReason::from(report.reason);
+        let route = match report.route {
+            WireFatalRoute::None => FatalRoute::None,
+            WireFatalRoute::Destination(destination) => {
+                FatalRoute::Destination(destination.try_into()?)
+            }
+            WireFatalRoute::Tls {
+                destination,
+                server_name,
+                client_hello_fingerprint,
+            } => {
+                let mut flow = TlsFlowIdentity::new(destination.try_into()?);
+                if let Some(server_name) = server_name {
+                    flow = flow.with_server_name(server_name).map_err(invalid_data)?;
+                }
+                if let Some(fingerprint) = client_hello_fingerprint {
+                    flow = flow
+                        .with_client_hello_fingerprint(fingerprint)
+                        .map_err(invalid_data)?;
+                }
+                FatalRoute::Tls(flow)
+            }
+        };
+        Ok(FatalReport::from_route(reason, route))
+    }
+}
+
+impl From<OriginalDestination> for WireDestination {
+    fn from(destination: OriginalDestination) -> Self {
+        Self {
+            ip: destination.ip(),
+            port: destination.port(),
+        }
+    }
+}
+
+impl TryFrom<WireDestination> for OriginalDestination {
+    type Error = io::Error;
+
+    fn try_from(destination: WireDestination) -> Result<Self, Self::Error> {
+        Self::new(destination.ip, destination.port).map_err(invalid_data)
+    }
+}
+
+impl From<CaptureFatalReason> for WireFatalReason {
+    fn from(reason: CaptureFatalReason) -> Self {
+        match reason {
+            CaptureFatalReason::SecretBindUnterminatable => Self::SecretBindUnterminatable,
+            CaptureFatalReason::SecretRouteAmbiguous => Self::SecretRouteAmbiguous,
+            CaptureFatalReason::SecretDestinationMismatch => Self::SecretDestinationMismatch,
+            CaptureFatalReason::SecretPassthroughForbidden => Self::SecretPassthroughForbidden,
+            CaptureFatalReason::SecretRouteIdentityMismatch => Self::SecretRouteIdentityMismatch,
+            CaptureFatalReason::SecretTransportInsecure => Self::SecretTransportInsecure,
+            CaptureFatalReason::SecretTransportUnsupported => Self::SecretTransportUnsupported,
+            CaptureFatalReason::DataplaneFailed => Self::DataplaneFailed,
+        }
+    }
+}
+
+impl From<WireFatalReason> for CaptureFatalReason {
+    fn from(reason: WireFatalReason) -> Self {
+        match reason {
+            WireFatalReason::SecretBindUnterminatable => Self::SecretBindUnterminatable,
+            WireFatalReason::SecretRouteAmbiguous => Self::SecretRouteAmbiguous,
+            WireFatalReason::SecretDestinationMismatch => Self::SecretDestinationMismatch,
+            WireFatalReason::SecretPassthroughForbidden => Self::SecretPassthroughForbidden,
+            WireFatalReason::SecretRouteIdentityMismatch => Self::SecretRouteIdentityMismatch,
+            WireFatalReason::SecretTransportInsecure => Self::SecretTransportInsecure,
+            WireFatalReason::SecretTransportUnsupported => Self::SecretTransportUnsupported,
+            WireFatalReason::DataplaneFailed => Self::DataplaneFailed,
+        }
+    }
+}
+
+pub(super) fn encode_gateway_fatal(report: &FatalReport) -> io::Result<Vec<u8>> {
+    let payload = serde_json::to_vec(&WireFatalReport::from(report)).map_err(invalid_data)?;
+    let mut frame = Vec::with_capacity(payload.len() + 1);
+    frame.push(GATEWAY_FATAL_VERSION);
+    frame.extend_from_slice(&payload);
+    if frame.len() > MAX_GATEWAY_CONTROL_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gateway fatal report exceeds the private control datagram limit",
+        ));
+    }
+    Ok(frame)
+}
+
+pub(super) fn decode_gateway_fatal(frame: &[u8]) -> io::Result<Option<FatalReport>> {
+    let Some((&version, payload)) = frame.split_first() else {
+        return Ok(None);
+    };
+    if version != GATEWAY_FATAL_VERSION {
+        return Ok(None);
+    }
+    let report = serde_json::from_slice::<WireFatalReport>(payload).map_err(invalid_data)?;
+    report.try_into().map(Some)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -473,5 +636,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn gateway_fatal_wire_round_trips_every_closed_reason_and_route_shape() {
+        let destination =
+            OriginalDestination::new("203.0.113.10".parse().expect("test destination"), 443)
+                .expect("valid destination");
+        let flow = TlsFlowIdentity::new(destination)
+            .with_server_name("api.example.com")
+            .expect("test SNI")
+            .with_client_hello_fingerprint("ja4:test")
+            .expect("test fingerprint");
+        for reason in [
+            CaptureFatalReason::SecretBindUnterminatable,
+            CaptureFatalReason::SecretRouteAmbiguous,
+            CaptureFatalReason::SecretDestinationMismatch,
+            CaptureFatalReason::SecretPassthroughForbidden,
+            CaptureFatalReason::SecretRouteIdentityMismatch,
+            CaptureFatalReason::SecretTransportInsecure,
+            CaptureFatalReason::SecretTransportUnsupported,
+            CaptureFatalReason::DataplaneFailed,
+        ] {
+            for report in [
+                FatalReport::without_route(reason),
+                FatalReport::destination(reason, destination),
+                FatalReport::tls(reason, flow.clone()),
+            ] {
+                let encoded = encode_gateway_fatal(&report).expect("encode fatal report");
+                assert!(encoded.len() <= MAX_GATEWAY_CONTROL_BYTES);
+                assert_eq!(
+                    decode_gateway_fatal(&encoded).expect("decode fatal report"),
+                    Some(report)
+                );
+            }
+        }
     }
 }
