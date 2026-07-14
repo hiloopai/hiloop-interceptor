@@ -207,7 +207,7 @@ impl SystemNetnsRun {
         })
     }
 
-    /// Substitute the W2 provisioner at its production port while retaining the real composer.
+    /// Substitute the network provisioner at its production port while retaining the composer.
     pub fn with_provisioner(
         provisioner: Arc<dyn NetworkProvisioner>,
         helper_path: impl Into<PathBuf>,
@@ -337,13 +337,14 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
     let result = supervisor.wait(session.as_mut()).await;
 
     let _ = relay_shutdown_tx.send(());
-    relay_task
-        .await
-        .context("join transparent-run event relay")??;
-    exporter
+    let relay_result = match relay_task.await {
+        Ok(result) => result.context("serve transparent-run event relay"),
+        Err(error) => Err(error).context("join transparent-run event relay"),
+    };
+    let flush_result = exporter
         .flush()
         .await
-        .context("flush transparent-run events")?;
+        .context("flush transparent-run events");
 
     if let Some(spool) = spool {
         let report = spool.drain(options.blob_drain_retry()).await;
@@ -362,9 +363,35 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         );
     }
 
-    match result? {
-        SubstrateExit::Code(code) => Ok(ExitCode::from(exit_byte(code))),
-        SubstrateExit::Signal(signal) => Ok(ExitCode::from(exit_byte(128 + signal.get()))),
+    let cleanup_error = combined_cleanup_error(relay_result, flush_result);
+    match result {
+        Err(error) => match cleanup_error {
+            Some(cleanup) => Err(anyhow::anyhow!(
+                "{error:#}; transparent capture cleanup also failed: {cleanup:#}"
+            )),
+            None => Err(error.into()),
+        },
+        Ok(exit) => {
+            if let Some(error) = cleanup_error {
+                return Err(error);
+            }
+            match exit {
+                SubstrateExit::Code(code) => Ok(ExitCode::from(exit_byte(code))),
+                SubstrateExit::Signal(signal) => Ok(ExitCode::from(exit_byte(128 + signal.get()))),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn combined_cleanup_error(
+    relay: anyhow::Result<()>,
+    flush: anyhow::Result<()>,
+) -> Option<anyhow::Error> {
+    match (relay.err(), flush.err()) {
+        (Some(relay), Some(flush)) => Some(anyhow::anyhow!("{relay:#}; {flush:#}")),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
     }
 }
 
