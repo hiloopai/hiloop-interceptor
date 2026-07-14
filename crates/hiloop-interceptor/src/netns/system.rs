@@ -15,6 +15,8 @@ pub struct SystemNetworkProvisioner {
     helper_path: PathBuf,
     startup_timeout: Duration,
     resolver_timeout: Duration,
+    #[cfg(feature = "test-support")]
+    forced_host_ip_families: Option<(bool, bool)>,
 }
 
 impl SystemNetworkProvisioner {
@@ -25,6 +27,8 @@ impl SystemNetworkProvisioner {
             helper_path: std::env::current_exe()?,
             startup_timeout: Duration::from_secs(10),
             resolver_timeout: Duration::from_secs(2),
+            #[cfg(feature = "test-support")]
+            forced_host_ip_families: None,
         })
     }
 
@@ -51,6 +55,12 @@ impl SystemNetworkProvisioner {
     /// Re-exec helper used to create namespace-scoped processes.
     pub fn helper_path(&self) -> &std::path::Path {
         &self.helper_path
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(super) fn force_ipv4_only(mut self) -> Self {
+        self.forced_host_ip_families = Some((true, false));
+        self
     }
 }
 
@@ -145,7 +155,7 @@ mod linux {
     const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
 
     pub(super) async fn preflight(provisioner: &SystemNetworkProvisioner) -> PreflightReport {
-        let connectivity = HostConnectivity::probe();
+        let connectivity = host_connectivity(provisioner);
         if !connectivity.ipv4 {
             return PreflightReport::failed(
                 CaptureTransportDegradationReason::NetnsStartupFailed,
@@ -198,7 +208,7 @@ mod linux {
         provisioner: &SystemNetworkProvisioner,
         request: ProvisionRequest,
     ) -> Result<Box<dyn NetworkSession>, ProvisionError> {
-        let connectivity = HostConnectivity::probe();
+        let connectivity = host_connectivity(provisioner);
         if !connectivity.ipv4 {
             return Err(ProvisionError::unavailable(
                 CaptureTransportDegradationReason::NetnsStartupFailed,
@@ -303,6 +313,14 @@ mod linux {
                 ipv6: route_available("[::]:0", "[2606:4700:4700::1111]:53"),
             }
         }
+    }
+
+    fn host_connectivity(provisioner: &SystemNetworkProvisioner) -> HostConnectivity {
+        #[cfg(feature = "test-support")]
+        if let Some((ipv4, ipv6)) = provisioner.forced_host_ip_families {
+            return HostConnectivity { ipv4, ipv6 };
+        }
+        HostConnectivity::probe()
     }
 
     fn route_available(bind: &str, destination: &str) -> bool {
