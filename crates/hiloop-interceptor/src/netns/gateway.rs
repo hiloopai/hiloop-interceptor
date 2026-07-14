@@ -58,8 +58,8 @@ use crate::{
 use super::{
     AdmittedTcpFlow, AuthorizedRoute, DataplaneClosed, DirectTcpConnector, DnsAnswerTracker,
     DnsRelayClient, FatalReport, GatewayDnsRelay, GatewayFatalController, GatewayWorkerBootstrap,
-    IngressError, NetworkCapture, RequestAuthorityRejection, SecretRoute, TcpProtocol,
-    TlsPolicyEngine, TlsPolicyFlow, TlsTransportDecision, TransparentTcpIngress,
+    IngressError, NamespaceCommand, NetworkCapture, RequestAuthorityRejection, SecretRoute,
+    TcpProtocol, TlsPolicyEngine, TlsPolicyFlow, TlsTransportDecision, TransparentTcpIngress,
     TransparentUdpChildSink, TransparentUdpIngress, UdpFlowRelay, UdpIngressError,
     classifier::HTTP2_PREFACE,
     classify_client_handshake_error, connect_authorized,
@@ -130,6 +130,104 @@ struct SecretBindingWire {
     scheme: String,
 }
 
+impl GatewayConfig {
+    pub(super) fn from_options(
+        options: &RunOptions,
+        event_socket: PathBuf,
+        ca_bundle: PathBuf,
+        blob_dir: PathBuf,
+    ) -> Self {
+        Self {
+            context: options.context().clone(),
+            attributes: options.attributes().clone(),
+            event_socket,
+            ca_bundle,
+            blob_dir,
+            max_capture_bytes: options.max_capture_bytes(),
+            redaction_enabled: options.redaction().is_enabled(),
+            egress: EgressConfig::from(options.egress()),
+            anomaly: AnomalyConfigWire::from(options.anomaly()),
+            bindings: options
+                .secret_bindings()
+                .iter()
+                .map(SecretBindingWire::from)
+                .collect(),
+            broker_url: options.secret_broker().map(|broker| broker.url.clone()),
+        }
+    }
+
+    pub(super) fn worker_command(
+        &self,
+        helper: &Path,
+        broker: Option<&BrokerConfig>,
+    ) -> io::Result<NamespaceCommand> {
+        let mut command = NamespaceCommand::new(helper)
+            .arg(GATEWAY_WORKER_ROLE)
+            .env(GATEWAY_CONFIG_ENV, encode(self)?);
+        if let Some(broker) = broker {
+            command = command.env(BROKER_TOKEN_ENV, &broker.token);
+        }
+        Ok(command)
+    }
+}
+
+impl WorkloadConfig {
+    pub(super) fn from_options(
+        options: &RunOptions,
+        event_socket: PathBuf,
+        ca_bundle: PathBuf,
+    ) -> Self {
+        Self {
+            context: options.context().clone(),
+            attributes: options.attributes().clone(),
+            event_socket,
+            ca_bundle,
+            execution_id: options.execution_id().map(str::to_owned),
+            otlp: options.otlp_enabled(),
+            redaction_enabled: options.redaction().is_enabled(),
+            export_batch_size: options.export_batch_size(),
+            export_flush_interval_ms: options
+                .export_flush_interval()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
+            env_allowlist: options.env_allowlist().to_vec(),
+        }
+    }
+
+    pub(super) fn workload_command(
+        &self,
+        helper: &Path,
+        command: &[String],
+    ) -> io::Result<NamespaceCommand> {
+        let mut workload = NamespaceCommand::new(helper)
+            .arg(CAPTURED_WORKLOAD_ROLE)
+            .args(command)
+            .env(WORKLOAD_CONFIG_ENV, encode(self)?);
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            workload = workload.env_remove(name);
+        }
+        Ok(workload)
+    }
+}
+
+impl From<&EgressPolicy> for EgressConfig {
+    fn from(policy: &EgressPolicy) -> Self {
+        Self {
+            deny_by_default: policy.mode() == EgressMode::Deny,
+            domains: policy.domain_rules().to_vec(),
+            cidrs: policy.cidr_rules().collect(),
+        }
+    }
+}
+
 impl EgressConfig {
     fn build(&self) -> io::Result<EgressPolicy> {
         EgressPolicy::new(
@@ -145,6 +243,19 @@ impl EgressConfig {
     }
 }
 
+impl From<&AnomalyConfig> for AnomalyConfigWire {
+    fn from(config: &AnomalyConfig) -> Self {
+        Self {
+            enabled: config.is_enabled(),
+            block_on_match: config.blocks_on_match(),
+            min_base64_bytes: config.min_base64_bytes(),
+            base64_ratio: config.base64_ratio(),
+            max_upload_bytes: config.max_upload_bytes(),
+            suspicious_content_types: config.suspicious_content_types().to_vec(),
+        }
+    }
+}
+
 impl AnomalyConfigWire {
     fn build(&self) -> AnomalyConfig {
         if !self.enabled {
@@ -156,6 +267,18 @@ impl AnomalyConfigWire {
             .with_base64_ratio(self.base64_ratio)
             .with_max_upload_bytes(self.max_upload_bytes)
             .with_suspicious_content_types(self.suspicious_content_types.clone())
+    }
+}
+
+impl From<&SecretBinding> for SecretBindingWire {
+    fn from(binding: &SecretBinding) -> Self {
+        Self {
+            name: binding.name.clone(),
+            env_placeholder: binding.env_placeholder.clone(),
+            host: binding.host.clone(),
+            header: binding.header.clone(),
+            scheme: binding.scheme.clone(),
+        }
     }
 }
 
@@ -860,6 +983,10 @@ fn forbidden() -> Response<Body> {
         .status(StatusCode::FORBIDDEN)
         .body(Body::empty())
         .expect("static forbidden response")
+}
+
+fn encode(value: &impl Serialize) -> io::Result<String> {
+    serde_json::to_string(value).map_err(invalid_data)
 }
 
 fn decode_environment<T: serde::de::DeserializeOwned>(name: &str) -> io::Result<T> {

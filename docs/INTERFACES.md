@@ -62,8 +62,23 @@ and `payload_ref` remains empty.
 
 `NetCaptureMode` is the shared selection contract. Its exact, case-sensitive values are `auto`,
 `netns`, `proxy`, and `off`. The product CLI owns exposing that selector and combining it with run
-policy; this repository owns the provisioner and dataplane selected by it. Defining the value type
-does not make any transparent runtime available by itself.
+policy; this repository owns the provisioner and dataplane selected by it.
+
+`hiloop_interceptor::NetnsRun` is the embeddable transparent-run port. `preflight` is observation
+only and separate from `run`, so an embedding CLI can evaluate `auto` without starting the child.
+`SystemNetnsRun::new` accepts the pinned pasta path and composes the namespace provisioner,
+transparent gateway, capture pipeline, stdio/OTLP supervisor, and close-first fatal supervisor from
+the caller's `RunOptions`. `NetworkCapture` records the caller's requested mode, exact preflight
+report, selected runner, and the data needed for the once-per-run `capture.transport` event. Under
+the `test-support` feature, `netns::testing::FakeNetnsRun` implements the same port, records
+preflight/run calls, and returns a deterministic exit or error without host privileges.
+
+The transparent workload receives no proxy variables. It receives only child-scoped trust hints for
+the ephemeral interception CA, plus the same run identity and optional OTLP receiver environment as
+ordinary capture. The gateway worker owns transparent TCP classification and policy, TLS
+termination or raw splice, request-authority revalidation, HTTP capture and secret injection, DNS,
+and opaque UDP relay. Both internal roles are production dispatch paths; an embedding binary must
+call `netns::dispatch_internal_helper` before creating an async runtime.
 
 The first-connection TLS compatibility registry is a versioned interceptor configuration made of
 reviewed exact host-and-port rows. Wildcards, embedded ports, duplicates, zero ports, blank evidence
@@ -96,7 +111,7 @@ host-loopback stubs and split-DNS routing. Search/domain/options directives are 
 gateway records only the exact A/AAAA answers it successfully returned, bounded by each record's TTL
 and any shorter CNAME-chain TTL. The workload receives no setup or namespace descriptors.
 
-Tests and later dataplane work use `netns::testing::FakeNetworkProvisioner` behind the existing
+Substrate tests use `netns::testing::FakeNetworkProvisioner` behind the existing
 `test-support` feature. It implements the same production port, records lifecycle calls, and can
 script successful exits, typed fatal signals, worker failures, cleanup failures, and
 unavailable-host results without requiring Linux privileges. It also records close-dataplane,

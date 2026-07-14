@@ -235,6 +235,14 @@ impl EgressPolicy {
         self.mode
     }
 
+    pub(crate) fn domain_rules(&self) -> &[String] {
+        &self.domains
+    }
+
+    pub(crate) fn cidr_rules(&self) -> impl Iterator<Item = String> + '_ {
+        self.cidrs.iter().map(ToString::to_string)
+    }
+
     /// Whether this policy permits everything (the default, no-op policy).
     ///
     /// An allow-list with no rules denies nothing, so enforcement can be skipped
