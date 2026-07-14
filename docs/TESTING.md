@@ -90,8 +90,9 @@ HILOOP_TEST_PASTA=/path/to/pasta \
   -- --ignored
 ```
 
-That contract has an outer timeout and covers original IPv4/IPv6 destinations, private workload and
-mapped host loopback, boundary PMTU plus per-family fragment counters, capability/descriptor and
+That contract has an outer timeout and covers original IPv4/IPv6 destinations, private workload
+loopback, dual-stack mapped host loopback without gateway re-entry, boundary PMTU plus per-family
+fragment counters, capability/descriptor and
 process-inspection confinement, workload exec failure, worker and pasta crashes, explicit shutdown,
 drop cleanup, and a detached descendant. It scans `/proc` after every path so no owned helper or
 carrier remains to retain namespace, mount, veth, or nftables state.

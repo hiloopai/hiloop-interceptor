@@ -352,4 +352,27 @@ mod tests {
             "timed-out version helper {pid} remained alive"
         );
     }
+
+    #[tokio::test]
+    async fn readiness_requires_the_expected_pid_and_a_bounded_wait() {
+        let directory = tempfile::tempdir().expect("temporary readiness directory");
+        let pid_file = directory.path().join("pasta.pid");
+
+        std::fs::write(&pid_file, b"4242\n").expect("write matching pidfile");
+        wait_until_ready(&pid_file, 4_242, Duration::from_millis(50))
+            .await
+            .expect("matching pasta PID is ready");
+
+        std::fs::write(&pid_file, b"4243\n").expect("write mismatched pidfile");
+        let error = wait_until_ready(&pid_file, 4_242, Duration::from_millis(50))
+            .await
+            .expect_err("mismatched pasta PID must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        std::fs::remove_file(&pid_file).expect("remove readiness file");
+        let error = wait_until_ready(&pid_file, 4_242, Duration::from_millis(20))
+            .await
+            .expect_err("absent pasta PID must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 }

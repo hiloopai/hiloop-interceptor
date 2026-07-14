@@ -116,14 +116,24 @@ async fn real_rootless_substrate_contract() {
         preflight.diagnostic().unwrap_or("no diagnostic")
     );
 
-    let host = TcpListener::bind("127.0.0.1:0").expect("host-loopback fixture");
-    let host_port = host.local_addr().expect("host fixture address").port();
+    let host_ipv4 = TcpListener::bind("127.0.0.1:0").expect("IPv4 host-loopback fixture");
+    let host_ipv4_port = host_ipv4
+        .local_addr()
+        .expect("IPv4 host fixture address")
+        .port();
+    let host_ipv6 = TcpListener::bind("[::1]:0").expect("IPv6 host-loopback fixture");
+    let host_ipv6_port = host_ipv6
+        .local_addr()
+        .expect("IPv6 host fixture address")
+        .port();
     let fixture = thread::spawn(move || {
-        let (mut stream, _) = host.accept().expect("host fixture accept");
-        let mut request = [0_u8; 4];
-        stream.read_exact(&mut request).expect("host fixture read");
-        assert_eq!(request, *b"ping");
-        stream.write_all(b"pong").expect("host fixture response");
+        for (host, family) in [(host_ipv4, "IPv4"), (host_ipv6, "IPv6")] {
+            let (mut stream, _) = host.accept().expect("host fixture accept");
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).expect("host fixture read");
+            assert_eq!(request, *b"ping", "{family} host request");
+            stream.write_all(b"pong").expect("host fixture response");
+        }
     });
     let evidence_dir = tempfile::tempdir().expect("evidence directory");
     let evidence = evidence_dir.path().join("destinations.txt");
@@ -131,10 +141,14 @@ async fn real_rootless_substrate_contract() {
     let worker = NamespaceCommand::new(&helper).args([
         DATAPLANE_WORKER_ROLE.into(),
         evidence.clone().into_os_string(),
-        host_port.to_string().into(),
+        host_ipv4_port.to_string().into(),
+        host_ipv6_port.to_string().into(),
     ]);
-    let workload =
-        NamespaceCommand::new(&helper).args([DATAPLANE_WORKLOAD_ROLE, &host_port.to_string()]);
+    let workload = NamespaceCommand::new(&helper).args([
+        DATAPLANE_WORKLOAD_ROLE.to_owned(),
+        host_ipv4_port.to_string(),
+        host_ipv6_port.to_string(),
+    ]);
     let mut session = provisioner
         .provision(ProvisionRequest::new(workload, worker))
         .await
@@ -154,7 +168,10 @@ async fn real_rootless_substrate_contract() {
     let evidence = fs::read_to_string(evidence).expect("dataplane evidence");
     assert!(evidence.contains("ipv4=198.51.100.42:443"));
     assert!(evidence.contains("ipv6=[2001:db8::42]:443"));
-    assert!(evidence.contains(&format!("host=169.254.2.2:{host_port}")));
+    assert!(evidence.contains(&format!("host_ipv4=169.254.2.2:{host_ipv4_port}")));
+    assert!(evidence.contains(&format!(
+        "host_ipv6=[fd00:6869:6c6f:6f70:1::2]:{host_ipv6_port}"
+    )));
 
     let missing_worker = evidence_dir.path().join("missing-worker");
     let error = provisioner

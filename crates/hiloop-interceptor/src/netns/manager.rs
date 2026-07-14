@@ -1490,13 +1490,14 @@ fn set_socket_integer_option(
 
 #[cfg(feature = "test-support")]
 fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
-    use std::net::{SocketAddr, TcpStream};
+    use std::net::SocketAddr;
 
     let evidence_path = std::env::args_os()
         .nth(2)
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing evidence path"))?;
-    let host_port = parse_probe_port(3)?;
+    let host_ipv4_port = parse_probe_port(3)?;
+    let host_ipv6_port = parse_probe_port(4)?;
     let bootstrap = GatewayWorkerBootstrap::from_inherited_fds()?;
     require_empty_capabilities()?;
     let listeners = bootstrap.notify_ready()?;
@@ -1521,27 +1522,45 @@ fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
     )?;
     second.write_all(&[2])?;
 
-    let (mut host_flow, host_address) = ipv4.accept()?;
-    let host_destination = host_flow.local_addr()?;
-    require_probe_destination(
-        host_destination,
-        SocketAddr::new(parse_ipv4_address(HOST_LOOPBACK_IPV4)?, host_port),
+    let (host_ipv4_destination, host_ipv4_peer) = proxy_host_loopback(
+        &ipv4,
+        SocketAddr::new(parse_ipv4_address(HOST_LOOPBACK_IPV4)?, host_ipv4_port),
     )?;
-    let mut upstream = TcpStream::connect_timeout(&host_destination, Duration::from_secs(5))?;
-    upstream.write_all(b"ping")?;
-    let mut response = [0_u8; 4];
-    upstream.read_exact(&mut response)?;
-    host_flow.write_all(&response)?;
+    let host_ipv6_destination = format!("[{HOST_LOOPBACK_IPV6}]:{host_ipv6_port}")
+        .parse()
+        .map_err(invalid_input)?;
+    let (host_ipv6_destination, host_ipv6_peer) =
+        proxy_host_loopback(&ipv6, host_ipv6_destination)?;
 
     fs::write(
         evidence_path,
         format!(
-            "ipv4={first_destination} peer={first_address}\nipv6={second_destination} peer={second_address}\nhost={host_destination} peer={host_address}\n"
+            "ipv4={first_destination} peer={first_address}\nipv6={second_destination} peer={second_address}\nhost_ipv4={host_ipv4_destination} peer={host_ipv4_peer}\nhost_ipv6={host_ipv6_destination} peer={host_ipv6_peer}\n"
         ),
     )?;
     loop {
         raw_pause();
     }
+}
+
+#[cfg(feature = "test-support")]
+fn proxy_host_loopback(
+    listener: &std::net::TcpListener,
+    expected_destination: std::net::SocketAddr,
+) -> io::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
+    use std::net::TcpStream;
+
+    let (mut flow, peer) = listener.accept()?;
+    let destination = flow.local_addr()?;
+    require_probe_destination(destination, expected_destination)?;
+    let mut request = [0_u8; 4];
+    flow.read_exact(&mut request)?;
+    let mut upstream = TcpStream::connect_timeout(&destination, Duration::from_secs(5))?;
+    upstream.write_all(&request)?;
+    let mut response = [0_u8; 4];
+    upstream.read_exact(&mut response)?;
+    flow.write_all(&response)?;
+    Ok((destination, peer))
 }
 
 #[cfg(feature = "test-support")]
@@ -1552,7 +1571,8 @@ fn dataplane_workload_probe_entrypoint() -> io::Result<ExitCode> {
     require_only_open_fds(&[])?;
     validate_private_workload_loopback()?;
     validate_udp_mtu_and_fragments()?;
-    let host_port = parse_probe_port(2)?;
+    let host_ipv4_port = parse_probe_port(2)?;
+    let host_ipv6_port = parse_probe_port(3)?;
     let timeout = Duration::from_secs(5);
     for (destination, expected) in [("198.51.100.42:443", 1_u8), ("[2001:db8::42]:443", 2_u8)] {
         let address = destination.parse().map_err(invalid_input)?;
@@ -1568,20 +1588,30 @@ fn dataplane_workload_probe_entrypoint() -> io::Result<ExitCode> {
         }
     }
 
-    let destination = ("host.hiloop.internal", host_port)
-        .to_socket_addrs()?
-        .find(std::net::SocketAddr::is_ipv4)
-        .ok_or_else(|| io::Error::other("host.hiloop.internal has no IPv4 mapping"))?;
-    let mut stream = TcpStream::connect_timeout(&destination, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.write_all(b"request")?;
-    let mut response = [0_u8; 4];
-    stream.read_exact(&mut response)?;
-    if response != *b"pong" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "host loopback fixture returned an unexpected payload",
-        ));
+    for (port, family, family_name) in [
+        (host_ipv4_port, IpFamily::Ipv4, "IPv4"),
+        (host_ipv6_port, IpFamily::Ipv6, "IPv6"),
+    ] {
+        let destination = ("host.hiloop.internal", port)
+            .to_socket_addrs()?
+            .find(|address| match family {
+                IpFamily::Ipv4 => address.is_ipv4(),
+                IpFamily::Ipv6 => address.is_ipv6(),
+            })
+            .ok_or_else(|| {
+                io::Error::other(format!("host.hiloop.internal has no {family_name} mapping"))
+            })?;
+        let mut stream = TcpStream::connect_timeout(&destination, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.write_all(b"ping")?;
+        let mut response = [0_u8; 4];
+        stream.read_exact(&mut response)?;
+        if response != *b"pong" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{family_name} host loopback fixture returned an unexpected payload"),
+            ));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
