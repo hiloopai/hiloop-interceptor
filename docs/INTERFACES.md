@@ -70,6 +70,25 @@ reviewed exact host-and-port rows. Wildcards, embedded ports, duplicates, zero p
 or ownership, and invalid `YYYY-MM-DD` revalidation dates are rejected. Registry matching may never
 weaken restrictive-policy or secret-binding behavior.
 
+`hiloop_interceptor::netns::NetworkProvisioner` is the wrapper-local lifecycle port for the Linux
+substrate. `preflight` performs the real operations and returns the existing closed transport reason
+set; `provision` requires workload and gateway-worker commands and returns a `NetworkSession` whose
+cancellation-safe `wait` can be followed by ordered `shutdown`. Both terminal paths close the
+dataplane and reap its helpers. `SystemNetworkProvisioner` owns the user/PID/mount and two network
+namespaces, veth, nftables TPROXY rules, dual-stack policy routes, and separately executed pinned
+pasta process. Non-DNS UDP and non-intercepted L3 forwarding remain fail-closed until a supervised
+relay owns those flows. All fragmented UDP, including fragmented DNS, is dropped before the carrier.
+The cap-free gateway worker receives pre-opened transparent listeners through an internal bootstrap;
+the workload receives no setup or namespace descriptors.
+
+Tests and later dataplane work use `netns::testing::FakeNetworkProvisioner` behind the existing
+`test-support` feature. It implements the same production port, records lifecycle calls, and can
+script successful exits, worker failures, cleanup failures, and unavailable-host results without
+requiring Linux privileges. It also records close-dataplane, terminate-namespace, and reap-helper
+ordering and can fail a typed startup stage. Embedding binaries must call
+`netns::dispatch_internal_helper` before creating an async runtime so the namespace manager remains
+single-threaded across user-namespace creation and re-exec.
+
 ## Current Seams
 
 ### Source

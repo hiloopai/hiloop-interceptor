@@ -79,6 +79,28 @@ Run the fast E2E suite directly:
 cargo test -p hiloop-interceptor --test interceptor_e2e --all-features --locked
 ```
 
+The real Linux network-substrate contract is intentionally ignored on ordinary PR runners. It
+requires an unprivileged-user-namespace host whose policy permits nested network namespaces,
+nftables TPROXY, `/dev/net/tun`, and the exact pinned pasta executable. Run it on that capable lane
+with:
+
+```sh
+HILOOP_TEST_PASTA=/path/to/pasta \
+  cargo test -p hiloop-interceptor --test netns_substrate --all-features --locked \
+  -- --ignored
+```
+
+That contract has an outer timeout and covers original IPv4/IPv6 destinations, private workload and
+mapped host loopback, boundary PMTU plus per-family fragment counters, capability/descriptor and
+process-inspection confinement, workload exec failure, worker and pasta crashes, explicit shutdown,
+drop cleanup, and a detached descendant. It scans `/proc` after every path so no owned helper or
+carrier remains to retain namespace, mount, veth, or nftables state.
+
+Normal CI still runs the provisioner/fake conformance tests, exact nft and policy-route generation,
+pasta argument/version and timeout checks, capability and descriptor plans, resolver decisions,
+cleanup order, and MTU/fragment policy. A skipped real contract is not evidence that the host
+substrate works.
+
 ### Nightly
 
 Nightly tests should add workloads that are too slow or timing-sensitive for every PR:
