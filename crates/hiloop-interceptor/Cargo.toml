@@ -64,6 +64,7 @@ tonic-prost-build.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 # The streaming-request proxy tests drive real HTTP/2 bidi exchanges through the
 # full proxy — client and upstream legs — needing hyper's h2 client/server conn APIs.
 hyper = { workspace = true, features = ["client", "http2"] }

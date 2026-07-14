@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use hiloop_core::capture::{CaptureContractError, OriginalDestination, TlsFlowIdentity};
+
 /// Maximum prefix inspected before classification fails closed.
 pub(super) const MAX_CLASSIFICATION_BYTES: usize = 64 * 1024;
 
@@ -65,6 +67,19 @@ impl ClientHelloIdentity {
     /// Whether the `ClientHello` carried the encrypted-client-hello extension.
     pub fn encrypted_client_hello(&self) -> bool {
         self.encrypted_client_hello
+    }
+
+    /// Build the ratified TLS event identity for an authoritative destination.
+    pub fn flow_identity(
+        &self,
+        destination: OriginalDestination,
+    ) -> Result<TlsFlowIdentity, CaptureContractError> {
+        let mut identity =
+            TlsFlowIdentity::new(destination).with_client_hello_fingerprint(&self.fingerprint)?;
+        if let Some(server_name) = &self.server_name {
+            identity = identity.with_server_name(server_name)?;
+        }
+        Ok(identity)
     }
 }
 
@@ -526,6 +541,8 @@ impl<'a> TlsReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     const ECH_EXTENSION: u16 = 0xfe0d;
@@ -596,6 +613,39 @@ mod tests {
         assert_eq!(identity.server_name(), Some("api.example.com"));
         assert!(identity.fingerprint().starts_with("ch1:"));
         assert!(!identity.encrypted_client_hello());
+        let destination = OriginalDestination::new("203.0.113.10".parse().expect("test IP"), 443)
+            .expect("test destination");
+        let flow = identity
+            .flow_identity(destination)
+            .expect("W1 flow identity");
+        assert_eq!(flow.destination(), destination);
+        assert_eq!(flow.server_name(), Some("api.example.com"));
+        assert_eq!(
+            flow.client_hello_fingerprint(),
+            Some(identity.fingerprint())
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn fingerprint_is_stable_for_arbitrary_cipher_order_and_grease(
+            suites in prop::collection::vec(any::<u16>(), 1..24)
+        ) {
+            let suites = suites
+                .into_iter()
+                .filter(|suite| !is_grease(*suite))
+                .collect::<Vec<_>>();
+            prop_assume!(!suites.is_empty());
+            let mut first = suites.clone();
+            first.push(0x1a1a);
+            let mut second = suites;
+            second.reverse();
+            second.push(0x4a4a);
+            let first = tls_record(&client_hello("api.example.com", &first, vec![]));
+            let second = tls_record(&client_hello("api.example.com", &second, vec![]));
+
+            prop_assert_eq!(fingerprint(&first), fingerprint(&second));
+        }
     }
 
     #[test]

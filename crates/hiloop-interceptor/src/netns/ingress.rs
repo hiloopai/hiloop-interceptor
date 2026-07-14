@@ -109,12 +109,9 @@ impl AdmittedTcpFlow {
         let TcpProtocol::TlsClientHello(hello) = &self.protocol else {
             return Ok(None);
         };
-        let mut identity = TlsFlowIdentity::new(self.route.original_destination())
-            .with_client_hello_fingerprint(hello.fingerprint())?;
-        if let Some(server_name) = hello.server_name() {
-            identity = identity.with_server_name(server_name)?;
-        }
-        Ok(Some(identity))
+        hello
+            .flow_identity(self.route.original_destination())
+            .map(Some)
     }
 }
 
