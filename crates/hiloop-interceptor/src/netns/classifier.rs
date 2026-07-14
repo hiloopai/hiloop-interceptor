@@ -417,7 +417,7 @@ fn normalize_u16_values(values: Vec<u16>) -> Vec<u16> {
 }
 
 fn is_grease(value: u16) -> bool {
-    value & 0x0f0f == 0x0a0a
+    value & 0x0f0f == 0x0a0a && value >> 8 == value & 0xff
 }
 
 fn append_u16_set(bytes: &mut Vec<u8>, tag: u8, values: &[u16]) -> Result<(), ClassificationError> {
@@ -693,6 +693,22 @@ mod tests {
         let second = tls_record(&client_hello(
             "api.example.com",
             &[0x1302],
+            vec![extension(0, server_name("api.example.com"))],
+        ));
+
+        assert_ne!(fingerprint(&first), fingerprint(&second));
+    }
+
+    #[test]
+    fn fingerprint_preserves_values_outside_the_exact_grease_set() {
+        let first = tls_record(&client_hello(
+            "api.example.com",
+            &[0x1301],
+            vec![extension(0, server_name("api.example.com"))],
+        ));
+        let second = tls_record(&client_hello(
+            "api.example.com",
+            &[0x1301, 0x0a1a],
             vec![extension(0, server_name("api.example.com"))],
         ));
 
