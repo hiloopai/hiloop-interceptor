@@ -22,6 +22,10 @@ use hiloop_core::capture::CaptureTransportDegradationReason;
 use nix::libc;
 use tempfile::NamedTempFile;
 
+use super::gateway::{
+    CAPTURED_WORKLOAD_ROLE, GATEWAY_WORKER_ROLE, captured_workload_entrypoint,
+    gateway_worker_entrypoint,
+};
 use super::{
     FatalReport, FragmentedUdpBehavior, NamespaceCommand, StartupStage, SubstrateExit,
     SubstrateInfo,
@@ -81,6 +85,8 @@ pub(super) fn dispatch_from_args() -> Option<io::Result<ExitCode>> {
         Some(WORKLOAD_ROLE) => Some(workload_entrypoint()),
         Some(WORKER_PROBE_ROLE) => Some(worker_probe_entrypoint()),
         Some(WORKLOAD_PROBE_ROLE) => Some(workload_probe_entrypoint()),
+        Some(GATEWAY_WORKER_ROLE) => Some(gateway_worker_entrypoint()),
+        Some(CAPTURED_WORKLOAD_ROLE) => Some(captured_workload_entrypoint()),
         #[cfg(feature = "test-support")]
         Some(DATAPLANE_WORKER_PROBE_ROLE) => Some(dataplane_worker_probe_entrypoint()),
         #[cfg(feature = "test-support")]

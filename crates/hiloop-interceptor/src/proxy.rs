@@ -185,6 +185,15 @@ impl ProxyCa {
     pub fn cert_pem(&self) -> &str {
         &self.cert_pem
     }
+
+    pub(crate) fn server_config_for(
+        &self,
+        authority: &str,
+    ) -> Result<Arc<ServerConfig>, ProxyError> {
+        let authority = Authority::try_from(authority)
+            .map_err(|error| ProxyError::Server(error.to_string()))?;
+        Ok(self.authority.server_config(&authority))
+    }
 }
 
 struct ProxyAuthority {
@@ -337,7 +346,7 @@ fn is_ca_certificate(anchor: &CertificateDer<'_>) -> bool {
 /// Build the rustls config for the proxy's upstream TLS client from
 /// [`upstream_root_store`], on the same `aws-lc-rs` provider as the rest of the
 /// proxy.
-fn upstream_client_config(
+pub(crate) fn upstream_client_config(
     extra_trust_anchors: &[CertificateDer<'static>],
 ) -> Result<ClientConfig, ProxyError> {
     ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
@@ -458,7 +467,7 @@ impl ProxyServer {
 /// exchange has an independent clone, which is the correct behavior: there is no
 /// shared mutable handler that could cross-link two in-flight exchanges.
 #[derive(Clone)]
-struct CaptureHandler {
+pub(crate) struct CaptureHandler {
     signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
     clock: Arc<HlcClock>,
     blob_store: Arc<dyn BlobStore>,
@@ -503,9 +512,9 @@ struct CaptureHandler {
 impl CaptureHandler {
     #[expect(
         clippy::too_many_arguments,
-        reason = "the handler's capture, redaction, egress, anomaly, and injection seams are each configured per run; a config struct is deferred while the only caller is the supervisor via ProxyServer::serve"
+        reason = "the cooperative proxy and transparent gateway both supply the same independent capture, policy, and injection seams"
     )]
-    fn new(
+    pub(crate) fn new(
         signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
         clock: Arc<HlcClock>,
         blob_store: Arc<dyn BlobStore>,
@@ -534,6 +543,11 @@ impl CaptureHandler {
         }
     }
 
+    pub(crate) fn with_connect_host(mut self, host: CanonicalHost) -> Self {
+        self.connect_host = Some(host);
+        self
+    }
+
     /// Enforces egress and (on a match) credential injection before capture: a CONNECT
     /// to a denied host short-circuits with `403` before any tunnel is established; a
     /// decrypted request to a denied host (or one whose `Host` disagrees with the
@@ -541,7 +555,7 @@ impl CaptureHandler {
     /// injected request fails closed with `502` so the request is never forwarded
     /// without its credential. Inherent (not the trait method) to stay testable
     /// without an `HttpContext`.
-    async fn on_request(&mut self, request: Request<Body>) -> RequestOrResponse {
+    pub(crate) async fn on_request(&mut self, request: Request<Body>) -> RequestOrResponse {
         // CONNECT only establishes the TLS tunnel; the real request arrives after
         // interception. Capture nothing here, but enforce egress on the SNI host and
         // stash it so the decrypted request can detect a Host/SNI mismatch.
@@ -880,7 +894,7 @@ impl CaptureHandler {
         redact_with_injected(self.redaction, body, &self.injected_secrets)
     }
 
-    fn on_response(&mut self, response: Response<Body>) -> Response<Body> {
+    pub(crate) fn on_response(&mut self, response: Response<Body>) -> Response<Body> {
         let (parts, body) = response.into_parts();
 
         let content_type = header_str(&parts.headers, &CONTENT_TYPE);
@@ -900,6 +914,21 @@ impl CaptureHandler {
 
         let teed = self.tee_body(RESPONSE_TEE, attributes, content_type, None, body);
         Response::from_parts(parts, teed)
+    }
+
+    pub(crate) async fn on_upstream_client_error(
+        &mut self,
+        error: hudsucker::hyper_util::client::legacy::Error,
+    ) -> Response<Body> {
+        eprintln!("hiloop-interceptor: proxy upstream request failed: {error:#}");
+        let reason = if error.is_connect() {
+            "upstream_connect_error"
+        } else {
+            "upstream_error"
+        };
+        self.on_upstream_error(reason, error_chain_message(&error))
+            .await;
+        bad_gateway()
     }
 
     /// Build a forwarded [`Body`] that streams each frame onward as it arrives
@@ -1373,15 +1402,7 @@ impl HttpHandler for CaptureHandler {
         _ctx: &HttpContext,
         error: hudsucker::hyper_util::client::legacy::Error,
     ) -> Response<Body> {
-        eprintln!("hiloop-interceptor: proxy upstream request failed: {error}");
-        let reason = if error.is_connect() {
-            "upstream_connect_error"
-        } else {
-            "upstream_error"
-        };
-        self.on_upstream_error(reason, error_chain_message(&error))
-            .await;
-        bad_gateway()
+        self.on_upstream_client_error(error).await
     }
 }
 

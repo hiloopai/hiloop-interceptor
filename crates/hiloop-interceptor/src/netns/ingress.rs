@@ -99,9 +99,13 @@ impl AdmittedTcpFlow {
         &self.protocol
     }
 
+    pub(crate) fn into_parts(self) -> (TcpStream, AuthorizedRoute, TcpProtocol) {
+        (self.client, self.route, self.protocol)
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn into_test_parts(self) -> (TcpStream, AuthorizedRoute, TcpProtocol) {
-        (self.client, self.route, self.protocol)
+        self.into_parts()
     }
 
     /// Build the W1 TLS event identity without defining a second event shape.

@@ -1,16 +1,23 @@
 #![cfg(feature = "test-support")]
 
-use std::sync::Arc;
+use std::{net::Ipv6Addr, num::NonZeroU16, path::PathBuf, sync::Arc, time::Duration};
 
 use hiloop_core::{
-    capture::{CapturePolicy, CaptureTransportDegradationReason, NetCaptureMode},
+    capture::{
+        CaptureFatalReason, CapturePolicy, CapturePreflight, CaptureTransportDegradationReason,
+        NetCaptureMode, OriginalDestination,
+    },
     identity::{Hlc, RunContext},
 };
 use hiloop_interceptor::{
-    NetnsRun, NetworkCapture, RunOptions,
+    NetnsRun, NetworkCapture, RunOptions, SystemNetnsRun,
     netns::{
-        PreflightReport,
-        testing::{FakeNetnsRun, FakeNetnsRunCall},
+        FatalReport, FragmentedUdpBehavior, PreflightReport, SubstrateExit, SubstrateInfo,
+        SystemNetworkProvisioner,
+        testing::{
+            FakeNetnsRun, FakeNetnsRunCall, FakeNetworkProvisioner, FakeProvisionerCall,
+            FakeSessionOutcome,
+        },
     },
     run,
 };
@@ -27,6 +34,21 @@ fn options(command: Vec<String>, capture: NetworkCapture) -> RunOptions {
         None,
         None,
     )
+}
+
+fn info() -> SubstrateInfo {
+    SubstrateInfo::new(
+        NonZeroU16::new(15_001).expect("port"),
+        1_500,
+        "169.254.254.1".parse().expect("gateway IPv4"),
+        "fd00:6869:6c6f:6f70::1".parse().expect("gateway IPv6"),
+        "169.254.2.2".parse().expect("host IPv4"),
+        "fd00:6869:6c6f:6f70:1::2"
+            .parse::<Ipv6Addr>()
+            .expect("host IPv6"),
+        FragmentedUdpBehavior::Drop,
+    )
+    .expect("info")
 }
 
 #[tokio::test]
@@ -110,4 +132,238 @@ fn selection_event_preserves_auto_fallback_inputs_and_strict_none_state() {
     let strict = serde_json::to_value(strict).expect("strict event");
     assert_eq!(strict["attributes"]["selected"], "none");
     assert_eq!(strict["attributes"]["capture_policy"], "secret_strict");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn system_composer_builds_the_production_worker_and_ca_only_workload_commands() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events = temp.path().join("events.jsonl");
+    let blobs = temp.path().join("blobs");
+    let (provisioner, handle) = FakeNetworkProvisioner::passing(
+        PreflightReport::passed(true),
+        info(),
+        SubstrateExit::Code(23),
+    );
+    let runner = Arc::new(SystemNetnsRun::with_provisioner(
+        Arc::new(provisioner),
+        "/fixture/hiloop-interceptor",
+    ));
+    let report = runner.preflight().await;
+    let capture = NetworkCapture::netns(NetCaptureMode::Netns, report, runner);
+    let options = RunOptions::new(
+        RunContext::new_local_root(),
+        vec!["fixture-child".to_owned(), "literal arg".to_owned()],
+        Some(events.clone()),
+        None,
+        Some(blobs),
+        true,
+        capture,
+        None,
+        None,
+    );
+
+    let code = run(&options).await.expect("composed fake run");
+    assert_eq!(
+        format!("{code:?}"),
+        format!("{:?}", std::process::ExitCode::from(23))
+    );
+
+    let calls = handle.calls();
+    assert_eq!(calls[0], FakeProvisionerCall::Preflight);
+    let FakeProvisionerCall::Provision(request) = &calls[1] else {
+        panic!("second call must provision")
+    };
+    assert_eq!(
+        request.workload().program(),
+        std::ffi::OsStr::new("/fixture/hiloop-interceptor")
+    );
+    assert_eq!(
+        request.workload().arguments(),
+        [
+            "__hiloop-netns-captured-workload",
+            "fixture-child",
+            "literal arg"
+        ]
+        .map(std::ffi::OsString::from)
+    );
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        assert_eq!(
+            request
+                .workload()
+                .environment()
+                .get(std::ffi::OsStr::new(name)),
+            Some(&None),
+            "{name} must be absent from the child"
+        );
+    }
+    assert_eq!(
+        request.gateway_worker().arguments(),
+        [std::ffi::OsString::from("__hiloop-netns-gateway-worker")]
+    );
+    assert_eq!(
+        &calls[2..],
+        [
+            FakeProvisionerCall::Wait,
+            FakeProvisionerCall::CloseDataplane,
+            FakeProvisionerCall::TerminateNamespace,
+            FakeProvisionerCall::ReapHelpers,
+        ]
+    );
+
+    let first: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(events)
+            .expect("events")
+            .lines()
+            .next()
+            .expect("transport event"),
+    )
+    .expect("event JSON");
+    assert_eq!(first["name"], "capture.transport");
+    assert_eq!(first["attributes"]["selected"], "netns");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn system_composer_preserves_close_first_fatal_order_and_durable_reason() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events = temp.path().join("fatal.jsonl");
+    let destination =
+        OriginalDestination::new("203.0.113.10".parse().expect("IP"), 443).expect("destination");
+    let report =
+        FatalReport::destination(CaptureFatalReason::SecretTransportUnsupported, destination);
+    let (provisioner, handle) = FakeNetworkProvisioner::scripted(
+        PreflightReport::passed(true),
+        info(),
+        FakeSessionOutcome::Fatal(report),
+    );
+    let runner = Arc::new(SystemNetnsRun::with_provisioner(
+        Arc::new(provisioner),
+        PathBuf::from("/fixture/hiloop-interceptor"),
+    ));
+    let preflight = runner.preflight().await;
+    let options = RunOptions::new(
+        RunContext::new_local_root(),
+        vec!["fixture-child".to_owned()],
+        Some(events.clone()),
+        None,
+        Some(temp.path().join("blobs")),
+        false,
+        NetworkCapture::netns(NetCaptureMode::Netns, preflight, runner),
+        None,
+        None,
+    );
+
+    let error = run(&options).await.expect_err("fatal result");
+    assert!(error.to_string().contains("secret_transport_unsupported"));
+    assert_eq!(
+        &handle.calls()[2..],
+        [
+            FakeProvisionerCall::Wait,
+            FakeProvisionerCall::CloseDataplane,
+            FakeProvisionerCall::TerminateNamespace,
+            FakeProvisionerCall::ReapHelpers,
+        ]
+    );
+    let last: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(events)
+            .expect("events")
+            .lines()
+            .last()
+            .expect("fatal event"),
+    )
+    .expect("event JSON");
+    assert_eq!(last["name"], "capture.fatal");
+    assert_eq!(last["attributes"]["reason"], "secret_transport_unsupported");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires unprivileged user/net/PID namespaces, nft TPROXY, /dev/net/tun, curl, and pinned pasta"]
+async fn real_system_composer_captures_cleartext_http_without_proxy_environment() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let pasta = std::env::var_os("HILOOP_TEST_PASTA")
+        .map(PathBuf::from)
+        .expect("set HILOOP_TEST_PASTA to the pinned pasta binary");
+    let helper = PathBuf::from(env!("CARGO_BIN_EXE_hiloop-interceptor"));
+    let provisioner = SystemNetworkProvisioner::new(&pasta)
+        .expect("system provisioner")
+        .with_helper_executable(&helper);
+    let runner = Arc::new(SystemNetnsRun::with_provisioner(
+        Arc::new(provisioner),
+        &helper,
+    ));
+    let preflight = runner.preflight().await;
+    assert_eq!(
+        preflight.result(),
+        CapturePreflight::Passed,
+        "{}",
+        preflight.diagnostic().unwrap_or("preflight failed")
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("host HTTP fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    let fixture = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("fixture accept");
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 1024];
+            let length = stream.read(&mut buffer).await.expect("fixture read");
+            request.extend_from_slice(&buffer[..length]);
+            if length == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .expect("fixture response");
+    });
+
+    let temp = tempfile::tempdir().expect("capture directory");
+    let events = temp.path().join("events.jsonl");
+    let options = RunOptions::new(
+        RunContext::new_local_root(),
+        vec![
+            "curl".to_owned(),
+            "--fail".to_owned(),
+            "--silent".to_owned(),
+            format!("http://169.254.2.2:{port}/"),
+        ],
+        Some(events.clone()),
+        None,
+        Some(temp.path().join("blobs")),
+        false,
+        NetworkCapture::netns(NetCaptureMode::Netns, preflight, runner),
+        None,
+        None,
+    );
+    let code = tokio::time::timeout(Duration::from_secs(90), run(&options))
+        .await
+        .expect("composed run timed out")
+        .expect("composed run");
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    fixture.await.expect("fixture task");
+
+    let event_names = std::fs::read_to_string(events)
+        .expect("events")
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("event JSON")["name"].clone()
+        })
+        .collect::<Vec<_>>();
+    assert!(event_names.contains(&serde_json::Value::String("http.request".to_owned())));
+    assert!(event_names.contains(&serde_json::Value::String("http.response".to_owned())));
 }

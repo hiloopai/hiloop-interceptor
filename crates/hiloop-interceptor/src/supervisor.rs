@@ -105,7 +105,7 @@ const SYSTEM_CA_BUNDLE_CANDIDATES: &[&str] = &[
 
 /// Read the OS public-root CA bundle the wrapped child would otherwise trust, honoring
 /// an explicit `SSL_CERT_FILE` first, then the well-known paths. `None` if none exist.
-fn read_system_ca_roots() -> Option<Vec<u8>> {
+pub(crate) fn read_system_ca_roots() -> Option<Vec<u8>> {
     if let Some(path) = std::env::var_os("SSL_CERT_FILE")
         && let Ok(bytes) = std::fs::read(&path)
         && !bytes.is_empty()
@@ -125,7 +125,7 @@ fn read_system_ca_roots() -> Option<Vec<u8>> {
 /// Build the child-scoped trust bundle: the OS public roots unioned with the interception
 /// CA, so the child validates both public hosts and the TLS-terminating proxy. The public
 /// roots come first, newline-separated from the appended interception CA.
-fn union_ca_bundle(system_roots: Option<&[u8]>, interception_ca_pem: &str) -> Vec<u8> {
+pub(crate) fn union_ca_bundle(system_roots: Option<&[u8]>, interception_ca_pem: &str) -> Vec<u8> {
     let mut bundle = Vec::new();
     if let Some(roots) = system_roots {
         bundle.extend_from_slice(roots);
@@ -249,6 +249,7 @@ pub struct RunOptions {
     secret_broker: Option<BrokerConfig>,
     verbose_diagnostics: bool,
     env_allowlist: Vec<String>,
+    ca_bundle: Option<PathBuf>,
 }
 
 impl RunOptions {
@@ -318,6 +319,7 @@ impl RunOptions {
             secret_broker: None,
             verbose_diagnostics: false,
             env_allowlist: Vec::new(),
+            ca_bundle: None,
         }
     }
 
@@ -450,6 +452,96 @@ impl RunOptions {
         self.env_allowlist = env_allowlist;
         self
     }
+
+    pub(crate) fn with_ca_bundle(mut self, ca_bundle: PathBuf) -> Self {
+        self.ca_bundle = Some(ca_bundle);
+        self
+    }
+
+    pub(crate) fn with_attributes(mut self, attributes: Attributes) -> Self {
+        self.attributes = attributes;
+        self
+    }
+
+    pub(crate) fn context(&self) -> &RunContext {
+        &self.context
+    }
+
+    pub(crate) fn command(&self) -> &[String] {
+        &self.command
+    }
+
+    pub(crate) fn events_jsonl(&self) -> Option<&Path> {
+        self.events_jsonl.as_deref()
+    }
+
+    pub(crate) fn raw_jsonl(&self) -> Option<&Path> {
+        self.raw_jsonl.as_deref()
+    }
+
+    pub(crate) fn blob_dir(&self) -> Option<&Path> {
+        self.blob_dir.as_deref()
+    }
+
+    pub(crate) fn otlp_enabled(&self) -> bool {
+        self.otlp
+    }
+
+    pub(crate) fn max_capture_bytes(&self) -> Option<u64> {
+        self.max_capture_bytes
+    }
+
+    pub(crate) fn grpc_export(&self) -> Option<&GrpcExportOptions> {
+        self.export_grpc.as_ref()
+    }
+
+    pub(crate) fn export_batch_size(&self) -> usize {
+        self.export_batch_size
+    }
+
+    pub(crate) fn export_flush_interval(&self) -> Option<Duration> {
+        self.export_flush_interval
+    }
+
+    pub(crate) fn blob_drain_retry(&self) -> &DrainRetryPolicy {
+        &self.blob_drain_retry
+    }
+
+    pub(crate) fn attributes(&self) -> &Attributes {
+        &self.attributes
+    }
+
+    pub(crate) fn redaction(&self) -> RedactionPolicy {
+        self.redaction
+    }
+
+    pub(crate) fn egress(&self) -> &EgressPolicy {
+        &self.egress
+    }
+
+    pub(crate) fn anomaly(&self) -> &AnomalyConfig {
+        &self.anomaly
+    }
+
+    pub(crate) fn secret_bindings(&self) -> &[SecretBinding] {
+        &self.secret_bindings
+    }
+
+    pub(crate) fn secret_broker(&self) -> Option<&BrokerConfig> {
+        self.secret_broker.as_ref()
+    }
+
+    pub(crate) fn execution_id(&self) -> Option<&str> {
+        self.execution_id.as_deref()
+    }
+
+    pub(crate) fn env_allowlist(&self) -> &[String] {
+        &self.env_allowlist
+    }
+
+    pub(crate) fn network_capture(&self) -> &NetworkCapture {
+        &self.network_capture
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +605,19 @@ impl ChildEnv {
         // interception bundle (OS public roots unioned with the proxy CA — see
         // `union_ca_bundle`), so the child trusts both public hosts and the proxy
         // without us mutating the on-disk system trust store.
+        let ca = ca_path.as_os_str().to_owned();
+        for var in [
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ] {
+            self.vars.push((var.into(), ca.clone()));
+        }
+    }
+
+    fn set_ca_bundle(&mut self, ca_path: &Path) {
         let ca = ca_path.as_os_str().to_owned();
         for var in [
             "SSL_CERT_FILE",
@@ -841,6 +946,8 @@ where
             .local_addr()
             .context("failed to read proxy server address")?;
         child_env.set_proxy(addr, file.path());
+    } else if let Some(ca_bundle) = &options.ca_bundle {
+        child_env.set_ca_bundle(ca_bundle);
     }
     child_env.apply_to(&mut command);
 
@@ -1253,6 +1360,21 @@ where
         exit_code: exit_u8_from_status(status),
         drain_warnings,
     })
+}
+
+pub(crate) async fn run_captured_with_exporter<E>(
+    options: &RunOptions,
+    exporter: &E,
+) -> Result<ExitCode>
+where
+    E: Exporter,
+{
+    if options.command.is_empty() {
+        bail!("no command given; usage: hiloop-interceptor run -- <cmd> [args...]");
+    }
+    Box::pin(run_captured(options, exporter, None, None))
+        .await
+        .map(CapturedRun::into_exit_code)
 }
 
 /// Render an incomplete or lossy drain outcome as the run's drain warning, or `None` when
@@ -2439,6 +2561,33 @@ mod tests {
             vars.get("HTTPS_PROXY").map(String::as_str),
             Some("http://127.0.0.1:8080")
         );
+    }
+
+    #[test]
+    fn ca_only_hints_do_not_add_proxy_environment() {
+        let mut env = ChildEnv::for_run(&RunContext::new_local_root(), None);
+        env.set_ca_bundle(Path::new("/tmp/hiloop-ca.pem"));
+        let vars = env
+            .vars()
+            .iter()
+            .map(|(key, value)| (key.to_string_lossy(), value.to_string_lossy()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        for key in [
+            "SSL_CERT_FILE",
+            "REQUESTS_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ] {
+            assert_eq!(
+                vars.get(key).map(std::convert::AsRef::as_ref),
+                Some("/tmp/hiloop-ca.pem")
+            );
+        }
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            assert!(!vars.contains_key(key));
+        }
     }
 
     #[test]

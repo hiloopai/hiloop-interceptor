@@ -59,14 +59,16 @@ streamed frame-by-frame into a content-addressed blob store (`--blob-dir`), so e
 cargo run -p hiloop-interceptor -- run --proxy --events-jsonl ./events.jsonl --blob-dir ./blobs -- <harness command>
 ```
 
-> **Cooperative capture, not transparent interception.** The proxy injects proxy + CA-trust env vars
+> **The `--proxy` CLI mode is cooperative capture.** It injects proxy + CA-trust env vars
 > (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`) into
 > the wrapped child only — it never touches the machine root trust store. So it decrypts HTTPS for
 > clients that honor the proxy env and trust the injected CA (Node, Python `requests`, `curl`, and most
 > SDKs — Claude Code, for one, is captured fully). It does **not** capture certificate-pinned clients,
 > mTLS, clients with a hardcoded trust store, or clients that ignore the proxy env. Guaranteed,
-> client-agnostic capture needs kernel-level interception (eBPF) and belongs to the sandbox runtime,
-> not this laptop-side wrapper — see
+> client-agnostic capture needs a transparent transport. Embedding products can select the library's
+> Linux network-namespace transport through `NetnsRun`; the public CLI intentionally exposes only
+> this portable cooperative mode. See [the interface contract](./docs/INTERFACES.md#transparent-capture-contracts)
+> and
 > [`docs/decisions/0001-cooperative-capture-vs-ebpf.md`](./docs/decisions/0001-cooperative-capture-vs-ebpf.md).
 
 Add `--export-grpc <URL>` to stream captured events to a hiloop telemetry gateway over gRPC. It
