@@ -241,59 +241,105 @@ pub struct DataplaneClosed;
 
 /// Gateway-side fatal sender that reports only after the shared dataplane has drained.
 #[cfg(target_os = "linux")]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GatewayFatalController {
+    inner: Arc<GatewayFatalInner>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct GatewayFatalInner {
     latch: DataplaneLatch,
     control: tokio::net::UnixDatagram,
-    reported: std::sync::atomic::AtomicBool,
+    first_report: std::sync::Mutex<Option<FatalReport>>,
+    completion: watch::Sender<Option<Result<(), GatewayFatalError>>>,
 }
 
 #[cfg(target_os = "linux")]
 impl GatewayFatalController {
     /// Clone the namespace-manager broker without taking it away from the UDP reply seam.
+    ///
+    /// This constructor must run inside a Tokio runtime with I/O enabled.
     pub fn new(latch: DataplaneLatch, broker: &UnixDatagram) -> std::io::Result<Self> {
         let control = broker.try_clone()?;
         control.set_nonblocking(true)?;
+        let (completion, _) = watch::channel(None);
         Ok(Self {
-            latch,
-            control: tokio::net::UnixDatagram::from_std(control)?,
-            reported: std::sync::atomic::AtomicBool::new(false),
+            inner: Arc::new(GatewayFatalInner {
+                latch,
+                control: tokio::net::UnixDatagram::from_std(control)?,
+                first_report: std::sync::Mutex::new(None),
+                completion,
+            }),
         })
     }
 
     /// Latch and drain all application work, then send the first fatal report to the manager.
     pub async fn trigger(&self, report: &FatalReport) -> Result<(), GatewayFatalError> {
-        let first = !self
-            .reported
-            .swap(true, std::sync::atomic::Ordering::AcqRel);
-        self.latch.close().await;
-        if !first {
-            return Ok(());
-        }
-        let frame = encode_gateway_fatal(report)?;
-        let sent = self.control.send(&frame).await?;
-        if sent != frame.len() {
-            return Err(GatewayFatalError::PartialDatagram {
-                expected: frame.len(),
-                actual: sent,
+        let first = {
+            let mut first_report = self
+                .inner
+                .first_report
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if first_report.is_none() {
+                *first_report = Some(report.clone());
+                true
+            } else {
+                false
+            }
+        };
+        let mut completion = self.inner.completion.subscribe();
+        if first {
+            let inner = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                let result = send_first_fatal(&inner).await;
+                inner.completion.send_replace(Some(result));
             });
         }
-        Ok(())
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result;
+            }
+            if completion.changed().await.is_err() {
+                return Err(GatewayFatalError::CompletionClosed);
+            }
+        }
     }
 
     /// Shared latch that accept loops and active flows must use for admission.
     pub fn latch(&self) -> &DataplaneLatch {
-        &self.latch
+        &self.inner.latch
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn send_first_fatal(inner: &GatewayFatalInner) -> Result<(), GatewayFatalError> {
+    inner.latch.close().await;
+    let report = inner
+        .first_report
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or(GatewayFatalError::MissingFirstReport)?;
+    let frame = encode_gateway_fatal(&report)?;
+    let sent = inner.control.send(&frame).await?;
+    if sent != frame.len() {
+        return Err(GatewayFatalError::PartialDatagram {
+            expected: frame.len(),
+            actual: sent,
+        });
+    }
+    Ok(())
 }
 
 /// Failure to report a fatal cause after the local dataplane was already closed.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum GatewayFatalError {
     /// The private manager channel failed after the latch closed.
     #[error("send gateway fatal report: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] Arc<std::io::Error>),
     /// A Unix datagram did not preserve its required atomic write.
     #[error("gateway fatal datagram was partially sent: {actual}/{expected} bytes")]
     PartialDatagram {
@@ -302,12 +348,31 @@ pub enum GatewayFatalError {
         /// Bytes accepted by the socket.
         actual: usize,
     },
+    /// The internally owned first-cause state was unexpectedly absent.
+    #[error("gateway fatal controller lost its first report")]
+    MissingFirstReport,
+    /// The internally owned report task ended without publishing a result.
+    #[error("gateway fatal controller completion channel closed")]
+    CompletionClosed,
+}
+
+#[cfg(target_os = "linux")]
+impl From<std::io::Error> for GatewayFatalError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(Arc::new(error))
+    }
 }
 
 /// Terminal nonzero result preserved independently of capture-event delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FatalRunResult {
     reason: CaptureFatalReason,
+}
+
+impl std::fmt::Display for FatalRunResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(formatter)
+    }
 }
 
 impl FatalRunResult {
@@ -324,11 +389,10 @@ impl FatalRunResult {
 
 /// Completed fatal transition, including any loud teardown or durability failure.
 #[derive(Debug, Error)]
-#[error("transparent capture run failed fatally: {result_reason}")]
+#[error("transparent capture run failed fatally: {result}")]
 pub struct FatalRunError {
     result: FatalRunResult,
-    result_reason: CaptureFatalReason,
-    teardown_error: Option<ProvisionError>,
+    substrate_error: Option<ProvisionError>,
     persistence_error: Option<ExportError>,
 }
 
@@ -348,9 +412,9 @@ impl FatalRunError {
         self.persistence_error.is_none()
     }
 
-    /// Ordered substrate teardown failure, if cleanup could not remove every resource.
-    pub fn teardown_error(&self) -> Option<&ProvisionError> {
-        self.teardown_error.as_ref()
+    /// Underlying worker failure or ordered-cleanup failure, when present.
+    pub fn substrate_error(&self) -> Option<&ProvisionError> {
+        self.substrate_error.as_ref()
     }
 
     /// Fatal-event export or flush failure, if durability could not be established.
@@ -417,8 +481,8 @@ impl FatalRunSupervisor {
                 report,
                 cleanup_diagnostic,
             }) => {
-                let teardown_error = cleanup_diagnostic.map(ProvisionError::cleanup);
-                Err(self.persist(report, teardown_error).await.into())
+                let substrate_error = cleanup_diagnostic.map(ProvisionError::cleanup);
+                Err(self.persist(report, substrate_error).await.into())
             }
             Err(error @ ProvisionError::Dataplane { .. }) => Err(self
                 .persist(
@@ -437,14 +501,14 @@ impl FatalRunSupervisor {
         session: &mut dyn NetworkSession,
         report: FatalReport,
     ) -> FatalRunError {
-        let teardown_error = session.shutdown().await.err();
-        self.persist(report, teardown_error).await
+        let substrate_error = session.shutdown().await.err();
+        self.persist(report, substrate_error).await
     }
 
     async fn persist(
         &self,
         report: FatalReport,
-        teardown_error: Option<ProvisionError>,
+        substrate_error: Option<ProvisionError>,
     ) -> FatalRunError {
         let result = FatalRunResult {
             reason: report.reason(),
@@ -456,8 +520,7 @@ impl FatalRunSupervisor {
         };
         FatalRunError {
             result,
-            result_reason: result.reason(),
-            teardown_error,
+            substrate_error,
             persistence_error,
         }
     }

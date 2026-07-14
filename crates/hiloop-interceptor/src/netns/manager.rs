@@ -1774,8 +1774,6 @@ fn fatal_worker_probe_entrypoint() -> io::Result<ExitCode> {
     require_empty_capabilities()?;
     let listeners = bootstrap.notify_ready()?;
     let (_, _, _, _, broker) = listeners.into_parts();
-    let latch = DataplaneLatch::new();
-    let controller = GatewayFatalController::new(latch, &broker)?;
     let destination = OriginalDestination::new("203.0.113.10".parse().map_err(invalid_input)?, 443)
         .map_err(invalid_input)?;
     let flow = TlsFlowIdentity::new(destination)
@@ -1784,14 +1782,19 @@ fn fatal_worker_probe_entrypoint() -> io::Result<ExitCode> {
         .with_client_hello_fingerprint("ja4:fatal-probe")
         .map_err(invalid_input)?;
     thread::sleep(Duration::from_millis(200));
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
-        .build()?
-        .block_on(controller.trigger(&FatalReport::tls(
-            CaptureFatalReason::SecretBindUnterminatable,
-            flow,
-        )))
-        .map_err(io::Error::other)?;
+        .build()?;
+    runtime.block_on(async {
+        let controller = GatewayFatalController::new(DataplaneLatch::new(), &broker)?;
+        controller
+            .trigger(&FatalReport::tls(
+                CaptureFatalReason::SecretBindUnterminatable,
+                flow,
+            ))
+            .await
+            .map_err(io::Error::other)
+    })?;
     loop {
         raw_pause();
     }

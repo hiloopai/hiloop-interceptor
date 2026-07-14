@@ -384,3 +384,34 @@ async fn gateway_controller_drains_the_latch_before_reporting_fatality() {
     let mut frame = [0_u8; 4 * 1024];
     assert!(manager.recv(&mut frame).await.expect("manager report") > 1);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancelling_a_trigger_waiter_cannot_strand_the_closed_dataplane() {
+    use std::os::unix::net::UnixDatagram;
+
+    let (manager, worker) = UnixDatagram::pair().expect("private control pair");
+    manager.set_nonblocking(true).expect("nonblocking manager");
+    let manager = tokio::net::UnixDatagram::from_std(manager).expect("async manager");
+    let controller =
+        GatewayFatalController::new(DataplaneLatch::new(), &worker).expect("fatal controller");
+    let waiter = {
+        let controller = controller.clone();
+        tokio::spawn(async move {
+            controller
+                .trigger(&tls_report(CaptureFatalReason::SecretRouteAmbiguous))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    waiter.abort();
+
+    let mut frame = [0_u8; 4 * 1024];
+    let received =
+        tokio::time::timeout(std::time::Duration::from_secs(1), manager.recv(&mut frame))
+            .await
+            .expect("internally owned report task timed out")
+            .expect("manager report");
+    assert!(received > 1);
+    assert!(controller.latch().is_closed());
+}
