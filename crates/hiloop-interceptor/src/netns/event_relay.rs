@@ -1,19 +1,16 @@
 //! Private event relay between namespace-scoped capture processes and the host exporter.
 
-#[cfg(test)]
-use std::sync::Arc;
-use std::{io, path::Path};
+use std::{io, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use hiloop_core::event::Event;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
-    net::UnixStream,
+    net::{UnixListener, UnixStream},
     sync::Mutex,
+    task::JoinSet,
 };
-#[cfg(test)]
-use tokio::{net::UnixListener, task::JoinSet};
 
 use crate::seams::{ExportError, Exporter};
 
@@ -104,13 +101,11 @@ impl Exporter for EventRelayExporter {
 }
 
 /// Host-side relay listener that serializes namespace event delivery through one exporter.
-#[cfg(test)]
 pub(super) struct EventRelayServer {
     listener: UnixListener,
     exporter: Arc<dyn Exporter>,
 }
 
-#[cfg(test)]
 impl std::fmt::Debug for EventRelayServer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -119,7 +114,6 @@ impl std::fmt::Debug for EventRelayServer {
     }
 }
 
-#[cfg(test)]
 impl EventRelayServer {
     pub(super) fn bind(path: &Path, exporter: Arc<dyn Exporter>) -> io::Result<Self> {
         Ok(Self {
@@ -150,7 +144,6 @@ impl EventRelayServer {
     }
 }
 
-#[cfg(test)]
 async fn serve_connection(mut stream: UnixStream, exporter: Arc<dyn Exporter>) -> io::Result<()> {
     loop {
         let request = match read_frame(&mut stream).await {

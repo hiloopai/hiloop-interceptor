@@ -32,6 +32,7 @@ thresholds.
 | B18 | With capture enabled, a child that fails to spawn is still captured: the wrapper exports one `process.spawn_failed` `exec` event (attempted argv, working directory, OS error, run identity and static attributes including `execution.id`) before the spawn error propagates — full capture includes failed attempts. | Mock-harness E2E + supervisor unit test |
 | B19 | Every event the wrapper exports — including out-of-band records built outside the pipeline (`capture.drain`, `process.spawn_failed`) — carries `wrapper.invocation_id`, a ULID minted once per wrap invocation at `RunOptions` construction; sequential invocations in one process mint distinct ids. Producer-minted join keys are globally unique: `http.exchange_id` is a minted ULID, never a process-local counter, so invocations sharing one run cannot collide. | Full-surface mock-harness E2E + public-run-API test + supervisor/proxy unit tests |
 | B20 | A telemetry-gateway outage never aborts capture and never blocks the child: gRPC export failures are classified — transient (`UNAVAILABLE`, `RESOURCE_EXHAUSTED`, transport) park the batch in a bounded in-memory spool (event + byte caps; over-cap drops oldest, counted) redelivered strictly in arrival order under bounded exponential backoff; permanent rejections (`INVALID_ARGUMENT`, `PERMISSION_DENIED`, `UNAUTHENTICATED`) drop that batch immediately with a loud warning; anything else gets one inline retry, then spools. Local sinks (JSONL) keep capturing regardless. At run end the spool drains best-effort within a bounded budget; loss and undelivered backlog are reported with counts on stderr and on the `capture.drain` record (`capture.events.dropped`/`rejected`/`pending`), which every gRPC-exported run emits. | Spool unit tests + gRPC classification tests + gateway-outage mock-harness E2E |
+| B21 | Transparent composition exposes preflight separately, never starts a strict-mode child after failed preflight, strips proxy variables, supplies CA-only trust hints, emits `capture.transport`, and preserves close-first fatal teardown. | Public netns-run API tests with deterministic fakes; ignored capable-host HTTP E2E |
 
 These are desired contracts, not incidental implementation details. Changing one requires an
 explicit design decision and updated tests.
@@ -87,6 +88,15 @@ with:
 ```sh
 HILOOP_TEST_PASTA=/path/to/pasta \
   cargo test -p hiloop-interceptor --test netns_substrate --all-features --locked \
+  -- --ignored
+```
+
+The same capable lane runs the production composer through a real cleartext HTTP request and asserts
+that the transparent gateway emits request and response capture:
+
+```sh
+HILOOP_TEST_PASTA=/path/to/pasta \
+  cargo test -p hiloop-interceptor --test netns_run_api --all-features --locked \
   -- --ignored
 ```
 

@@ -462,6 +462,86 @@ impl RunOptions {
         self.attributes = attributes;
         self
     }
+
+    pub(crate) fn context(&self) -> &RunContext {
+        &self.context
+    }
+
+    pub(crate) fn command(&self) -> &[String] {
+        &self.command
+    }
+
+    pub(crate) fn events_jsonl(&self) -> Option<&Path> {
+        self.events_jsonl.as_deref()
+    }
+
+    pub(crate) fn raw_jsonl(&self) -> Option<&Path> {
+        self.raw_jsonl.as_deref()
+    }
+
+    pub(crate) fn blob_dir(&self) -> Option<&Path> {
+        self.blob_dir.as_deref()
+    }
+
+    pub(crate) fn otlp_enabled(&self) -> bool {
+        self.otlp
+    }
+
+    pub(crate) fn max_capture_bytes(&self) -> Option<u64> {
+        self.max_capture_bytes
+    }
+
+    pub(crate) fn grpc_export(&self) -> Option<&GrpcExportOptions> {
+        self.export_grpc.as_ref()
+    }
+
+    pub(crate) fn export_batch_size(&self) -> usize {
+        self.export_batch_size
+    }
+
+    pub(crate) fn export_flush_interval(&self) -> Option<Duration> {
+        self.export_flush_interval
+    }
+
+    pub(crate) fn blob_drain_retry(&self) -> &DrainRetryPolicy {
+        &self.blob_drain_retry
+    }
+
+    pub(crate) fn attributes(&self) -> &Attributes {
+        &self.attributes
+    }
+
+    pub(crate) fn redaction(&self) -> RedactionPolicy {
+        self.redaction
+    }
+
+    pub(crate) fn egress(&self) -> &EgressPolicy {
+        &self.egress
+    }
+
+    pub(crate) fn anomaly(&self) -> &AnomalyConfig {
+        &self.anomaly
+    }
+
+    pub(crate) fn secret_bindings(&self) -> &[SecretBinding] {
+        &self.secret_bindings
+    }
+
+    pub(crate) fn secret_broker(&self) -> Option<&BrokerConfig> {
+        self.secret_broker.as_ref()
+    }
+
+    pub(crate) fn execution_id(&self) -> Option<&str> {
+        self.execution_id.as_deref()
+    }
+
+    pub(crate) fn env_allowlist(&self) -> &[String] {
+        &self.env_allowlist
+    }
+
+    pub(crate) fn network_capture(&self) -> &NetworkCapture {
+        &self.network_capture
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -159,6 +159,22 @@ impl AnomalyConfig {
         self.enabled && self.block_on_match
     }
 
+    pub(crate) fn min_base64_bytes(&self) -> u64 {
+        self.min_base64_bytes
+    }
+
+    pub(crate) fn base64_ratio(&self) -> f64 {
+        self.base64_ratio
+    }
+
+    pub(crate) fn max_upload_bytes(&self) -> u64 {
+        self.max_upload_bytes
+    }
+
+    pub(crate) fn suspicious_content_types(&self) -> &[String] {
+        &self.suspicious_content_types
+    }
+
     /// Reject a request whenever any rule matches, rather than only flagging it.
     #[must_use]
     pub fn with_block_on_match(mut self, block: bool) -> Self {
