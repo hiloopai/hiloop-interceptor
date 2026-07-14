@@ -190,16 +190,15 @@ impl TlsPolicyEngine {
 
     /// Select one transport action in the R1 precedence order.
     pub async fn decide(&self, flow: TlsPolicyFlow<'_>) -> TlsTransportDecision {
-        let TlsPolicyFlow::Admitted {
-            route,
-            protocol,
-            secret_route,
-        } = flow
-        else {
-            let TlsPolicyFlow::Denied(denial) = flow else {
-                return TlsTransportDecision::Denied(RouteDenial::IdentityUnavailable);
-            };
-            return TlsTransportDecision::Denied(denial.clone());
+        let (route, protocol, secret_route) = match flow {
+            TlsPolicyFlow::Denied(denial) => {
+                return TlsTransportDecision::Denied(denial.clone());
+            }
+            TlsPolicyFlow::Admitted {
+                route,
+                protocol,
+                secret_route,
+            } => (route, protocol, secret_route),
         };
 
         match self.posture {
@@ -284,20 +283,26 @@ impl TlsPolicyEngine {
     pub async fn record_handshake_failure(
         &self,
         flow: TlsPolicyFlow<'_>,
-        secret_route: SecretRoute,
         failure: HandshakeFailure,
     ) -> HandshakeFailureDecision {
-        let (route, hello) = match flow {
+        let (route, hello, secret_route) = match flow {
             TlsPolicyFlow::Admitted {
                 route,
                 protocol: TcpProtocol::TlsClientHello(hello),
-                ..
-            } => (route, hello),
-            TlsPolicyFlow::Denied(_) | TlsPolicyFlow::Admitted { .. } => {
+                secret_route,
+            } => (route, hello, secret_route),
+            TlsPolicyFlow::Admitted { secret_route, .. } => {
                 return HandshakeFailureDecision::Failed {
                     reason: TlsInterceptionFailedReason::InternalError,
                     retry_required: false,
                     fatal: self.strict_failure_fatal(secret_route),
+                };
+            }
+            TlsPolicyFlow::Denied(_) => {
+                return HandshakeFailureDecision::Failed {
+                    reason: TlsInterceptionFailedReason::InternalError,
+                    retry_required: false,
+                    fatal: None,
                 };
             }
         };
@@ -557,8 +562,7 @@ mod tests {
         );
         let failure = engine
             .record_handshake_failure(
-                fixture.admitted(),
-                SecretRoute::Unbound,
+                fixture.admitted(SecretRoute::Unbound),
                 HandshakeFailure::ClientTrustAlert(TrustAlert::UnknownCa),
             )
             .await;
@@ -600,7 +604,7 @@ mod tests {
             let engine = engine(false, &policy);
             let fixture = FlowFixture::Tls("new.example.com", 443, false).build(&policy);
             let decision = engine
-                .record_handshake_failure(fixture.admitted(), SecretRoute::Unbound, failure)
+                .record_handshake_failure(fixture.admitted(SecretRoute::Unbound), failure)
                 .await;
             assert!(!decision.retry_required());
             assert_eq!(
@@ -631,8 +635,7 @@ mod tests {
             let fixture = FlowFixture::Tls("new.example.com", 443, false).build(&policy);
             let failure = engine
                 .record_handshake_failure(
-                    fixture.admitted(),
-                    secret_route,
+                    fixture.admitted(secret_route),
                     HandshakeFailure::ClientTrustAlert(TrustAlert::CertificateUnknown),
                 )
                 .await;
@@ -811,12 +814,12 @@ mod tests {
             }
         }
 
-        fn admitted(&self) -> TlsPolicyFlow<'_> {
+        fn admitted(&self, secret_route: SecretRoute) -> TlsPolicyFlow<'_> {
             let route = self.route();
             TlsPolicyFlow::Admitted {
                 route,
                 protocol: &self.protocol,
-                secret_route: SecretRoute::Unbound,
+                secret_route,
             }
         }
 
