@@ -99,6 +99,11 @@ impl AdmittedTcpFlow {
         &self.protocol
     }
 
+    #[cfg(feature = "test-support")]
+    pub(crate) fn into_test_parts(self) -> (TcpStream, AuthorizedRoute, TcpProtocol) {
+        (self.client, self.route, self.protocol)
+    }
+
     /// Build the W1 TLS event identity without defining a second event shape.
     pub fn tls_flow_identity(&self) -> Result<Option<TlsFlowIdentity>, CaptureContractError> {
         let TcpProtocol::TlsClientHello(hello) = &self.protocol else {
