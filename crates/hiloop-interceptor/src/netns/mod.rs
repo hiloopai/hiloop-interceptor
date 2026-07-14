@@ -31,6 +31,7 @@ mod resolver;
 mod route;
 #[cfg(target_os = "linux")]
 mod routing;
+mod run;
 #[cfg(target_os = "linux")]
 mod security;
 mod system;
@@ -64,6 +65,7 @@ pub use route::{
     AuthorizedRoute, DnsAnswerEvidence, NoDnsAnswerEvidence, RouteDenial, RoutingIdentitySource,
     authorize_route,
 };
+pub use run::{NetnsRun, NetworkCapture};
 pub use system::SystemNetworkProvisioner;
 pub use tls_policy::{
     HandshakeFailure, HandshakeFailureDecision, RequestAuthorityRejection, SecretRoute,

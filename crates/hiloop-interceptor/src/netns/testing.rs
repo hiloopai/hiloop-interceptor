@@ -1,14 +1,101 @@
 //! Deterministic rootless-substrate fake for dataplane and policy tests.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    process::ExitCode,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use hiloop_core::capture::CaptureTransportDegradationReason;
 
 use super::{
-    FatalReport, NetworkProvisioner, NetworkSession, PreflightReport, ProvisionError,
+    FatalReport, NetnsRun, NetworkProvisioner, NetworkSession, PreflightReport, ProvisionError,
     ProvisionRequest, StartupStage, SubstrateExit, SubstrateInfo,
 };
+use crate::supervisor::RunOptions;
+
+/// One observable call through the composed netns-run port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeNetnsRunCall {
+    /// Host preflight was requested without starting a child.
+    Preflight,
+    /// The composed transparent run was invoked.
+    Run,
+}
+
+/// Cloneable inspection handle for [`FakeNetnsRun`].
+#[derive(Debug, Clone)]
+pub struct FakeNetnsRunHandle {
+    calls: Arc<Mutex<Vec<FakeNetnsRunCall>>>,
+}
+
+impl FakeNetnsRunHandle {
+    /// Snapshot calls in execution order.
+    pub fn calls(&self) -> Vec<FakeNetnsRunCall> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Deterministic implementation of the exact production [`NetnsRun`] port.
+#[derive(Debug, Clone)]
+pub struct FakeNetnsRun {
+    preflight: PreflightReport,
+    result: Result<u8, String>,
+    calls: Arc<Mutex<Vec<FakeNetnsRunCall>>>,
+}
+
+impl FakeNetnsRun {
+    /// Script a preflight report and successful process exit byte.
+    pub fn exiting(preflight: PreflightReport, exit_code: u8) -> (Self, FakeNetnsRunHandle) {
+        Self::new(preflight, Ok(exit_code))
+    }
+
+    /// Script a preflight report and composed-run failure.
+    pub fn failing(
+        preflight: PreflightReport,
+        diagnostic: impl Into<String>,
+    ) -> (Self, FakeNetnsRunHandle) {
+        Self::new(preflight, Err(diagnostic.into()))
+    }
+
+    fn new(preflight: PreflightReport, result: Result<u8, String>) -> (Self, FakeNetnsRunHandle) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                preflight,
+                result,
+                calls: Arc::clone(&calls),
+            },
+            FakeNetnsRunHandle { calls },
+        )
+    }
+
+    fn record(&self, call: FakeNetnsRunCall) {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(call);
+    }
+}
+
+#[async_trait]
+impl NetnsRun for FakeNetnsRun {
+    async fn preflight(&self) -> PreflightReport {
+        self.record(FakeNetnsRunCall::Preflight);
+        self.preflight.clone()
+    }
+
+    async fn run(&self, _options: &RunOptions) -> anyhow::Result<ExitCode> {
+        self.record(FakeNetnsRunCall::Run);
+        match &self.result {
+            Ok(code) => Ok(ExitCode::from(*code)),
+            Err(diagnostic) => Err(anyhow::anyhow!(diagnostic.clone())),
+        }
+    }
+}
 
 /// One observable call across the fake provisioner and its session.
 #[derive(Debug, Clone, PartialEq, Eq)]

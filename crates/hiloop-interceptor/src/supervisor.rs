@@ -14,6 +14,7 @@ use crate::{
     exporters::{FanOutExporter, JsonlExporter},
     framing::LineFramer,
     grpc_export::GrpcIngestExporter,
+    netns::NetworkCapture,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
     pipeline::{
         DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL, Pipeline, PipelineOptions,
@@ -233,7 +234,7 @@ pub struct RunOptions {
     raw_jsonl: Option<PathBuf>,
     blob_dir: Option<PathBuf>,
     otlp: bool,
-    proxy: bool,
+    network_capture: NetworkCapture,
     max_capture_bytes: Option<u64>,
     export_grpc: Option<GrpcExportOptions>,
     export_batch_size: usize,
@@ -263,7 +264,8 @@ impl RunOptions {
     /// Each sink is optional and composes with the others: `events_jsonl` writes a
     /// newline-delimited JSON event log, `raw_jsonl` a raw observation log (requires
     /// an export target), `blob_dir` the proxy's durable local blob store, `otlp` an
-    /// embedded OTLP receiver, `proxy` an embedded MITM proxy (requires an export
+    /// embedded OTLP receiver, `network_capture` the selected off, cooperative-proxy,
+    /// or transparent-netns implementation (capture requires an export
     /// target, plus somewhere for captured bodies: `blob_dir`, or `export_grpc` — which
     /// stages them in a per-run scratch store), `max_capture_bytes` caps the captured
     /// copy of proxy bodies in memory (`Some(n)` bounds it to `n` bytes; `None` is
@@ -284,7 +286,7 @@ impl RunOptions {
         raw_jsonl: Option<PathBuf>,
         blob_dir: Option<PathBuf>,
         otlp: bool,
-        proxy: bool,
+        network_capture: NetworkCapture,
         max_capture_bytes: Option<u64>,
         export_grpc: Option<GrpcExportOptions>,
     ) -> Self {
@@ -301,7 +303,7 @@ impl RunOptions {
             raw_jsonl,
             blob_dir,
             otlp,
-            proxy,
+            network_capture,
             max_capture_bytes,
             export_grpc,
             export_batch_size: DEFAULT_EXPORT_BATCH_SIZE,
@@ -570,6 +572,19 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
         bail!("no command given; usage: hiloop-interceptor run -- <cmd> [args...]");
     }
 
+    if let Some((preflight, runner)) = options.network_capture.netns_runner() {
+        if preflight.result() != hiloop_core::capture::CapturePreflight::Passed {
+            let reason = preflight
+                .degradation_reason()
+                .map_or_else(|| "unknown".to_owned(), |reason| reason.to_string());
+            bail!(
+                "transparent network capture preflight failed ({reason}): {}",
+                preflight.diagnostic().unwrap_or("no diagnostic available")
+            );
+        }
+        return runner.run(options).await;
+    }
+
     // Capture runs whenever there is somewhere to send events: a JSONL file and/or a gRPC export.
     let has_exporter = options.events_jsonl.is_some() || options.export_grpc.is_some();
 
@@ -585,7 +600,7 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
         );
     }
 
-    if options.proxy {
+    if options.network_capture.uses_proxy() {
         if !has_exporter {
             bail!(
                 "--proxy requires an export target (--events-jsonl or --export-grpc) so captured exchanges have an exporter"
@@ -602,7 +617,7 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
     }
 
     if !options.secret_bindings.is_empty() {
-        if !options.proxy {
+        if !options.network_capture.uses_proxy() {
             bail!(
                 "secret bindings require --proxy: credentials are injected into intercepted HTTP(S) requests"
             );
@@ -612,13 +627,13 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
         }
     }
 
-    if !options.egress.is_allow_all() && !options.proxy {
+    if !options.egress.is_allow_all() && !options.network_capture.uses_proxy() {
         bail!(
             "an egress policy requires --proxy: egress is enforced on intercepted HTTP(S) traffic"
         );
     }
 
-    if options.anomaly.is_enabled() && !options.proxy {
+    if options.anomaly.is_enabled() && !options.network_capture.uses_proxy() {
         bail!(
             "anomaly detection requires --proxy: request bodies are inspected on intercepted HTTP(S) traffic"
         );
@@ -736,7 +751,7 @@ where
         None
     };
 
-    let proxy_ca = if options.proxy {
+    let proxy_ca = if options.network_capture.uses_proxy() {
         Some(ProxyCa::generate().context("failed to generate proxy CA")?)
     } else {
         None
@@ -753,7 +768,7 @@ where
         }
         None => None,
     };
-    let proxy_server = if options.proxy {
+    let proxy_server = if options.network_capture.uses_proxy() {
         Some(
             ProxyServer::bind(Arc::clone(&clock))
                 .await
@@ -766,13 +781,21 @@ where
     // the TempDir handle keeps it alive until the post-run blob upload below, then removes it on
     // drop — unless the drain left blobs behind, in which case it is kept (see the drain below).
     // An explicit blob dir is the durable local CAS and is never removed.
-    let mut scratch_blob_dir = match (options.proxy, &options.blob_dir, &options.export_grpc) {
+    let mut scratch_blob_dir = match (
+        options.network_capture.uses_proxy(),
+        &options.blob_dir,
+        &options.export_grpc,
+    ) {
         (true, None, Some(_)) => {
             Some(tempfile::tempdir().context("failed to create scratch blob dir")?)
         }
         _ => None,
     };
-    let blob_store = match (options.proxy, &options.blob_dir, &scratch_blob_dir) {
+    let blob_store = match (
+        options.network_capture.uses_proxy(),
+        &options.blob_dir,
+        &scratch_blob_dir,
+    ) {
         (true, Some(dir), _) => {
             Some(Arc::new(DirBlobStore::create(dir).await.with_context(
                 || format!("failed to create blob store at `{}`", dir.display()),
@@ -1044,7 +1067,7 @@ where
     if options.otlp {
         normalizers.push(&otlp_normalizer);
     }
-    if options.proxy {
+    if options.network_capture.uses_proxy() {
         normalizers.push(&proxy_normalizer);
     }
     let router = NormalizerRouter::new(normalizers).expect("router has at least one normalizer");
@@ -2682,7 +2705,7 @@ mod tests {
             None,
             None,
             false,
-            false, // proxy disabled
+            NetworkCapture::off(),
             None,
             None,
         )
@@ -2997,7 +3020,7 @@ mod tests {
             None,
             None,
             false,
-            true,
+            NetworkCapture::proxy(),
             None,
             None,
         );
@@ -3019,7 +3042,7 @@ mod tests {
             None,
             None,
             false,
-            true,
+            NetworkCapture::proxy(),
             None,
             Some(GrpcExportOptions {
                 endpoint: "http://127.0.0.1:9".to_owned(),
@@ -3049,7 +3072,7 @@ mod tests {
             None,
             None,
             false,
-            true,
+            NetworkCapture::proxy(),
             None,
             Some(GrpcExportOptions {
                 endpoint: "http://127.0.0.1:9".to_owned(),
@@ -3086,7 +3109,7 @@ mod tests {
             None,
             None,
             false,
-            false,
+            NetworkCapture::off(),
             None,
             None,
         );
@@ -3122,7 +3145,7 @@ mod tests {
             None,
             None,
             false,
-            false,
+            NetworkCapture::off(),
             None,
             None,
         );
