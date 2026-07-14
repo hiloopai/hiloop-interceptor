@@ -1,14 +1,14 @@
 use std::{
     ffi::{CStr, CString, OsStr, OsString},
     fs,
-    io::{self, Read as _, Write as _},
+    io::{self, IoSlice, Read as _, Write as _},
     net::{Ipv4Addr, Ipv6Addr},
     num::NonZeroU16,
     os::{
         fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
         unix::{
             ffi::{OsStrExt as _, OsStringExt as _},
-            net::UnixStream,
+            net::{UnixDatagram, UnixStream},
             process::CommandExt as _,
         },
     },
@@ -24,7 +24,10 @@ use tempfile::NamedTempFile;
 
 use super::{
     FragmentedUdpBehavior, NamespaceCommand, StartupStage, SubstrateExit, SubstrateInfo,
-    listener::{GatewayWorkerBootstrap, TransparentListenerError, TransparentListeners},
+    listener::{
+        GatewayWorkerBootstrap, TransparentListenerError, TransparentListeners,
+        create_transparent_reply_socket,
+    },
     pasta::{HOST_LOOPBACK_IPV4, HOST_LOOPBACK_IPV6, PASTA_INTERFACE},
     protocol::{
         ManagerMessage, SupervisorMessage, WireCommand, WireDegradationReason, WireExecCommand,
@@ -39,6 +42,7 @@ use super::{
     security::{
         CapabilityStatus, ChildLockdown, close_descriptors_except, deny_process_inspection,
     },
+    udp_broker::{BROKER_REQUEST_LENGTH, BROKER_STATUS_ERROR, BROKER_STATUS_OK, decode_request},
 };
 
 pub(super) const MANAGER_ROLE: &str = "__hiloop-netns-manager";
@@ -59,7 +63,9 @@ pub(super) const DETACHED_WORKLOAD_PROBE_ROLE: &str = "__hiloop-netns-detached-w
 const CONTROL_FD: RawFd = 3;
 const IPV4_LISTENER_FD: RawFd = 3;
 const IPV6_LISTENER_FD: RawFd = 4;
-const WORKER_READY_FD: RawFd = 5;
+const IPV4_UDP_FD: RawFd = 5;
+const IPV6_UDP_FD: RawFd = 6;
+const WORKER_READY_FD: RawFd = 7;
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -388,6 +394,7 @@ struct RunningGateway {
     worker_pid: Option<libc::pid_t>,
     routing: RoutingPlan,
     listeners: Option<TransparentListeners>,
+    broker: Option<UnixDatagram>,
 }
 
 fn start_gateway(
@@ -404,13 +411,16 @@ fn start_gateway(
     let validate_dataplane = parts.validate_dataplane;
     let resolv_conf = parts.resolv_conf;
     validate_carrier(require_ipv6)?;
-    disable_forwarding().map_err(|error| ManagerFailure::new(StartupStage::Routing, error))?;
+    configure_gateway_sysctls()
+        .map_err(|error| ManagerFailure::new(StartupStage::Routing, error))?;
     let listeners = TransparentListeners::bind(requested_port).map_err(|error| {
         let reason = match &error {
-            TransparentListenerError::Ipv4(_) => {
+            TransparentListenerError::Ipv4(_) | TransparentListenerError::UdpIpv4(_) => {
                 CaptureTransportDegradationReason::TproxyUnavailable
             }
-            TransparentListenerError::Ipv6(_) => CaptureTransportDegradationReason::Ipv6Unavailable,
+            TransparentListenerError::Ipv6(_) | TransparentListenerError::UdpIpv6(_) => {
+                CaptureTransportDegradationReason::Ipv6Unavailable
+            }
         };
         ManagerFailure::classified(StartupStage::Routing, reason, io::Error::other(error))
     })?;
@@ -434,6 +444,7 @@ fn start_gateway(
             worker_pid: None,
             routing,
             listeners: Some(listeners),
+            broker: None,
         };
         let _ = cleanup_gateway(&mut running);
         return Err(failure);
@@ -449,6 +460,7 @@ fn start_gateway(
             worker_pid: None,
             routing,
             listeners: Some(listeners),
+            broker: None,
         };
         let _ = cleanup_gateway(&mut running);
         return Err(failure);
@@ -459,6 +471,7 @@ fn start_gateway(
             worker_pid: None,
             routing,
             listeners: Some(listeners),
+            broker: None,
         };
         let _ = cleanup_gateway(&mut running);
         return Err(ManagerFailure::new(StartupStage::Workload, error));
@@ -469,19 +482,21 @@ fn start_gateway(
             worker_pid: None,
             routing,
             listeners: Some(listeners),
+            broker: None,
         };
         let _ = cleanup_gateway(&mut running);
         return Err(ManagerFailure::new(StartupStage::Workload, error));
     }
 
-    let worker_pid = match spawn_gateway_worker(gateway_worker, &listeners) {
-        Ok(pid) => pid,
+    let (worker_pid, broker) = match spawn_gateway_worker(gateway_worker, &listeners) {
+        Ok(worker) => worker,
         Err(error) => {
             let mut running = RunningGateway {
                 workload_pid,
                 worker_pid: None,
                 routing,
                 listeners: Some(listeners),
+                broker: None,
             };
             let _ = cleanup_gateway(&mut running);
             return Err(ManagerFailure::new(StartupStage::GatewayWorker, error));
@@ -494,6 +509,7 @@ fn start_gateway(
         worker_pid: Some(worker_pid),
         routing,
         listeners: None,
+        broker: Some(broker),
     };
     if let Err(error) = start_workload(&mut workload_control, workload) {
         let _ = cleanup_gateway(&mut running);
@@ -689,9 +705,10 @@ fn ipv6_failure(error: io::Error) -> ManagerFailure {
     )
 }
 
-fn disable_forwarding() -> io::Result<()> {
+fn configure_gateway_sysctls() -> io::Result<()> {
     fs::write("/proc/sys/net/ipv4/ip_forward", b"0")?;
     fs::write("/proc/sys/net/ipv6/conf/all/forwarding", b"0")?;
+    fs::write("/proc/sys/net/ipv4/ip_unprivileged_port_start", b"0")?;
     for path in [
         "/proc/sys/net/ipv4/ip_forward",
         "/proc/sys/net/ipv6/conf/all/forwarding",
@@ -701,6 +718,11 @@ fn disable_forwarding() -> io::Result<()> {
                 "namespace forwarding remained enabled at {path}"
             )));
         }
+    }
+    if fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")?.trim() != "0" {
+        return Err(io::Error::other(
+            "gateway namespace did not reserve cap-free DNS port binding",
+        ));
     }
     Ok(())
 }
@@ -938,13 +960,19 @@ fn execute_routing_command(
 fn spawn_gateway_worker(
     worker: WireCommand,
     listeners: &TransparentListeners,
-) -> io::Result<libc::pid_t> {
+) -> io::Result<(libc::pid_t, UnixDatagram)> {
     let command_spec = worker.into_command();
-    let (mut ready_parent, ready_child) = UnixStream::pair()?;
+    let (ready_parent, ready_child) = UnixDatagram::pair()?;
     ready_parent.set_read_timeout(Some(WORKER_READY_TIMEOUT))?;
     let listener_fds = listeners.raw_fds();
     let ready_fd = ready_child.as_raw_fd();
-    let lockdown = ChildLockdown::prepare(&[IPV4_LISTENER_FD, IPV6_LISTENER_FD, WORKER_READY_FD])?;
+    let lockdown = ChildLockdown::prepare(&[
+        IPV4_LISTENER_FD,
+        IPV6_LISTENER_FD,
+        IPV4_UDP_FD,
+        IPV6_UDP_FD,
+        WORKER_READY_FD,
+    ])?;
     let mut command = command_from_spec(&command_spec);
     set_worker_pre_exec(&mut command, listener_fds, ready_fd, lockdown);
     let child = command.spawn()?;
@@ -954,14 +982,20 @@ fn spawn_gateway_worker(
     drop(child);
     drop(ready_child);
     let mut readiness = [0_u8; 1];
-    ready_parent.read_exact(&mut readiness)?;
+    if ready_parent.recv(&mut readiness)? != readiness.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gateway worker sent partial readiness",
+        ));
+    }
     if readiness != [1] {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "gateway worker sent invalid readiness byte",
         ));
     }
-    Ok(pid)
+    ready_parent.set_nonblocking(true)?;
+    Ok((pid, ready_parent))
 }
 
 #[expect(
@@ -970,7 +1004,7 @@ fn spawn_gateway_worker(
 )]
 fn set_worker_pre_exec(
     command: &mut Command,
-    listeners: [RawFd; 2],
+    listeners: [RawFd; 4],
     ready_fd: RawFd,
     lockdown: ChildLockdown,
 ) {
@@ -981,6 +1015,8 @@ fn set_worker_pre_exec(
         command.pre_exec(move || {
             duplicate_to(listeners[0], IPV4_LISTENER_FD)?;
             duplicate_to(listeners[1], IPV6_LISTENER_FD)?;
+            duplicate_to(listeners[2], IPV4_UDP_FD)?;
+            duplicate_to(listeners[3], IPV6_UDP_FD)?;
             duplicate_to(ready_fd, WORKER_READY_FD)?;
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) == -1 {
                 return Err(io::Error::last_os_error());
@@ -1035,6 +1071,11 @@ fn supervise_children(control: &mut UnixStream, running: &RunningGateway) -> Ter
         {
             return terminal;
         }
+        if let Some(broker) = &running.broker
+            && service_udp_broker(broker).is_err()
+        {
+            return TerminalState::WorkerFailed(SubstrateExit::Code(1));
+        }
         match control_readable(control.as_raw_fd(), CHILD_POLL_INTERVAL) {
             Ok(false) => {}
             Ok(true) => match receive_sync::<SupervisorMessage>(control) {
@@ -1044,6 +1085,54 @@ fn supervise_children(control: &mut UnixStream, running: &RunningGateway) -> Ter
             Err(_) => return TerminalState::ControlClosed,
         }
     }
+}
+
+fn service_udp_broker(broker: &UnixDatagram) -> io::Result<()> {
+    loop {
+        let mut request = [0_u8; BROKER_REQUEST_LENGTH];
+        let length = match broker.recv(&mut request) {
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let Some(key) = decode_request(&request[..length]) else {
+            send_broker_error(broker)?;
+            continue;
+        };
+        let Ok(socket) = create_transparent_reply_socket(key) else {
+            send_broker_error(broker)?;
+            continue;
+        };
+        let status = [BROKER_STATUS_OK];
+        let iovec = [IoSlice::new(&status)];
+        let descriptors = [socket.as_raw_fd()];
+        let control = [nix::sys::socket::ControlMessage::ScmRights(&descriptors)];
+        let sent = nix::sys::socket::sendmsg::<()>(
+            broker.as_raw_fd(),
+            &iovec,
+            &control,
+            nix::sys::socket::MsgFlags::empty(),
+            None,
+        )
+        .map_err(errno_io)?;
+        if sent != status.len() {
+            return Err(io::Error::other("UDP broker response was partially sent"));
+        }
+    }
+}
+
+fn send_broker_error(broker: &UnixDatagram) -> io::Result<()> {
+    if broker.send(&[BROKER_STATUS_ERROR])? == 1 {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "UDP broker error response was partially sent",
+        ))
+    }
+}
+
+fn errno_io(error: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
 }
 
 fn terminal_from_reaped(
@@ -1086,6 +1175,7 @@ fn control_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
 
 fn cleanup_gateway(running: &mut RunningGateway) -> Vec<String> {
     running.listeners.take();
+    running.broker.take();
     let mut failures = Vec::new();
     let teardown = running.routing.teardown_commands();
     if let Some(veth) = teardown.first()
@@ -1280,7 +1370,13 @@ fn worker_probe_entrypoint() -> io::Result<ExitCode> {
     let bootstrap = GatewayWorkerBootstrap::from_inherited_fds()?;
     require_empty_capabilities()?;
     let listeners = bootstrap.notify_ready()?;
-    require_only_open_fds(&[IPV4_LISTENER_FD, IPV6_LISTENER_FD])?;
+    require_only_open_fds(&[
+        IPV4_LISTENER_FD,
+        IPV6_LISTENER_FD,
+        IPV4_UDP_FD,
+        IPV6_UDP_FD,
+        WORKER_READY_FD,
+    ])?;
     validate_transparent_listener_probe(listeners)?;
     loop {
         raw_pause();
@@ -1292,7 +1388,13 @@ fn crashing_worker_probe_entrypoint() -> io::Result<ExitCode> {
     let bootstrap = GatewayWorkerBootstrap::from_inherited_fds()?;
     require_empty_capabilities()?;
     let _listeners = bootstrap.notify_ready()?;
-    require_only_open_fds(&[IPV4_LISTENER_FD, IPV6_LISTENER_FD])?;
+    require_only_open_fds(&[
+        IPV4_LISTENER_FD,
+        IPV6_LISTENER_FD,
+        IPV4_UDP_FD,
+        IPV6_UDP_FD,
+        WORKER_READY_FD,
+    ])?;
     thread::sleep(Duration::from_millis(100));
     Ok(ExitCode::from(23))
 }
@@ -1316,7 +1418,7 @@ fn workload_probe_entrypoint() -> io::Result<ExitCode> {
 fn validate_transparent_listener_probe(
     listeners: crate::netns::listener::GatewayListeners,
 ) -> io::Result<()> {
-    let (ipv4, ipv6) = listeners.into_parts();
+    let (ipv4, ipv6, _udp_ipv4, _udp_ipv6, _broker) = listeners.into_parts();
     ipv4.set_nonblocking(false)?;
     ipv6.set_nonblocking(false)?;
     for (listener, expected, response) in [
@@ -1546,7 +1648,11 @@ fn set_socket_integer_option(
 
 #[cfg(feature = "test-support")]
 fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
-    use crate::netns::TransparentTcpIngress;
+    use std::sync::Arc;
+
+    use crate::netns::{
+        TransparentTcpIngress, TransparentUdpChildSink, TransparentUdpIngress, UdpFlowRelay,
+    };
 
     let evidence_path = std::env::args_os()
         .nth(2)
@@ -1554,12 +1660,30 @@ fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing evidence path"))?;
     let host_ipv4_port = parse_probe_port(3)?;
     let host_ipv6_port = parse_probe_port(4)?;
+    let _host_udp_ipv4_port = parse_probe_port(5)?;
+    let _host_udp_ipv6_port = parse_probe_port(6)?;
     let bootstrap = GatewayWorkerBootstrap::from_inherited_fds()?;
     require_empty_capabilities()?;
     let listeners = bootstrap.notify_ready()?;
-    let (ipv4, ipv6) = listeners.into_parts();
-    require_only_open_fds(&[IPV4_LISTENER_FD, IPV6_LISTENER_FD])?;
+    let (ipv4, ipv6, udp_ipv4, udp_ipv6, broker) = listeners.into_parts();
+    require_only_open_fds(&[
+        IPV4_LISTENER_FD,
+        IPV6_LISTENER_FD,
+        IPV4_UDP_FD,
+        IPV6_UDP_FD,
+        WORKER_READY_FD,
+    ])?;
     let ingress = TransparentTcpIngress::from_std(ipv4, ipv6)?;
+    let udp_ingress = TransparentUdpIngress::from_std(udp_ipv4, udp_ipv6)?;
+    let udp_sink = Arc::new(TransparentUdpChildSink::new(broker)?);
+    let (summary_tx, mut summary_rx) = tokio::sync::mpsc::channel(8);
+    let udp_relay = Arc::new(UdpFlowRelay::new(
+        false,
+        &crate::egress::EgressPolicy::default(),
+        Duration::from_secs(5),
+        udp_sink,
+        summary_tx,
+    ));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -1570,6 +1694,8 @@ fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
         (host_ipv4_destination, host_ipv4_peer),
         (host_ipv6_destination, host_ipv6_peer),
     ) = runtime.block_on(async {
+        let relay = Arc::clone(&udp_relay);
+        let _udp_task = tokio::spawn(async move { udp_ingress.serve(&relay).await });
         let first = accept_transparent_probe(
             &ingress,
             "198.51.100.42:443".parse().map_err(invalid_input)?,
@@ -1591,6 +1717,12 @@ fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
             .parse()
             .map_err(invalid_input)?;
         let host_ipv6 = proxy_host_loopback(&ingress, host_ipv6_destination).await?;
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(10), summary_rx.recv())
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP flow did not idle"))?
+                .ok_or_else(|| io::Error::other("UDP flow summary channel closed"))?;
+        }
         Ok::<_, io::Error>((first, second, host_ipv4, host_ipv6))
     })?;
 
@@ -1664,7 +1796,7 @@ async fn proxy_host_loopback(
 
 #[cfg(feature = "test-support")]
 fn dataplane_workload_probe_entrypoint() -> io::Result<ExitCode> {
-    use std::net::{TcpStream, ToSocketAddrs as _};
+    use std::net::{TcpStream, ToSocketAddrs as _, UdpSocket};
 
     require_empty_capabilities()?;
     require_only_open_fds(&[])?;
@@ -1672,6 +1804,8 @@ fn dataplane_workload_probe_entrypoint() -> io::Result<ExitCode> {
     validate_udp_mtu_and_fragments()?;
     let host_ipv4_port = parse_probe_port(2)?;
     let host_ipv6_port = parse_probe_port(3)?;
+    let host_udp_ipv4_port = parse_probe_port(4)?;
+    let host_udp_ipv6_port = parse_probe_port(5)?;
     let timeout = Duration::from_secs(5);
     for (destination, expected) in [("198.51.100.42:443", 1_u8), ("[2001:db8::42]:443", 2_u8)] {
         let address = destination.parse().map_err(invalid_input)?;
@@ -1710,6 +1844,34 @@ fn dataplane_workload_probe_entrypoint() -> io::Result<ExitCode> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{family_name} host loopback fixture returned an unexpected payload"),
+            ));
+        }
+    }
+    for (bind, destination, family_name) in [
+        (
+            "0.0.0.0:0",
+            format!("{HOST_LOOPBACK_IPV4}:{host_udp_ipv4_port}"),
+            "IPv4",
+        ),
+        (
+            "[::]:0",
+            format!("[{HOST_LOOPBACK_IPV6}]:{host_udp_ipv6_port}"),
+            "IPv6",
+        ),
+    ] {
+        let socket = UdpSocket::bind(bind)?;
+        socket.set_read_timeout(Some(timeout))?;
+        socket.connect(destination)?;
+        if socket.send(b"ping")? != 4 {
+            return Err(io::Error::other(format!(
+                "{family_name} UDP request was partially sent"
+            )));
+        }
+        let mut response = [0_u8; 4];
+        if socket.recv(&mut response)? != response.len() || response != *b"pong" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{family_name} UDP relay returned an unexpected payload"),
             ));
         }
     }
@@ -2153,6 +2315,19 @@ mod tests {
             terminal_from_reaped(&exits, 10, Some(11)),
             Some(TerminalState::WorkerFailed(SubstrateExit::Code(23)))
         );
+    }
+
+    #[test]
+    fn udp_socket_broker_rejects_malformed_requests_without_opening_a_socket() {
+        let (manager, worker) = UnixDatagram::pair().expect("broker pair");
+        manager.set_nonblocking(true).expect("nonblocking manager");
+        worker.send(b"malformed").expect("broker request");
+
+        service_udp_broker(&manager).expect("service malformed request");
+
+        let mut status = [0_u8; 1];
+        assert_eq!(worker.recv(&mut status).expect("broker response"), 1);
+        assert_eq!(status, [BROKER_STATUS_ERROR]);
     }
 
     #[test]

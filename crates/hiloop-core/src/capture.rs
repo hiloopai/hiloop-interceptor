@@ -475,6 +475,25 @@ impl Event {
             None => event,
         }
     }
+
+    /// Build a strict-run fatal cause for a non-TLS transport destination.
+    pub fn capture_fatal_for_destination(
+        context: &RunContext,
+        ts: Hlc,
+        reason: CaptureFatalReason,
+        destination: OriginalDestination,
+    ) -> Self {
+        with_destination(
+            Self::new(
+                context,
+                ts,
+                SignalType::Net,
+                EventName::from_static("capture.fatal"),
+            )
+            .with_attribute(AttributeKey::from_static(REASON), reason.to_string()),
+            destination,
+        )
+    }
 }
 
 fn nonblank(field: &'static str, value: impl Into<String>) -> Result<String, CaptureContractError> {

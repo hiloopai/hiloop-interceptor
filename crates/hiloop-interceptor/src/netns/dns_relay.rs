@@ -400,6 +400,114 @@ mod tests {
         relay_task.abort();
     }
 
+    #[tokio::test]
+    async fn gateway_reserves_dual_stack_udp_and_tcp_listeners() {
+        let upstream_udp = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("upstream UDP fixture");
+        let upstream = upstream_udp.local_addr().expect("upstream address");
+        let upstream_tcp = TcpListener::bind(upstream)
+            .await
+            .expect("upstream TCP fixture");
+        let udp_fixture = tokio::spawn(async move {
+            let mut query = [0_u8; 512];
+            let (length, peer) = upstream_udp
+                .recv_from(&mut query)
+                .await
+                .expect("upstream UDP receive");
+            upstream_udp
+                .send_to(&response(&query[..length]), peer)
+                .await
+                .expect("upstream UDP response");
+        });
+        let tcp_fixture = tokio::spawn(async move {
+            let (mut stream, _) = upstream_tcp.accept().await.expect("upstream TCP accept");
+            let length = stream.read_u16().await.expect("upstream TCP length");
+            let mut query = vec![0_u8; usize::from(length)];
+            stream
+                .read_exact(&mut query)
+                .await
+                .expect("upstream TCP query");
+            let response = response(&query);
+            stream
+                .write_u16(u16::try_from(response.len()).expect("response length"))
+                .await
+                .expect("upstream response length");
+            stream
+                .write_all(&response)
+                .await
+                .expect("upstream TCP response");
+        });
+
+        let directory = tempfile::tempdir().expect("relay directory");
+        let relay_path = directory.path().join("dns.sock");
+        let host_relay = HostDnsRelay::bind(
+            &relay_path,
+            HostResolver::new(vec![upstream], Duration::from_secs(1)).expect("host resolver"),
+        )
+        .expect("host relay");
+        let host_task = tokio::spawn(host_relay.serve());
+        let client = DnsRelayClient::connect(&relay_path)
+            .await
+            .expect("relay client");
+
+        let reservation =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("gateway port reservation");
+        let port = reservation.local_addr().expect("reserved address").port();
+        drop(reservation);
+        let gateway = GatewayDnsRelay::bind_on(
+            format!("127.0.0.1:{port}").parse().expect("gateway IPv4"),
+            format!("[::1]:{port}").parse().expect("gateway IPv6"),
+            client,
+            Arc::new(DnsAnswerTracker::default()),
+        )
+        .await
+        .expect("gateway DNS relay");
+        let gateway_task = tokio::spawn(gateway.serve());
+        let query = query();
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("gateway UDP client");
+        udp_client
+            .send_to(&query, format!("127.0.0.1:{port}"))
+            .await
+            .expect("gateway UDP query");
+        let mut udp_response = [0_u8; 512];
+        let (length, _) = udp_client
+            .recv_from(&mut udp_response)
+            .await
+            .expect("gateway UDP response");
+        assert_eq!(&udp_response[..length], response(&query));
+
+        let mut tcp_client = TcpStream::connect(format!("[::1]:{port}"))
+            .await
+            .expect("gateway TCP client");
+        tcp_client
+            .write_u16(u16::try_from(query.len()).expect("query length"))
+            .await
+            .expect("gateway TCP length");
+        tcp_client
+            .write_all(&query)
+            .await
+            .expect("gateway TCP query");
+        let length = tcp_client
+            .read_u16()
+            .await
+            .expect("gateway TCP response length");
+        let mut tcp_response = vec![0_u8; usize::from(length)];
+        tcp_client
+            .read_exact(&mut tcp_response)
+            .await
+            .expect("gateway TCP response");
+        assert_eq!(tcp_response, response(&query));
+
+        udp_fixture.await.expect("UDP fixture task");
+        tcp_fixture.await.expect("TCP fixture task");
+        gateway_task.abort();
+        host_task.abort();
+    }
+
     #[test]
     fn servfail_retains_the_query_and_clears_all_answer_sections() {
         let query = query();

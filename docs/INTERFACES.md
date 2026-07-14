@@ -76,10 +76,18 @@ set; `provision` requires workload and gateway-worker commands and returns a `Ne
 cancellation-safe `wait` can be followed by ordered `shutdown`. Both terminal paths close the
 dataplane and reap its helpers. `SystemNetworkProvisioner` owns the user/PID/mount and two network
 namespaces, veth, nftables TPROXY rules, dual-stack policy routes, and separately executed pinned
-pasta process. Non-DNS UDP and non-intercepted L3 forwarding remain fail-closed until a supervised
-relay owns those flows. All fragmented UDP, including fragmented DNS, is dropped before the carrier.
-The cap-free gateway worker receives pre-opened transparent listeners through an internal bootstrap;
-the workload receives no setup or namespace descriptors.
+pasta process. The cap-free gateway worker receives pre-opened transparent TCP and UDP listeners
+through an internal bootstrap. Its UDP relay raw-forwards opaque flows only for a no-binding,
+allow-all run; restrictive policy denies before opening an upstream socket, and any binding closes
+the relay with `secret_transport_unsupported`. A narrow manager socket broker creates per-flow
+transparent reply sockets so the worker retains no capabilities. All fragmented UDP, including
+fragmented DNS, is dropped before the carrier.
+
+The workload resolver points only at reserved dual-stack gateway listeners. A private Unix channel
+forwards UDP and TCP DNS messages to a relay that remains in the host network namespace, preserving
+host-loopback stubs and split-DNS routing. Search/domain/options directives are retained, and the
+gateway records only the exact A/AAAA answers it successfully returned, bounded by each record's TTL
+and any shorter CNAME-chain TTL. The workload receives no setup or namespace descriptors.
 
 Tests and later dataplane work use `netns::testing::FakeNetworkProvisioner` behind the existing
 `test-support` feature. It implements the same production port, records lifecycle calls, and can

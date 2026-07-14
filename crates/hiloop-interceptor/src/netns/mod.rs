@@ -36,6 +36,10 @@ mod system;
 mod tls_policy;
 mod tls_transport;
 mod udp;
+#[cfg(target_os = "linux")]
+mod udp_broker;
+#[cfg(target_os = "linux")]
+mod udp_ingress;
 
 pub use classifier::{
     ClassificationError, ClassificationProgress, ClientHelloIdentity, HttpIdentity, TcpProtocol,
@@ -47,6 +51,8 @@ pub use ingress::{
     AdmittedTcpFlow, ConnectedTcpFlow, DirectTcpConnector, IngressError, TcpUpstreamConnector,
     TransparentTcpIngress, connect_authorized, recover_original_destination,
 };
+#[cfg(target_os = "linux")]
+pub use listener::{GatewayListeners, GatewayWorkerBootstrap};
 pub use route::{
     AuthorizedRoute, DnsAnswerEvidence, NoDnsAnswerEvidence, RouteDenial, RoutingIdentitySource,
     authorize_route,
@@ -63,6 +69,10 @@ pub use tls_transport::{
 pub use udp::{
     UdpChildDatagram, UdpChildSink, UdpFlowDisposition, UdpFlowKey, UdpFlowRelay, UdpFlowSummary,
     UdpRelayError, udp_flow_disposition,
+};
+#[cfg(target_os = "linux")]
+pub use udp_ingress::{
+    InterceptedUdpDatagram, TransparentUdpChildSink, TransparentUdpIngress, UdpIngressError,
 };
 
 #[cfg(any(test, feature = "test-support"))]

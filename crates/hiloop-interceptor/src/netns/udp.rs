@@ -108,6 +108,9 @@ impl UdpChildDatagram {
 pub trait UdpChildSink: Send + Sync {
     /// Return one origin datagram to the workload under the original destination identity.
     async fn send(&self, datagram: UdpChildDatagram) -> io::Result<()>;
+
+    /// Release downstream state when the flow emits its terminal summary.
+    async fn close(&self, _key: UdpFlowKey) {}
 }
 
 /// Final accounting emitted exactly once when an admitted UDP flow closes or idles out.
@@ -203,11 +206,12 @@ impl UdpFlowRelay {
             UdpFlowDisposition::DenyIdentityUnavailable => {
                 return Err(UdpRelayError::Policy(
                     UdpFlowDisposition::DenyIdentityUnavailable,
+                    key,
                 ));
             }
             fatal @ UdpFlowDisposition::Fatal(_) => {
                 self.close().await;
-                return Err(UdpRelayError::Policy(fatal));
+                return Err(UdpRelayError::Policy(fatal, key));
             }
         }
         if self.closed.load(Ordering::Acquire) {
@@ -313,6 +317,7 @@ async fn run_flow(
         }
     }
     flows.lock().await.remove(&key);
+    child_sink.close(key).await;
     let _ = summary_tx
         .send(UdpFlowSummary {
             key,
@@ -327,7 +332,7 @@ async fn run_flow(
 pub enum UdpRelayError {
     /// Run policy rejected the flow before forwarding.
     #[error("UDP flow rejected: {0:?}")]
-    Policy(UdpFlowDisposition),
+    Policy(UdpFlowDisposition, UdpFlowKey),
     /// The local relay was already closed.
     #[error("UDP relay is closed")]
     Closed,
@@ -351,9 +356,27 @@ impl UdpRelayError {
     /// Policy outcome carried by a fail-closed rejection.
     pub fn disposition(&self) -> Option<UdpFlowDisposition> {
         match self {
-            Self::Policy(disposition) => Some(*disposition),
+            Self::Policy(disposition, _) => Some(*disposition),
             _ => None,
         }
+    }
+
+    /// Build the typed fatal event when this rejection closed a binding run.
+    pub fn fatal_event(
+        &self,
+        context: &RunContext,
+        timestamp: Hlc,
+    ) -> Result<Option<Event>, CaptureContractError> {
+        let Self::Policy(UdpFlowDisposition::Fatal(reason), key) = self else {
+            return Ok(None);
+        };
+        let destination = OriginalDestination::new(key.destination.ip(), key.destination.port())?;
+        Ok(Some(Event::capture_fatal_for_destination(
+            context,
+            timestamp,
+            *reason,
+            destination,
+        )))
     }
 }
 
@@ -367,6 +390,8 @@ mod tests {
 
     use async_trait::async_trait;
     use hiloop_core::capture::CaptureFatalReason;
+    use hiloop_core::identity::{Hlc, RunContext};
+    use serde_json::json;
     use tokio::sync::{Mutex, mpsc};
 
     use super::{
@@ -456,6 +481,20 @@ mod tests {
             assert_eq!(summary.key(), key);
             assert_eq!(summary.upstream_bytes(), 22);
             assert_eq!(summary.downstream_bytes(), 22);
+            let event = summary
+                .net_passthrough_event(
+                    &RunContext::new_local_root(),
+                    Hlc {
+                        wall_ns: 1,
+                        logical: 0,
+                    },
+                )
+                .expect("typed passthrough event");
+            let event = serde_json::to_value(event).expect("serialize passthrough event");
+            assert_eq!(event["name"], json!("net.passthrough"));
+            assert_eq!(event["attributes"]["transport"], json!("udp"));
+            assert_eq!(event["attributes"]["upstream_bytes"], json!(22));
+            assert_eq!(event["attributes"]["downstream_bytes"], json!(22));
         }
     }
 
@@ -494,6 +533,28 @@ mod tests {
                 .expect_err("flow must fail closed");
             assert_eq!(error.disposition(), Some(expected));
             assert_eq!(relay.open_flow_count().await, 0);
+            let fatal = error
+                .fatal_event(
+                    &RunContext::new_local_root(),
+                    Hlc {
+                        wall_ns: 1,
+                        logical: 0,
+                    },
+                )
+                .expect("typed fatal event");
+            assert_eq!(fatal.is_some(), bindings);
+            if let Some(fatal) = fatal {
+                let fatal = serde_json::to_value(fatal).expect("serialize fatal event");
+                assert_eq!(fatal["name"], json!("capture.fatal"));
+                assert_eq!(
+                    fatal["attributes"]["reason"],
+                    json!("secret_transport_unsupported")
+                );
+                assert_eq!(
+                    fatal["attributes"]["original_destination.ip"],
+                    json!("127.0.0.1")
+                );
+            }
         }
     }
 

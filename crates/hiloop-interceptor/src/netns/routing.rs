@@ -391,7 +391,6 @@ fn nft_script(intercept_port: NonZeroU16) -> String {
         iifname "{GATEWAY_INTERFACE}" ip6 daddr {GATEWAY_IPV6} udp dport 53 accept
         iifname "{GATEWAY_INTERFACE}" meta l4proto tcp th dport 53 drop
         iifname "{GATEWAY_INTERFACE}" meta l4proto udp th dport 53 drop
-        iifname "{GATEWAY_INTERFACE}" meta l4proto udp socket transparent 1 meta mark set {TPROXY_MARK:#x} accept
         iifname "{GATEWAY_INTERFACE}" meta l4proto udp tproxy to :{intercept_port} meta mark set {TPROXY_MARK:#x} accept
         iifname "{GATEWAY_INTERFACE}" meta l4proto tcp socket transparent 1 meta mark set {TPROXY_MARK:#x} accept
         iifname "{GATEWAY_INTERFACE}" meta l4proto tcp tproxy to :{intercept_port} meta mark set {TPROXY_MARK:#x} accept
@@ -587,7 +586,6 @@ mod tests {
         iifname "hlgate0" ip6 daddr fd00:6869:6c6f:6f70::1 udp dport 53 accept
         iifname "hlgate0" meta l4proto tcp th dport 53 drop
         iifname "hlgate0" meta l4proto udp th dport 53 drop
-        iifname "hlgate0" meta l4proto udp socket transparent 1 meta mark set 0x1 accept
         iifname "hlgate0" meta l4proto udp tproxy to :15001 meta mark set 0x1 accept
         iifname "hlgate0" meta l4proto tcp socket transparent 1 meta mark set 0x1 accept
         iifname "hlgate0" meta l4proto tcp tproxy to :15001 meta mark set 0x1 accept
@@ -602,7 +600,7 @@ mod tests {
         let plan = RoutingPlan::new(9, NonZeroU16::new(32_000).expect("test port is nonzero"));
         let script = plan.nft_script();
 
-        assert_eq!(script.matches("iifname \"hlgate0\"").count(), 12);
+        assert_eq!(script.matches("iifname \"hlgate0\"").count(), 11);
         assert_eq!(script.matches(IPV4_FRAGMENT_COUNTER).count(), 2);
         assert_eq!(script.matches(IPV6_FRAGMENT_COUNTER).count(), 2);
         assert!(!script.contains("hlwork0"));
@@ -629,19 +627,11 @@ mod tests {
         let udp_dns_drop = script
             .find("meta l4proto udp th dport 53 drop")
             .expect("non-reserved UDP DNS drop rule");
-        let udp_divert = script
-            .find("meta l4proto udp socket transparent")
-            .expect("UDP socket divert rule");
         let udp_tproxy = script
             .find("meta l4proto udp tproxy to")
             .expect("UDP TPROXY rule");
         let tcp_divert = script
-            .find("socket transparent")
-            .and_then(|first| {
-                script[first + 1..]
-                    .find("socket transparent")
-                    .map(|second| first + 1 + second)
-            })
+            .find("meta l4proto tcp socket transparent")
             .expect("TCP socket divert rule");
         let tcp_tproxy = script.rfind("tproxy to").expect("TCP TPROXY rule");
         for fragment_rule in [ipv4_frag, ipv6_frag] {
@@ -654,9 +644,8 @@ mod tests {
             assert!(dns_exception < tcp_dns_drop);
             assert!(dns_exception < udp_dns_drop);
         }
-        assert!(tcp_dns_drop < udp_divert);
-        assert!(udp_dns_drop < udp_divert);
-        assert!(udp_divert < udp_tproxy);
+        assert!(tcp_dns_drop < udp_tproxy);
+        assert!(udp_dns_drop < udp_tproxy);
         assert!(udp_tproxy < tcp_divert);
         assert!(tcp_divert < tcp_tproxy);
     }
