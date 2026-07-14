@@ -1491,7 +1491,7 @@ fn set_socket_integer_option(
 
 #[cfg(feature = "test-support")]
 fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
-    use std::net::SocketAddr;
+    use crate::netns::TransparentTcpIngress;
 
     let evidence_path = std::env::args_os()
         .nth(2)
@@ -1504,34 +1504,40 @@ fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
     let listeners = bootstrap.notify_ready()?;
     let (ipv4, ipv6) = listeners.into_parts();
     require_only_open_fds(&[IPV4_LISTENER_FD, IPV6_LISTENER_FD])?;
-    ipv4.set_nonblocking(false)?;
-    ipv6.set_nonblocking(false)?;
-
-    let (mut first, first_address) = ipv4.accept()?;
-    let first_destination = first.local_addr()?;
-    require_probe_destination(
-        first_destination,
-        "198.51.100.42:443".parse().map_err(invalid_input)?,
-    )?;
-    first.write_all(&[1])?;
-
-    let (mut second, second_address) = ipv6.accept()?;
-    let second_destination = second.local_addr()?;
-    require_probe_destination(
-        second_destination,
-        "[2001:db8::42]:443".parse().map_err(invalid_input)?,
-    )?;
-    second.write_all(&[2])?;
-
-    let (host_ipv4_destination, host_ipv4_peer) = proxy_host_loopback(
-        &ipv4,
-        SocketAddr::new(parse_ipv4_address(HOST_LOOPBACK_IPV4)?, host_ipv4_port),
-    )?;
-    let host_ipv6_destination = format!("[{HOST_LOOPBACK_IPV6}]:{host_ipv6_port}")
-        .parse()
-        .map_err(invalid_input)?;
-    let (host_ipv6_destination, host_ipv6_peer) =
-        proxy_host_loopback(&ipv6, host_ipv6_destination)?;
+    let ingress = TransparentTcpIngress::from_std(ipv4, ipv6)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    let (
+        (first_destination, first_address),
+        (second_destination, second_address),
+        (host_ipv4_destination, host_ipv4_peer),
+        (host_ipv6_destination, host_ipv6_peer),
+    ) = runtime.block_on(async {
+        let first = accept_transparent_probe(
+            &ingress,
+            "198.51.100.42:443".parse().map_err(invalid_input)?,
+            1,
+        )
+        .await?;
+        let second = accept_transparent_probe(
+            &ingress,
+            "[2001:db8::42]:443".parse().map_err(invalid_input)?,
+            2,
+        )
+        .await?;
+        let host_ipv4 = proxy_host_loopback(
+            &ingress,
+            std::net::SocketAddr::new(parse_ipv4_address(HOST_LOOPBACK_IPV4)?, host_ipv4_port),
+        )
+        .await?;
+        let host_ipv6_destination = format!("[{HOST_LOOPBACK_IPV6}]:{host_ipv6_port}")
+            .parse()
+            .map_err(invalid_input)?;
+        let host_ipv6 = proxy_host_loopback(&ingress, host_ipv6_destination).await?;
+        Ok::<_, io::Error>((first, second, host_ipv4, host_ipv6))
+    })?;
 
     fs::write(
         evidence_path,
@@ -1545,22 +1551,59 @@ fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
 }
 
 #[cfg(feature = "test-support")]
-fn proxy_host_loopback(
-    listener: &std::net::TcpListener,
+async fn accept_transparent_probe(
+    ingress: &crate::netns::TransparentTcpIngress,
+    expected_destination: std::net::SocketAddr,
+    response: u8,
+) -> io::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let admitted = ingress
+        .accept(
+            &crate::egress::EgressPolicy::default(),
+            &crate::netns::NoDnsAnswerEvidence,
+        )
+        .await
+        .map_err(io::Error::other)?;
+    let destination = std::net::SocketAddr::new(
+        admitted.route().original_destination().ip(),
+        admitted.route().original_destination().port(),
+    );
+    require_probe_destination(destination, expected_destination)?;
+    let (mut flow, _, _) = admitted.into_test_parts();
+    let peer = flow.peer_addr()?;
+    flow.write_all(&[response]).await?;
+    Ok((destination, peer))
+}
+
+#[cfg(feature = "test-support")]
+async fn proxy_host_loopback(
+    ingress: &crate::netns::TransparentTcpIngress,
     expected_destination: std::net::SocketAddr,
 ) -> io::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
-    use std::net::TcpStream;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    let (mut flow, peer) = listener.accept()?;
-    let destination = flow.local_addr()?;
+    let connected = ingress
+        .accept_and_connect(
+            &crate::egress::EgressPolicy::default(),
+            &crate::netns::NoDnsAnswerEvidence,
+            &crate::netns::DirectTcpConnector,
+        )
+        .await
+        .map_err(io::Error::other)?;
+    let (mut flow, mut upstream, route, _) = connected.into_parts();
+    let destination = std::net::SocketAddr::new(
+        route.original_destination().ip(),
+        route.original_destination().port(),
+    );
     require_probe_destination(destination, expected_destination)?;
+    let peer = flow.peer_addr()?;
     let mut request = [0_u8; 4];
-    flow.read_exact(&mut request)?;
-    let mut upstream = TcpStream::connect_timeout(&destination, Duration::from_secs(5))?;
-    upstream.write_all(&request)?;
+    flow.read_exact(&mut request).await?;
+    upstream.write_all(&request).await?;
     let mut response = [0_u8; 4];
-    upstream.read_exact(&mut response)?;
-    flow.write_all(&response)?;
+    upstream.read_exact(&mut response).await?;
+    flow.write_all(&response).await?;
     Ok((destination, peer))
 }
 
@@ -1579,6 +1622,7 @@ fn dataplane_workload_probe_entrypoint() -> io::Result<ExitCode> {
         let address = destination.parse().map_err(invalid_input)?;
         let mut stream = TcpStream::connect_timeout(&address, timeout)?;
         stream.set_read_timeout(Some(timeout))?;
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: transparent.test\r\n\r\n")?;
         let mut actual = [0_u8; 1];
         stream.read_exact(&mut actual)?;
         if actual != [expected] {
@@ -1731,7 +1775,6 @@ fn parse_probe_port(index: usize) -> io::Result<u16> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
-#[cfg(feature = "test-support")]
 fn require_probe_destination(
     actual: std::net::SocketAddr,
     expected: std::net::SocketAddr,

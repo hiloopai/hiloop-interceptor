@@ -83,6 +83,11 @@ pub struct Destination {
 }
 
 impl Destination {
+    pub(crate) fn with_default_port(mut self, port: u16) -> Self {
+        self.port.get_or_insert(port);
+        self
+    }
+
     /// The canonicalized host.
     pub fn host(&self) -> &CanonicalHost {
         &self.host
