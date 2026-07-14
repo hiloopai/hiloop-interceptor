@@ -1775,7 +1775,6 @@ fn parse_probe_port(index: usize) -> io::Result<u16> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
-#[cfg(feature = "test-support")]
 fn require_probe_destination(
     actual: std::net::SocketAddr,
     expected: std::net::SocketAddr,
