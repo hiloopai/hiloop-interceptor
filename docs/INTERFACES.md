@@ -44,6 +44,32 @@ migration. Internal, non-serialized APIs such as the `Source` / `Normalizer` tra
 the pipeline internals are *not* frozen and may change freely — that is the whole point of keeping
 them out of `hiloop-core`.
 
+### Transparent-capture contracts
+
+Transparent capture extends the existing Event v1 envelope; it does not introduce a second event
+type. `hiloop_core::capture` owns typed constructors and closed reason sets for:
+
+- `tls.interception_failed`;
+- `tls.passthrough`;
+- `net.passthrough`;
+- `capture.transport`; and
+- `capture.fatal`.
+
+The constructors preserve scalar attribute types through Event v1 serialization. Normalizers must
+not stringify their boolean or integer fields. They accept only route metadata, reason values, and
+byte counts; request bodies, certificates, secret identifiers, and secret values have no input seam
+and `payload_ref` remains empty.
+
+`NetCaptureMode` is the shared selection contract. Its exact, case-sensitive values are `auto`,
+`netns`, `proxy`, and `off`. The product CLI owns exposing that selector and combining it with run
+policy; this repository owns the provisioner and dataplane selected by it. Defining the value type
+does not make any transparent runtime available by itself.
+
+The first-connection TLS compatibility registry is a versioned interceptor configuration made of
+reviewed exact host-and-port rows. Wildcards, embedded ports, duplicates, zero ports, blank evidence
+or ownership, and invalid `YYYY-MM-DD` revalidation dates are rejected. Registry matching may never
+weaken restrictive-policy or secret-binding behavior.
+
 ## Current Seams
 
 ### Source

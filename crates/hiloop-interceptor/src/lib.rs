@@ -12,6 +12,7 @@ pub mod grpc_client;
 pub mod grpc_export;
 pub mod inspect;
 pub mod jsonl;
+pub mod net_capture;
 pub mod otlp;
 pub mod pipeline;
 pub mod proxy;
