@@ -10,7 +10,7 @@ pub(super) const MAX_CLASSIFICATION_BYTES: usize = 64 * 1024;
 const MAX_TLS_RECORD_BYTES: usize = 18 * 1024;
 const MAX_HTTP_METHOD_BYTES: usize = 32;
 const ECH_EXTENSION: u16 = 0xfe0d;
-const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub(super) const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// More bytes are needed or a protocol has been classified.
 #[derive(Debug, Clone, PartialEq, Eq)]

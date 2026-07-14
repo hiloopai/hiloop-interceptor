@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use hiloop_core::identity::RunContext;
-use hiloop_interceptor::{DrainRetryPolicy, GrpcExportOptions, RunOptions, run};
+use hiloop_interceptor::{DrainRetryPolicy, GrpcExportOptions, NetworkCapture, RunOptions, run};
 
 fn options_for(command: Vec<String>, export_grpc: Option<GrpcExportOptions>) -> RunOptions {
     RunOptions::new(
@@ -17,7 +17,7 @@ fn options_for(command: Vec<String>, export_grpc: Option<GrpcExportOptions>) -> 
         None,
         None,
         false,
-        false,
+        NetworkCapture::off(),
         None,
         export_grpc,
     )
@@ -51,7 +51,7 @@ async fn sequential_runs_in_one_process_mint_distinct_invocation_ids() {
             None,
             None,
             false,
-            false,
+            NetworkCapture::off(),
             None,
             None,
         );

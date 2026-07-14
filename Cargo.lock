@@ -1048,6 +1048,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower-service",
  "ulid",
  "url",
  "webpki-roots 1.0.8",

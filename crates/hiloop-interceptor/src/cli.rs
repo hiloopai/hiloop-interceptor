@@ -10,7 +10,7 @@ use hiloop_interceptor::egress::{EgressMode, EgressPolicy};
 use hiloop_interceptor::pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL_MS};
 use hiloop_interceptor::proxy::DEFAULT_MAX_CAPTURE_BYTES;
 use hiloop_interceptor::secret::{BrokerConfig, SecretBinding};
-use hiloop_interceptor::{GrpcExportOptions, RedactionPolicy, RunOptions, run};
+use hiloop_interceptor::{GrpcExportOptions, NetworkCapture, RedactionPolicy, RunOptions, run};
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 pub(crate) async fn run_from_args() -> Result<ExitCode> {
@@ -301,7 +301,11 @@ impl RunArgs {
             self.raw_jsonl,
             self.blob_dir,
             self.otlp,
-            self.proxy,
+            if self.proxy {
+                NetworkCapture::proxy()
+            } else {
+                NetworkCapture::off()
+            },
             max_capture_bytes,
             export_grpc,
         )

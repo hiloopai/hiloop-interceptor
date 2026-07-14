@@ -16,7 +16,10 @@ use thiserror::Error;
 mod classifier;
 mod dns;
 mod dns_relay;
+mod event_relay;
 mod fatal;
+#[cfg(target_os = "linux")]
+mod gateway;
 mod ingress;
 #[cfg(target_os = "linux")]
 mod listener;
@@ -31,6 +34,7 @@ mod resolver;
 mod route;
 #[cfg(target_os = "linux")]
 mod routing;
+mod run;
 #[cfg(target_os = "linux")]
 mod security;
 mod system;
@@ -64,6 +68,7 @@ pub use route::{
     AuthorizedRoute, DnsAnswerEvidence, NoDnsAnswerEvidence, RouteDenial, RoutingIdentitySource,
     authorize_route,
 };
+pub use run::{NetnsRun, NetworkCapture};
 pub use system::SystemNetworkProvisioner;
 pub use tls_policy::{
     HandshakeFailure, HandshakeFailureDecision, RequestAuthorityRejection, SecretRoute,

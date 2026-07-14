@@ -28,6 +28,7 @@ pub mod supervisor;
 pub use anomaly::AnomalyConfig;
 pub use blob_drain::DrainRetryPolicy;
 pub use egress::{EgressMode, EgressPolicy};
+pub use netns::{NetnsRun, NetworkCapture};
 pub use proxy::DEFAULT_MAX_CAPTURE_BYTES;
 pub use redact::RedactionPolicy;
 pub use secret::{BrokerConfig, SecretBinding};
