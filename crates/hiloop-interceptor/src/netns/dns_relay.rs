@@ -1,26 +1,32 @@
 use std::{
-    ffi::OsString,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
+
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
-    net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream},
+    net::{TcpListener, TcpStream, UdpSocket, UnixStream},
     sync::Mutex,
 };
 
-use super::{
-    DnsAnswerTracker,
-    resolver::{DnsTransport, HostResolver},
-};
+#[cfg(target_os = "linux")]
+use tokio::net::UnixListener;
+
+use super::DnsAnswerTracker;
+
+#[cfg(target_os = "linux")]
+use super::resolver::{DnsTransport, HostResolver};
 
 const DNS_PORT: u16 = 53;
 const RELAY_PROTOCOL_VERSION: u8 = 1;
 const RELAY_STATUS_OK: u8 = 0;
 const RELAY_STATUS_ERROR: u8 = 1;
+#[cfg(target_os = "linux")]
 const MAX_ERROR_BYTES: usize = 1024;
 
 /// Gateway-worker environment variable naming the private host DNS relay socket.
@@ -35,6 +41,7 @@ pub enum DnsQueryTransport {
     Tcp,
 }
 
+#[cfg(target_os = "linux")]
 impl From<DnsQueryTransport> for DnsTransport {
     fn from(transport: DnsQueryTransport) -> Self {
         match transport {
@@ -104,11 +111,13 @@ impl DnsRelayClient {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(super) struct HostDnsRelay {
     listener: UnixListener,
     resolver: HostResolver,
 }
 
+#[cfg(target_os = "linux")]
 impl HostDnsRelay {
     pub(super) fn bind(path: &Path, resolver: HostResolver) -> io::Result<Self> {
         Ok(Self {
@@ -125,6 +134,7 @@ impl HostDnsRelay {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn serve_host_connection(mut stream: UnixStream, resolver: &HostResolver) -> io::Result<()> {
     loop {
         let mut version = [0_u8; 1];
@@ -167,6 +177,7 @@ async fn serve_host_connection(mut stream: UnixStream, resolver: &HostResolver) 
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn write_relay_response(
     stream: &mut UnixStream,
     status: u8,
@@ -343,6 +354,7 @@ fn servfail(query: &[u8]) -> Vec<u8> {
     response
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn relay_socket_environment(path: &Path) -> (OsString, OsString) {
     (DNS_RELAY_SOCKET_ENV.into(), path.as_os_str().to_owned())
 }
@@ -351,7 +363,7 @@ fn invalid_input(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::time::Duration;
 

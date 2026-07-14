@@ -205,7 +205,7 @@ async fn wrapper_exits_after_the_child_even_when_its_stdin_never_closes() {
     assert!(status.success(), "wrapper exited non-zero: {status:?}");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn capture_preserves_tty_stdio_for_interactive_children() {
     use nix::fcntl::OFlag;
