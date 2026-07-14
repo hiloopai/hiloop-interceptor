@@ -66,7 +66,7 @@ tower-service = "0.3"
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
-ulid = { version = "1", features = ["serde"] }
+ulid = { version = "2", features = ["serde"] }
 x509-parser = "0.18"
 # Best-effort zeroing of fetched secret values after each request is built.
 zeroize = "1"
