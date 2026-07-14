@@ -43,7 +43,7 @@ fn info() -> SubstrateInfo {
         "169.254.254.1".parse().expect("gateway IPv4"),
         "fd00:6869:6c6f:6f70::1".parse().expect("gateway IPv6"),
         "169.254.2.2".parse().expect("host IPv4"),
-        "fd00:6869:6c6f:6f70:1::2"
+        "fd00:6869:6c6f:6f71::2"
             .parse::<Ipv6Addr>()
             .expect("host IPv6"),
         FragmentedUdpBehavior::Drop,

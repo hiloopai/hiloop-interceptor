@@ -18,7 +18,8 @@ use super::{PINNED_PASTA_VERSION, routing::LINK_MTU, security::PreExecDescriptor
 
 pub(super) const PASTA_INTERFACE: &str = "hlhost0";
 pub(super) const HOST_LOOPBACK_IPV4: &str = "169.254.2.2";
-pub(super) const HOST_LOOPBACK_IPV6: &str = "fd00:6869:6c6f:6f70:1::2";
+pub(super) const HOST_LOOPBACK_IPV6: &str = "fd00:6869:6c6f:6f71::2";
+const IPV6_GATEWAY: &str = "fe80::1";
 
 const EXPECTED_VERSION_LINE: &str = "pasta 2026_06_11.a9c61ff";
 const VERSION_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -51,6 +52,8 @@ impl PastaCommand {
                 OsString::from("none"),
                 OsString::from("--udp-ns"),
                 OsString::from("none"),
+                OsString::from("--gateway"),
+                OsString::from(IPV6_GATEWAY),
                 OsString::from("--map-host-loopback"),
                 OsString::from(HOST_LOOPBACK_IPV4),
                 OsString::from("--map-host-loopback"),
@@ -252,9 +255,10 @@ pub(super) enum PastaStartupFailure {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt as _, time::Duration};
+    use std::{net::Ipv6Addr, os::unix::fs::PermissionsExt as _, time::Duration};
 
     use super::*;
+    use crate::netns::routing::GATEWAY_IPV6;
 
     #[test]
     fn version_output_requires_the_exact_pinned_first_line() {
@@ -296,14 +300,22 @@ mod tests {
                 "none",
                 "--udp-ns",
                 "none",
+                "--gateway",
+                "fe80::1",
                 "--map-host-loopback",
                 "169.254.2.2",
                 "--map-host-loopback",
-                "fd00:6869:6c6f:6f70:1::2",
+                "fd00:6869:6c6f:6f71::2",
                 "42",
             ]
             .map(OsString::from)
         );
+    }
+
+    #[test]
+    fn mapped_host_ipv6_is_outside_the_workload_prefix() {
+        let host = HOST_LOOPBACK_IPV6.parse::<Ipv6Addr>().expect("host IPv6");
+        assert_ne!(&host.octets()[..8], &GATEWAY_IPV6.octets()[..8]);
     }
 
     #[test]

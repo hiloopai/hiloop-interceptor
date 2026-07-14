@@ -19,7 +19,7 @@ use std::{
 };
 
 use hiloop_core::capture::CaptureTransportDegradationReason;
-use nix::libc;
+use nix::{errno::Errno, libc, net::if_::if_nametoindex};
 use tempfile::NamedTempFile;
 
 use super::gateway::{
@@ -41,9 +41,9 @@ use super::{
         receive_sync, send_sync,
     },
     routing::{
-        GATEWAY_IPV4, GATEWAY_IPV6, IPV4_FRAGMENT_COUNTER, IPV6_FRAGMENT_COUNTER, IpFamily,
-        LINK_MTU, NFT_TABLE, NamespacedCommand, NetworkNamespace, RoutingPlan,
-        parse_counter_packets,
+        GATEWAY_INTERFACE, GATEWAY_IPV4, GATEWAY_IPV6, IPV4_FRAGMENT_COUNTER,
+        IPV6_FRAGMENT_COUNTER, IpFamily, LINK_MTU, NFT_TABLE, NamespacedCommand, NetworkNamespace,
+        RoutingPlan, parse_counter_packets,
     },
     security::{
         CapabilityStatus, ChildLockdown, close_descriptors_except, deny_process_inspection,
@@ -733,19 +733,20 @@ fn ipv6_failure(error: io::Error) -> ManagerFailure {
 }
 
 fn configure_gateway_sysctls() -> io::Result<()> {
-    fs::write("/proc/sys/net/ipv4/ip_forward", b"0")?;
-    fs::write("/proc/sys/net/ipv6/conf/all/forwarding", b"0")?;
-    fs::write("/proc/sys/net/ipv4/ip_unprivileged_port_start", b"0")?;
     for path in [
         "/proc/sys/net/ipv4/ip_forward",
         "/proc/sys/net/ipv6/conf/all/forwarding",
+        "/proc/sys/net/ipv4/conf/all/src_valid_mark",
+        "/proc/sys/net/ipv4/conf/default/src_valid_mark",
     ] {
+        fs::write(path, b"0")?;
         if fs::read_to_string(path)?.trim() != "0" {
             return Err(io::Error::other(format!(
-                "namespace forwarding remained enabled at {path}"
+                "gateway namespace sysctl remained enabled at {path}"
             )));
         }
     }
+    fs::write("/proc/sys/net/ipv4/ip_unprivileged_port_start", b"0")?;
     if fs::read_to_string("/proc/sys/net/ipv4/ip_unprivileged_port_start")?.trim() != "0" {
         return Err(io::Error::other(
             "gateway namespace did not reserve cap-free DNS port binding",
@@ -1213,6 +1214,7 @@ fn cleanup_gateway(running: &mut RunningGateway) -> Vec<String> {
     let teardown = running.routing.teardown_commands();
     if let Some(veth) = teardown.first()
         && let Err(error) = execute_routing_command(veth, None)
+        && !network_interface_is_absent(GATEWAY_INTERFACE)
     {
         failures.push(format!("delete workload veth: {error}"));
     }
@@ -1230,6 +1232,10 @@ fn cleanup_gateway(running: &mut RunningGateway) -> Vec<String> {
         failures.push(format!("reap PID-namespace descendants: {error}"));
     }
     failures
+}
+
+fn network_interface_is_absent(name: &str) -> bool {
+    matches!(if_nametoindex(name), Err(Errno::ENODEV))
 }
 
 fn kill_namespace_descendants() {
@@ -1706,6 +1712,11 @@ fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
         IPV6_UDP_FD,
         WORKER_READY_FD,
     ])?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    let runtime_guard = runtime.enter();
     let ingress = TransparentTcpIngress::from_std(ipv4, ipv6)?;
     let udp_ingress = TransparentUdpIngress::from_std(udp_ipv4, udp_ipv6)?;
     let udp_sink = Arc::new(TransparentUdpChildSink::new(broker)?);
@@ -1717,10 +1728,7 @@ fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
         udp_sink,
         summary_tx,
     ));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()?;
+    drop(runtime_guard);
     let (
         (first_destination, first_address),
         (second_destination, second_address),
@@ -1875,6 +1883,10 @@ fn dataplane_workload_probe_entrypoint() -> io::Result<ExitCode> {
     let host_ipv6_port = parse_probe_port(3)?;
     let host_udp_ipv4_port = parse_probe_port(4)?;
     let host_udp_ipv6_port = parse_probe_port(5)?;
+    let evidence_path = std::env::args_os()
+        .nth(6)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing evidence path"))?;
     let timeout = Duration::from_secs(5);
     for (destination, expected) in [("198.51.100.42:443", 1_u8), ("[2001:db8::42]:443", 2_u8)] {
         let address = destination.parse().map_err(invalid_input)?;
@@ -1944,7 +1956,30 @@ fn dataplane_workload_probe_entrypoint() -> io::Result<ExitCode> {
             ));
         }
     }
+    wait_for_probe_evidence(&evidence_path, Duration::from_secs(10))?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "test-support")]
+fn wait_for_probe_evidence(path: &Path, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(evidence) if evidence.ends_with('\n') && evidence.contains("\nhost_ipv6=") => {
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "gateway worker did not persist dataplane evidence",
+            ));
+        }
+        thread::sleep(CHILD_POLL_INTERVAL);
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -2375,6 +2410,12 @@ mod tests {
             first.command().arguments(),
             ["link", "delete", "dev", "hlgate0"]
         );
+    }
+
+    #[test]
+    fn missing_veth_is_already_clean() {
+        assert!(network_interface_is_absent("__hl_missing"));
+        assert!(!network_interface_is_absent("lo"));
     }
 
     #[test]

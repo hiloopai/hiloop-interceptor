@@ -29,7 +29,7 @@ fn fake_info() -> SubstrateInfo {
         "169.254.254.1".parse().expect("test IPv4"),
         "fd00:6869:6c6f:6f70::1".parse().expect("test IPv6"),
         "169.254.2.2".parse().expect("test host IPv4"),
-        "fd00:6869:6c6f:6f70:1::2"
+        "fd00:6869:6c6f:6f71::2"
             .parse::<Ipv6Addr>()
             .expect("test host IPv6"),
         FragmentedUdpBehavior::Drop,
@@ -166,11 +166,12 @@ async fn real_rootless_substrate_contract() {
         host_udp_ipv6_port.to_string().into(),
     ]);
     let workload = NamespaceCommand::new(&helper).args([
-        DATAPLANE_WORKLOAD_ROLE.to_owned(),
-        host_ipv4_port.to_string(),
-        host_ipv6_port.to_string(),
-        host_udp_ipv4_port.to_string(),
-        host_udp_ipv6_port.to_string(),
+        DATAPLANE_WORKLOAD_ROLE.into(),
+        host_ipv4_port.to_string().into(),
+        host_ipv6_port.to_string().into(),
+        host_udp_ipv4_port.to_string().into(),
+        host_udp_ipv6_port.to_string().into(),
+        evidence.clone().into_os_string(),
     ]);
     let mut session = provisioner
         .provision(ProvisionRequest::new(workload, worker))
@@ -194,7 +195,7 @@ async fn real_rootless_substrate_contract() {
     assert!(evidence.contains("ipv6=[2001:db8::42]:443"));
     assert!(evidence.contains(&format!("host_ipv4=169.254.2.2:{host_ipv4_port}")));
     assert!(evidence.contains(&format!(
-        "host_ipv6=[fd00:6869:6c6f:6f70:1::2]:{host_ipv6_port}"
+        "host_ipv6=[fd00:6869:6c6f:6f71::2]:{host_ipv6_port}"
     )));
 
     let missing_worker = evidence_dir.path().join("missing-worker");

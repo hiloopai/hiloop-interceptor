@@ -422,7 +422,7 @@ mod tests {
             "169.254.254.1".parse().expect("test IPv4"),
             "fd00:6869:6c6f:6f70::1".parse().expect("test IPv6"),
             "169.254.2.2".parse().expect("test host IPv4"),
-            "fd00:6869:6c6f:6f70:1::2"
+            "fd00:6869:6c6f:6f71::2"
                 .parse::<Ipv6Addr>()
                 .expect("test host IPv6"),
             FragmentedUdpBehavior::Drop,
@@ -661,21 +661,21 @@ mod tests {
                 "0.0.0.0",
                 "fd00:6869:6c6f:6f70::1",
                 "169.254.2.2",
-                "fd00:6869:6c6f:6f70:1::2",
+                "fd00:6869:6c6f:6f71::2",
             ),
             (
                 "gateway_ipv6",
                 "169.254.254.1",
                 "ff02::1",
                 "169.254.2.2",
-                "fd00:6869:6c6f:6f70:1::2",
+                "fd00:6869:6c6f:6f71::2",
             ),
             (
                 "host_loopback_ipv4",
                 "169.254.254.1",
                 "fd00:6869:6c6f:6f70::1",
                 "127.0.0.1",
-                "fd00:6869:6c6f:6f70:1::2",
+                "fd00:6869:6c6f:6f71::2",
             ),
         ] {
             let error = SubstrateInfo::new(
