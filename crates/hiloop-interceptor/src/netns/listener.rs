@@ -3,7 +3,7 @@ use std::{
     mem,
     net::TcpListener,
     num::NonZeroU16,
-    os::fd::{FromRawFd as _, OwnedFd, RawFd},
+    os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
     os::unix::net::UnixStream,
 };
 
@@ -256,8 +256,6 @@ fn create_ipv6_listener(port: NonZeroU16) -> io::Result<OwnedFd> {
     listen(ipv6.as_raw_fd())?;
     Ok(ipv6)
 }
-
-use std::os::fd::AsRawFd as _;
 
 fn create_socket(family: libc::c_int) -> io::Result<OwnedFd> {
     #[expect(
