@@ -1200,6 +1200,15 @@ mod linux {
                     };
                     self.record_failure(error);
                 }
+                TerminalEvent::Manager(Some(Ok(ManagerMessage::Fatal(report)))) => {
+                    match report.try_into() {
+                        Ok(report) => self.record_failure(ProvisionError::fatal(report)),
+                        Err(error) => self.record_failure(dataplane_manager(
+                            "decode fatal report from namespace manager",
+                            error,
+                        )),
+                    }
+                }
                 TerminalEvent::Manager(Some(Ok(ManagerMessage::CleanupComplete { failures }))) => {
                     self.cleanup.extend_messages(failures);
                     self.terminal = true;

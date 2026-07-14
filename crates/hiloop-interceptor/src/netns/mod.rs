@@ -52,6 +52,8 @@ pub use fatal::{
     DataplaneClosed, DataplaneLatch, FatalReport, FatalRunError, FatalRunResult,
     FatalRunSupervisor, SupervisedRunError,
 };
+#[cfg(target_os = "linux")]
+pub use fatal::{GatewayFatalController, GatewayFatalError};
 pub use ingress::{
     AdmittedTcpFlow, ConnectedTcpFlow, DirectTcpConnector, IngressError, TcpUpstreamConnector,
     TransparentTcpIngress, connect_authorized, recover_original_destination,

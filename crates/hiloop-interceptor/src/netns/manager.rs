@@ -23,16 +23,18 @@ use nix::libc;
 use tempfile::NamedTempFile;
 
 use super::{
-    FragmentedUdpBehavior, NamespaceCommand, StartupStage, SubstrateExit, SubstrateInfo,
+    FatalReport, FragmentedUdpBehavior, NamespaceCommand, StartupStage, SubstrateExit,
+    SubstrateInfo,
     listener::{
         GatewayWorkerBootstrap, TransparentListenerError, TransparentListeners,
         create_transparent_reply_socket,
     },
     pasta::{HOST_LOOPBACK_IPV4, HOST_LOOPBACK_IPV6, PASTA_INTERFACE},
     protocol::{
-        ManagerMessage, SupervisorMessage, WireCommand, WireDegradationReason, WireExecCommand,
-        WireExit, WireProvisionRequest, WireStartupStage, WireSubstrateInfo, WorkloadMessage,
-        WorkloadReply, receive_sync, send_sync,
+        MAX_GATEWAY_CONTROL_BYTES, ManagerMessage, SupervisorMessage, WireCommand,
+        WireDegradationReason, WireExecCommand, WireExit, WireFatalReport, WireProvisionRequest,
+        WireStartupStage, WireSubstrateInfo, WorkloadMessage, WorkloadReply, decode_gateway_fatal,
+        receive_sync, send_sync,
     },
     routing::{
         GATEWAY_IPV4, GATEWAY_IPV6, IPV4_FRAGMENT_COUNTER, IPV6_FRAGMENT_COUNTER, IpFamily,
@@ -42,7 +44,7 @@ use super::{
     security::{
         CapabilityStatus, ChildLockdown, close_descriptors_except, deny_process_inspection,
     },
-    udp_broker::{BROKER_REQUEST_LENGTH, BROKER_STATUS_ERROR, BROKER_STATUS_OK, decode_request},
+    udp_broker::{BROKER_STATUS_ERROR, BROKER_STATUS_OK, decode_request},
 };
 
 pub(super) const MANAGER_ROLE: &str = "__hiloop-netns-manager";
@@ -59,6 +61,8 @@ pub(super) const LOOPBACK_DESCENDANT_PROBE_ROLE: &str = "__hiloop-netns-loopback
 pub(super) const CRASHING_WORKER_PROBE_ROLE: &str = "__hiloop-netns-crashing-worker-probe";
 #[cfg(feature = "test-support")]
 pub(super) const DETACHED_WORKLOAD_PROBE_ROLE: &str = "__hiloop-netns-detached-workload-probe";
+#[cfg(feature = "test-support")]
+pub(super) const FATAL_WORKER_PROBE_ROLE: &str = "__hiloop-netns-fatal-worker-probe";
 
 const CONTROL_FD: RawFd = 3;
 const IPV4_LISTENER_FD: RawFd = 3;
@@ -87,6 +91,8 @@ pub(super) fn dispatch_from_args() -> Option<io::Result<ExitCode>> {
         Some(CRASHING_WORKER_PROBE_ROLE) => Some(crashing_worker_probe_entrypoint()),
         #[cfg(feature = "test-support")]
         Some(DETACHED_WORKLOAD_PROBE_ROLE) => Some(detached_workload_probe_entrypoint()),
+        #[cfg(feature = "test-support")]
+        Some(FATAL_WORKER_PROBE_ROLE) => Some(fatal_worker_probe_entrypoint()),
         _ => None,
     }
 }
@@ -534,7 +540,7 @@ fn start_gateway(
 
     let terminal = supervise_children(control, &running);
     let validation_failure = if validate_dataplane
-        && matches!(terminal, TerminalState::Workload(SubstrateExit::Code(0)))
+        && matches!(&terminal, TerminalState::Workload(SubstrateExit::Code(0)))
     {
         thread::sleep(CHILD_POLL_INTERVAL);
         validate_fragment_counters().err()
@@ -599,6 +605,21 @@ fn start_gateway(
                     reason: WireDegradationReason::NetnsStartupFailed,
                     diagnostic: diagnostic.clone(),
                 },
+            )
+            .map_err(|error| ManagerFailure::new(StartupStage::GatewayWorker, error))?;
+            send_sync(
+                control,
+                &ManagerMessage::CleanupComplete {
+                    failures: cleanup_failures,
+                },
+            )
+            .map_err(|error| ManagerFailure::new(StartupStage::Namespace, error))?;
+            Ok(SubstrateExit::Code(1))
+        }
+        TerminalState::Fatal(report) => {
+            send_sync(
+                control,
+                &ManagerMessage::Fatal(WireFatalReport::from(&report)),
             )
             .map_err(|error| ManagerFailure::new(StartupStage::GatewayWorker, error))?;
             send_sync(
@@ -1055,12 +1076,13 @@ fn command_from_spec(spec: &NamespaceCommand) -> Command {
     command
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TerminalState {
     Workload(SubstrateExit),
     WorkerFailed(SubstrateExit),
     Shutdown,
     ControlClosed,
+    Fatal(FatalReport),
 }
 
 fn supervise_children(control: &mut UnixStream, running: &RunningGateway) -> TerminalState {
@@ -1071,10 +1093,12 @@ fn supervise_children(control: &mut UnixStream, running: &RunningGateway) -> Ter
         {
             return terminal;
         }
-        if let Some(broker) = &running.broker
-            && service_udp_broker(broker).is_err()
-        {
-            return TerminalState::WorkerFailed(SubstrateExit::Code(1));
+        if let Some(broker) = &running.broker {
+            match service_gateway_control(broker) {
+                Ok(Some(report)) => return TerminalState::Fatal(report),
+                Ok(None) => {}
+                Err(_) => return TerminalState::WorkerFailed(SubstrateExit::Code(1)),
+            }
         }
         match control_readable(control.as_raw_fd(), CHILD_POLL_INTERVAL) {
             Ok(false) => {}
@@ -1087,14 +1111,17 @@ fn supervise_children(control: &mut UnixStream, running: &RunningGateway) -> Ter
     }
 }
 
-fn service_udp_broker(broker: &UnixDatagram) -> io::Result<()> {
+fn service_gateway_control(broker: &UnixDatagram) -> io::Result<Option<FatalReport>> {
     loop {
-        let mut request = [0_u8; BROKER_REQUEST_LENGTH];
+        let mut request = [0_u8; MAX_GATEWAY_CONTROL_BYTES];
         let length = match broker.recv(&mut request) {
             Ok(length) => length,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error),
         };
+        if let Some(report) = decode_gateway_fatal(&request[..length])? {
+            return Ok(Some(report));
+        }
         let Some(key) = decode_request(&request[..length]) else {
             send_broker_error(broker)?;
             continue;
@@ -1738,6 +1765,39 @@ fn dataplane_worker_probe_entrypoint() -> io::Result<ExitCode> {
 }
 
 #[cfg(feature = "test-support")]
+fn fatal_worker_probe_entrypoint() -> io::Result<ExitCode> {
+    use hiloop_core::capture::{CaptureFatalReason, OriginalDestination, TlsFlowIdentity};
+
+    use crate::netns::{DataplaneLatch, FatalReport, GatewayFatalController};
+
+    let bootstrap = GatewayWorkerBootstrap::from_inherited_fds()?;
+    require_empty_capabilities()?;
+    let listeners = bootstrap.notify_ready()?;
+    let (_, _, _, _, broker) = listeners.into_parts();
+    let latch = DataplaneLatch::new();
+    let controller = GatewayFatalController::new(latch, &broker)?;
+    let destination = OriginalDestination::new("203.0.113.10".parse().map_err(invalid_input)?, 443)
+        .map_err(invalid_input)?;
+    let flow = TlsFlowIdentity::new(destination)
+        .with_server_name("api.example.com")
+        .map_err(invalid_input)?
+        .with_client_hello_fingerprint("ja4:fatal-probe")
+        .map_err(invalid_input)?;
+    thread::sleep(Duration::from_millis(200));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?
+        .block_on(controller.trigger(&FatalReport::tls(
+            CaptureFatalReason::SecretBindUnterminatable,
+            flow,
+        )))
+        .map_err(io::Error::other)?;
+    loop {
+        raw_pause();
+    }
+}
+
+#[cfg(feature = "test-support")]
 async fn accept_transparent_probe(
     ingress: &crate::netns::TransparentTcpIngress,
     expected_destination: std::net::SocketAddr,
@@ -2323,11 +2383,35 @@ mod tests {
         manager.set_nonblocking(true).expect("nonblocking manager");
         worker.send(b"malformed").expect("broker request");
 
-        service_udp_broker(&manager).expect("service malformed request");
+        assert_eq!(
+            service_gateway_control(&manager).expect("service malformed request"),
+            None
+        );
 
         let mut status = [0_u8; 1];
         assert_eq!(worker.recv(&mut status).expect("broker response"), 1);
         assert_eq!(status, [BROKER_STATUS_ERROR]);
+    }
+
+    #[test]
+    fn gateway_fatal_report_preempts_further_broker_service() {
+        use hiloop_core::capture::{CaptureFatalReason, OriginalDestination};
+
+        let (manager, worker) = UnixDatagram::pair().expect("broker pair");
+        manager.set_nonblocking(true).expect("nonblocking manager");
+        let report = FatalReport::destination(
+            CaptureFatalReason::SecretTransportUnsupported,
+            OriginalDestination::new("203.0.113.10".parse().expect("test destination"), 443)
+                .expect("valid destination"),
+        );
+        let frame =
+            crate::netns::protocol::encode_gateway_fatal(&report).expect("encode gateway fatal");
+        worker.send(&frame).expect("send gateway fatal");
+
+        assert_eq!(
+            service_gateway_control(&manager).expect("service gateway fatal"),
+            Some(report)
+        );
     }
 
     #[test]

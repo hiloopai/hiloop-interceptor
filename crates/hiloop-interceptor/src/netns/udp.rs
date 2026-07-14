@@ -25,6 +25,7 @@ use tokio::{
 };
 
 use crate::egress::EgressPolicy;
+use crate::netns::FatalReport;
 
 /// Run-level handling for opaque non-DNS UDP, including QUIC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,22 +362,13 @@ impl UdpRelayError {
         }
     }
 
-    /// Build the typed fatal event when this rejection closed a binding run.
-    pub fn fatal_event(
-        &self,
-        context: &RunContext,
-        timestamp: Hlc,
-    ) -> Result<Option<Event>, CaptureContractError> {
+    /// Build the typed report sent through the fatal controller for a binding run.
+    pub fn fatal_report(&self) -> Result<Option<FatalReport>, CaptureContractError> {
         let Self::Policy(UdpFlowDisposition::Fatal(reason), key) = self else {
             return Ok(None);
         };
         let destination = OriginalDestination::new(key.destination.ip(), key.destination.port())?;
-        Ok(Some(Event::capture_fatal_for_destination(
-            context,
-            timestamp,
-            *reason,
-            destination,
-        )))
+        Ok(Some(FatalReport::destination(*reason, destination)))
     }
 }
 
@@ -533,17 +525,16 @@ mod tests {
                 .expect_err("flow must fail closed");
             assert_eq!(error.disposition(), Some(expected));
             assert_eq!(relay.open_flow_count().await, 0);
-            let fatal = error
-                .fatal_event(
+            let fatal = error.fatal_report().expect("typed fatal report");
+            assert_eq!(fatal.is_some(), bindings);
+            if let Some(fatal) = fatal {
+                let fatal = fatal.event(
                     &RunContext::new_local_root(),
                     Hlc {
                         wall_ns: 1,
                         logical: 0,
                     },
-                )
-                .expect("typed fatal event");
-            assert_eq!(fatal.is_some(), bindings);
-            if let Some(fatal) = fatal {
+                );
                 let fatal = serde_json::to_value(fatal).expect("serialize fatal event");
                 assert_eq!(fatal["name"], json!("capture.fatal"));
                 assert_eq!(

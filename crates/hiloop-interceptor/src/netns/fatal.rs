@@ -1,5 +1,8 @@
 use std::{future::Future, num::NonZeroU8, sync::Arc};
 
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixDatagram;
+
 use hiloop_core::{
     capture::{CaptureFatalReason, OriginalDestination, TlsFlowIdentity},
     event::Event,
@@ -10,11 +13,13 @@ use tokio::sync::watch;
 
 use crate::seams::{ExportError, Exporter};
 
+#[cfg(target_os = "linux")]
+use super::protocol::encode_gateway_fatal;
 use super::{NetworkSession, ProvisionError, SubstrateExit};
 
 /// Route metadata safe to carry from the gateway into a fatal event.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FatalRoute {
+pub(super) enum FatalRoute {
     None,
     Tls(TlsFlowIdentity),
     Destination(OriginalDestination),
@@ -55,6 +60,14 @@ impl FatalReport {
     /// Closed reason returned as the run's terminal result.
     pub fn reason(&self) -> CaptureFatalReason {
         self.reason
+    }
+
+    pub(super) fn from_route(reason: CaptureFatalReason, route: FatalRoute) -> Self {
+        Self { reason, route }
+    }
+
+    pub(super) fn route(&self) -> &FatalRoute {
+        &self.route
     }
 
     pub(super) fn event(&self, context: &RunContext, timestamp: Hlc) -> Event {
@@ -225,6 +238,71 @@ impl Drop for ActiveFlow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("transparent capture dataplane is closed")]
 pub struct DataplaneClosed;
+
+/// Gateway-side fatal sender that reports only after the shared dataplane has drained.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct GatewayFatalController {
+    latch: DataplaneLatch,
+    control: tokio::net::UnixDatagram,
+    reported: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl GatewayFatalController {
+    /// Clone the namespace-manager broker without taking it away from the UDP reply seam.
+    pub fn new(latch: DataplaneLatch, broker: &UnixDatagram) -> std::io::Result<Self> {
+        let control = broker.try_clone()?;
+        control.set_nonblocking(true)?;
+        Ok(Self {
+            latch,
+            control: tokio::net::UnixDatagram::from_std(control)?,
+            reported: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Latch and drain all application work, then send the first fatal report to the manager.
+    pub async fn trigger(&self, report: &FatalReport) -> Result<(), GatewayFatalError> {
+        let first = !self
+            .reported
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        self.latch.close().await;
+        if !first {
+            return Ok(());
+        }
+        let frame = encode_gateway_fatal(report)?;
+        let sent = self.control.send(&frame).await?;
+        if sent != frame.len() {
+            return Err(GatewayFatalError::PartialDatagram {
+                expected: frame.len(),
+                actual: sent,
+            });
+        }
+        Ok(())
+    }
+
+    /// Shared latch that accept loops and active flows must use for admission.
+    pub fn latch(&self) -> &DataplaneLatch {
+        &self.latch
+    }
+}
+
+/// Failure to report a fatal cause after the local dataplane was already closed.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Error)]
+pub enum GatewayFatalError {
+    /// The private manager channel failed after the latch closed.
+    #[error("send gateway fatal report: {0}")]
+    Io(#[from] std::io::Error),
+    /// A Unix datagram did not preserve its required atomic write.
+    #[error("gateway fatal datagram was partially sent: {actual}/{expected} bytes")]
+    PartialDatagram {
+        /// Complete encoded report length.
+        expected: usize,
+        /// Bytes accepted by the socket.
+        actual: usize,
+    },
+}
 
 /// Terminal nonzero result preserved independently of capture-event delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

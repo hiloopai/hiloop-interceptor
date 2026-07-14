@@ -94,14 +94,16 @@ That contract has an outer timeout and covers original IPv4/IPv6 destinations, p
 loopback, dual-stack mapped host loopback without gateway re-entry, boundary PMTU plus per-family
 fragment counters, transparent dual-stack UDP relay and reply-source identity,
 capability/descriptor and process-inspection confinement, workload exec failure, worker and pasta
-crashes, explicit shutdown, drop cleanup, and a detached descendant. It scans `/proc` after every
+crashes, an IPC-reported fatal transition with a detached descendant, explicit shutdown, drop
+cleanup, and a detached descendant. It scans `/proc` after every
 path so no owned helper or carrier remains to retain namespace, mount, veth, or nftables state.
 
 Normal CI still runs the provisioner/fake conformance tests, exact nft and policy-route generation,
 pasta argument/version and timeout checks, capability and descriptor plans, host-namespace UDP/TCP
 DNS relay, exact TTL-bounded answer tracking, resolver-file preservation, dual-stack UDP flow and
-policy-matrix tests, cleanup order, and MTU/fragment policy. A skipped real contract is not evidence
-that the host substrate works.
+policy-matrix tests, close-latch flow cancellation, fatal-report wire round trips, direct
+post-teardown fatal persistence under blocked export, cleanup order, and MTU/fragment policy. A
+skipped real contract is not evidence that the host substrate works.
 
 ### Nightly
 

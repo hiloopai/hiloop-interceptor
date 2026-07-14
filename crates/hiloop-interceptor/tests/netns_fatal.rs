@@ -24,6 +24,9 @@ use hiloop_interceptor::{
 };
 use tokio::sync::{Notify, oneshot};
 
+#[cfg(target_os = "linux")]
+use hiloop_interceptor::netns::GatewayFatalController;
+
 fn info() -> SubstrateInfo {
     SubstrateInfo::new(
         NonZeroU16::new(15_001).expect("test port is nonzero"),
@@ -221,6 +224,40 @@ async fn worker_crash_becomes_dataplane_fatal_after_ordered_teardown() {
     );
 }
 
+#[tokio::test]
+async fn gateway_fatal_signal_reaches_the_supervisor_only_after_fake_teardown() {
+    let report = tls_report(CaptureFatalReason::SecretDestinationMismatch);
+    let (fake, handle) = FakeNetworkProvisioner::scripted(
+        hiloop_interceptor::netns::PreflightReport::passed(true),
+        info(),
+        FakeSessionOutcome::Fatal(report),
+    );
+    let mut session = fake.provision(request()).await.expect("fake provision");
+    let exporter = Arc::new(OrderingExporter::new(handle.clone()));
+    let supervisor = FatalRunSupervisor::new(
+        RunContext::new_local_root(),
+        Arc::<OrderingExporter>::clone(&exporter),
+    );
+
+    let fatal = supervisor
+        .wait(session.as_mut())
+        .await
+        .expect_err("fatal report must fail the run")
+        .into_fatal()
+        .expect("typed fatal result");
+
+    assert_eq!(
+        fatal.reason(),
+        CaptureFatalReason::SecretDestinationMismatch
+    );
+    assert!(fatal.event_persisted());
+    assert!(
+        exporter
+            .calls_at_export()
+            .ends_with(&[FakeProvisionerCall::ReapHelpers])
+    );
+}
+
 #[derive(Debug)]
 struct BlockingExporter {
     provisioner: FakeProvisionerHandle,
@@ -313,4 +350,37 @@ async fn atomic_latch_cancels_active_flows_and_rejects_later_admission() {
     assert!(latch.is_closed());
     assert!(flow.await.expect("flow task").is_err());
     assert!(latch.run(async {}).await.is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn gateway_controller_drains_the_latch_before_reporting_fatality() {
+    use std::os::unix::net::UnixDatagram;
+
+    let (manager, worker) = UnixDatagram::pair().expect("private control pair");
+    manager.set_nonblocking(true).expect("nonblocking manager");
+    let manager = tokio::net::UnixDatagram::from_std(manager).expect("async manager");
+    let latch = DataplaneLatch::new();
+    let controller = GatewayFatalController::new(latch.clone(), &worker).expect("fatal controller");
+    let active = latch.clone();
+    let (started_tx, started_rx) = oneshot::channel();
+    let flow = tokio::spawn(async move {
+        active
+            .run(async move {
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .await
+    });
+    started_rx.await.expect("flow started");
+
+    controller
+        .trigger(&tls_report(CaptureFatalReason::SecretBindUnterminatable))
+        .await
+        .expect("report fatal");
+
+    assert!(latch.is_closed());
+    assert!(flow.await.expect("flow task").is_err());
+    let mut frame = [0_u8; 4 * 1024];
+    assert!(manager.recv(&mut frame).await.expect("manager report") > 1);
 }
