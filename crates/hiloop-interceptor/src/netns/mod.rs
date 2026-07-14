@@ -16,6 +16,7 @@ use thiserror::Error;
 mod classifier;
 mod dns;
 mod dns_relay;
+mod fatal;
 mod ingress;
 #[cfg(target_os = "linux")]
 mod listener;
@@ -47,6 +48,10 @@ pub use classifier::{
 };
 pub use dns::DnsAnswerTracker;
 pub use dns_relay::{DNS_RELAY_SOCKET_ENV, DnsQueryTransport, DnsRelayClient, GatewayDnsRelay};
+pub use fatal::{
+    DataplaneClosed, DataplaneLatch, FatalReport, FatalRunError, FatalRunResult,
+    FatalRunSupervisor, SupervisedRunError,
+};
 pub use ingress::{
     AdmittedTcpFlow, ConnectedTcpFlow, DirectTcpConnector, IngressError, TcpUpstreamConnector,
     TransparentTcpIngress, connect_authorized, recover_original_destination,
@@ -563,9 +568,25 @@ pub enum ProvisionError {
         #[source]
         source: Option<Box<dyn StdError + Send + Sync>>,
     },
+    /// The gateway latched closed and completed namespace teardown for a typed fatal route.
+    #[error("transparent network substrate failed fatally: {report:?}")]
+    Fatal {
+        /// Safe route metadata and the closed fatal reason.
+        report: FatalReport,
+        /// Ordered teardown failures reported after the fatal latch, when present.
+        cleanup_diagnostic: Option<String>,
+    },
 }
 
 impl ProvisionError {
+    /// Preserve a gateway fatal report after its close-first teardown completes.
+    pub fn fatal(report: FatalReport) -> Self {
+        Self::Fatal {
+            report,
+            cleanup_diagnostic: None,
+        }
+    }
+
     /// Report that the host cannot provide the required transparent transport.
     pub fn unavailable(
         reason: CaptureTransportDegradationReason,

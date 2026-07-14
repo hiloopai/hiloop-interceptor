@@ -1395,6 +1395,16 @@ mod linux {
                         .map(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
                 }
             }
+            ProvisionError::Fatal {
+                cleanup_diagnostic: fatal_cleanup,
+                ..
+            } => match fatal_cleanup {
+                Some(diagnostic) => {
+                    diagnostic.push_str("; ");
+                    diagnostic.push_str(&cleanup_diagnostic);
+                }
+                None => *fatal_cleanup = Some(cleanup_diagnostic),
+            },
         }
         error
     }
@@ -1611,6 +1621,10 @@ mod linux {
             ProvisionError::Cleanup { diagnostic, .. } => (
                 CaptureTransportDegradationReason::NetnsStartupFailed,
                 diagnostic,
+            ),
+            ProvisionError::Fatal { report, .. } => (
+                CaptureTransportDegradationReason::NetnsStartupFailed,
+                format!("preflight failed fatally: {}", report.reason()),
             ),
         };
         PreflightReport::failed(reason, diagnostic, connectivity.ipv4, connectivity.ipv6)
