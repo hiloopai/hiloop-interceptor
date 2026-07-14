@@ -1082,11 +1082,12 @@ fn reap_descendants() -> io::Result<()> {
         if reaped.is_empty() {
             let mut status = 0;
             let result = raw_waitpid(-1, &mut status, libc::WNOHANG);
-            if result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
-                return Ok(());
-            }
             if result == -1 {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    return Ok(());
+                }
+                return Err(error);
             }
         }
         if Instant::now() >= deadline {
