@@ -8,6 +8,7 @@ pub(super) const MAX_CLASSIFICATION_BYTES: usize = 64 * 1024;
 const MAX_TLS_RECORD_BYTES: usize = 18 * 1024;
 const MAX_HTTP_METHOD_BYTES: usize = 32;
 const ECH_EXTENSION: u16 = 0xfe0d;
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// More bytes are needed or a protocol has been classified.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +101,14 @@ fn classify_http_or_other(prefix: &[u8]) -> Result<ClassificationProgress, Class
     let Some(first) = prefix.first() else {
         return Ok(ClassificationProgress::NeedMore);
     };
+    if prefix.starts_with(HTTP2_PREFACE) {
+        return Ok(ClassificationProgress::Classified(
+            TcpProtocol::CleartextHttp(HttpIdentity { authority: None }),
+        ));
+    }
+    if HTTP2_PREFACE.starts_with(prefix) {
+        return Ok(ClassificationProgress::NeedMore);
+    }
     if !first.is_ascii_uppercase() {
         return Ok(ClassificationProgress::Classified(TcpProtocol::OtherTcp));
     }
@@ -543,6 +552,20 @@ mod tests {
             panic!("expected HTTP classification: {classified:?}");
         };
         assert_eq!(identity.authority(), Some("ExAmPle.COM:8080"));
+    }
+
+    #[test]
+    fn cleartext_http2_preface_is_not_treated_as_opaque_tcp() {
+        assert_eq!(
+            classify_tcp_prefix(&HTTP2_PREFACE[..12]).expect("partial h2 preface"),
+            ClassificationProgress::NeedMore
+        );
+        assert_eq!(
+            classify_tcp_prefix(HTTP2_PREFACE).expect("complete h2 preface"),
+            ClassificationProgress::Classified(TcpProtocol::CleartextHttp(HttpIdentity {
+                authority: None
+            }))
+        );
     }
 
     #[test]

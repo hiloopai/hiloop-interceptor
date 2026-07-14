@@ -163,6 +163,13 @@ fn visible_identity(
     };
     let identity =
         canonicalize_host(authority).map_err(|source| RouteDenial::InvalidIdentity { source })?;
+    if source == RoutingIdentitySource::TlsServerName
+        && (identity.port().is_some() || !matches!(identity.host(), CanonicalHost::Domain(_)))
+    {
+        return Err(RouteDenial::InvalidIdentity {
+            source: CanonicalizeError::Invalid,
+        });
+    }
     if identity
         .port()
         .is_some_and(|port| port != original_destination.port())
@@ -329,6 +336,24 @@ mod tests {
             ),
             Err(RouteDenial::DestinationMismatch)
         );
+    }
+
+    #[test]
+    fn tls_sni_must_be_a_dns_name_without_a_port() {
+        let original = destination("203.0.113.10", 443);
+        for protocol in [tls("example.com:443", false), tls("203.0.113.10", false)] {
+            assert_eq!(
+                authorize_route(
+                    &EgressPolicy::default(),
+                    &NoDnsAnswerEvidence,
+                    original,
+                    &protocol,
+                ),
+                Err(RouteDenial::InvalidIdentity {
+                    source: CanonicalizeError::Invalid
+                })
+            );
+        }
     }
 
     #[test]
