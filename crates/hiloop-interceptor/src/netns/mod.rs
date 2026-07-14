@@ -16,7 +16,10 @@ use thiserror::Error;
 mod classifier;
 mod dns;
 mod dns_relay;
+mod event_relay;
 mod fatal;
+#[cfg(target_os = "linux")]
+mod gateway;
 mod ingress;
 #[cfg(target_os = "linux")]
 mod listener;

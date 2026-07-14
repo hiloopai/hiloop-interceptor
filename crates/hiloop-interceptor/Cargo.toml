@@ -41,8 +41,10 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-rustls.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+tower-service.workspace = true
 ulid.workspace = true
 url.workspace = true
 # Validates CA-ness (BasicConstraints/KeyUsage) before a certificate becomes an
@@ -71,7 +73,6 @@ hyper = { workspace = true, features = ["client", "http2"] }
 # Deterministic clock control (`start_paused`, `time::advance`) for the export
 # spool's backoff tests; a dev-only feature, never part of the shipped build.
 tokio = { workspace = true, features = ["test-util"] }
-tokio-rustls.workspace = true
 
 [[bench]]
 name = "stdio_path"
