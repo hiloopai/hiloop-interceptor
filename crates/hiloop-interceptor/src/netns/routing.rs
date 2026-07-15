@@ -300,9 +300,7 @@ fn setup_commands(workload_pid: u32, enable_ipv6: bool) -> Vec<NamespacedCommand
         gateway_command("nft", ["-f", "-"]),
     ];
     if !enable_ipv6 {
-        commands.retain(|command| {
-            command.command().arguments().first().map(String::as_str) != Some("-6")
-        });
+        commands.retain(retained_for_ipv4_only);
     }
     commands
 }
@@ -373,11 +371,16 @@ fn teardown_commands(enable_ipv6: bool) -> Vec<NamespacedCommand> {
         ),
     ];
     if !enable_ipv6 {
-        commands.retain(|command| {
-            command.command().arguments().first().map(String::as_str) != Some("-6")
-        });
+        commands.retain(retained_for_ipv4_only);
     }
     commands
+}
+
+fn retained_for_ipv4_only(command: &NamespacedCommand) -> bool {
+    let arguments = command.command().arguments();
+    arguments.first().map(String::as_str) != Some("-6")
+        || (command.namespace() == NetworkNamespace::Gateway
+            && arguments.get(1).map(String::as_str) == Some("address"))
 }
 
 fn nft_script(intercept_port: NonZeroU16) -> String {
@@ -557,7 +560,14 @@ mod tests {
         let setup = command_lines(plan.setup_commands());
         let teardown = command_lines(plan.teardown_commands());
 
-        assert!(setup.iter().all(|command| !command.contains("ip -6")));
+        assert!(
+            setup
+                .iter()
+                .all(|command| !command.starts_with("Workload: ip -6"))
+        );
+        assert!(setup.contains(
+            &"Gateway: ip -6 address add fd00:6869:6c6f:6f70::1/64 dev hlgate0 nodad".to_owned()
+        ));
         assert!(teardown.iter().all(|command| !command.contains("ip -6")));
     }
 
