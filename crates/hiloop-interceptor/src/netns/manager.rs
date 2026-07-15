@@ -55,6 +55,7 @@ pub(super) const MANAGER_ROLE: &str = "__hiloop-netns-manager";
 pub(super) const WORKLOAD_ROLE: &str = "__hiloop-netns-workload";
 pub(super) const WORKER_PROBE_ROLE: &str = "__hiloop-netns-worker-probe";
 pub(super) const WORKLOAD_PROBE_ROLE: &str = "__hiloop-netns-workload-probe";
+pub(super) const IPV4_ONLY_PROBE_ARG: &str = "--ipv4-only";
 #[cfg(feature = "test-support")]
 pub(super) const DATAPLANE_WORKER_PROBE_ROLE: &str = "__hiloop-netns-dataplane-worker-probe";
 #[cfg(feature = "test-support")]
@@ -448,7 +449,7 @@ fn start_gateway(
     })?;
     let (workload_pid, mut workload_control) = spawn_workload_helper()
         .map_err(|error| ManagerFailure::new(StartupStage::Namespace, error))?;
-    let routing = RoutingPlan::new(pid_u32(workload_pid)?, port);
+    let routing = RoutingPlan::new(pid_u32(workload_pid)?, port, require_ipv6);
 
     if let Err(failure) = execute_gateway_setup(&routing) {
         let mut running = RunningGateway {
@@ -549,7 +550,7 @@ fn start_gateway(
         && matches!(&terminal, TerminalState::Workload(SubstrateExit::Code(0)))
     {
         thread::sleep(CHILD_POLL_INTERVAL);
-        validate_fragment_counters().err()
+        validate_fragment_counters(require_ipv6).err()
     } else {
         None
     };
@@ -640,11 +641,12 @@ fn start_gateway(
     }
 }
 
-fn validate_fragment_counters() -> io::Result<()> {
-    for (family, counter) in [
+fn validate_fragment_counters(enable_ipv6: bool) -> io::Result<()> {
+    let families = [
         ("IPv4", IPV4_FRAGMENT_COUNTER),
         ("IPv6", IPV6_FRAGMENT_COUNTER),
-    ] {
+    ];
+    for (family, counter) in families.into_iter().take(if enable_ipv6 { 2 } else { 1 }) {
         let output = Command::new("nft")
             .args(["list", "counter", "inet", NFT_TABLE, counter])
             .output()?;
@@ -1416,7 +1418,7 @@ fn worker_probe_entrypoint() -> io::Result<ExitCode> {
         IPV6_UDP_FD,
         WORKER_READY_FD,
     ])?;
-    validate_transparent_listener_probe(listeners)?;
+    validate_transparent_listener_probe(listeners, probe_ipv6_enabled())?;
     loop {
         raw_pause();
     }
@@ -1449,21 +1451,24 @@ fn workload_probe_entrypoint() -> io::Result<ExitCode> {
     }
     require_ptrace_denied(1, MANAGER_ROLE)?;
     require_process_inspection_denied(WORKER_PROBE_ROLE)?;
-    validate_udp_mtu_and_fragments()?;
-    validate_transparent_workload_probe()?;
+    let enable_ipv6 = probe_ipv6_enabled();
+    validate_udp_mtu_and_fragments(enable_ipv6)?;
+    validate_transparent_workload_probe(enable_ipv6)?;
     Ok(ExitCode::SUCCESS)
 }
 
 fn validate_transparent_listener_probe(
     listeners: crate::netns::listener::GatewayListeners,
+    enable_ipv6: bool,
 ) -> io::Result<()> {
     let (ipv4, ipv6, _udp_ipv4, _udp_ipv6, _broker) = listeners.into_parts();
     ipv4.set_nonblocking(false)?;
     ipv6.set_nonblocking(false)?;
-    for (listener, expected, response) in [
+    let probes = [
         (&ipv4, "198.51.100.42:443", 1_u8),
         (&ipv6, "[2001:db8::42]:443", 2_u8),
-    ] {
+    ];
+    for (listener, expected, response) in probes.into_iter().take(if enable_ipv6 { 2 } else { 1 }) {
         let (mut connection, _) = listener.accept()?;
         require_probe_destination(
             connection.local_addr()?,
@@ -1474,11 +1479,12 @@ fn validate_transparent_listener_probe(
     Ok(())
 }
 
-fn validate_transparent_workload_probe() -> io::Result<()> {
+fn validate_transparent_workload_probe(enable_ipv6: bool) -> io::Result<()> {
     use std::net::TcpStream;
 
     let timeout = Duration::from_secs(5);
-    for (destination, expected) in [("198.51.100.42:443", 1_u8), ("[2001:db8::42]:443", 2_u8)] {
+    let probes = [("198.51.100.42:443", 1_u8), ("[2001:db8::42]:443", 2_u8)];
+    for (destination, expected) in probes.into_iter().take(if enable_ipv6 { 2 } else { 1 }) {
         let address = destination.parse().map_err(invalid_input)?;
         let mut stream = TcpStream::connect_timeout(&address, timeout)?;
         stream.set_read_timeout(Some(timeout))?;
@@ -1607,7 +1613,7 @@ fn find_process_by_role(role: &str) -> io::Result<libc::pid_t> {
     ))
 }
 
-fn validate_udp_mtu_and_fragments() -> io::Result<()> {
+fn validate_udp_mtu_and_fragments(enable_ipv6: bool) -> io::Result<()> {
     validate_udp_family(
         IpFamily::Ipv4,
         "0.0.0.0:0",
@@ -1615,13 +1621,20 @@ fn validate_udp_mtu_and_fragments() -> io::Result<()> {
         libc::IPPROTO_IP,
         libc::IP_MTU_DISCOVER,
     )?;
-    validate_udp_family(
-        IpFamily::Ipv6,
-        "[::]:0",
-        "[2001:db8::42]:443",
-        libc::IPPROTO_IPV6,
-        libc::IPV6_MTU_DISCOVER,
-    )
+    if enable_ipv6 {
+        validate_udp_family(
+            IpFamily::Ipv6,
+            "[::]:0",
+            "[2001:db8::42]:443",
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+        )?;
+    }
+    Ok(())
+}
+
+fn probe_ipv6_enabled() -> bool {
+    std::env::args_os().nth(2).as_deref() != Some(OsStr::new(IPV4_ONLY_PROBE_ARG))
 }
 
 fn validate_udp_family(
@@ -1878,7 +1891,7 @@ fn dataplane_workload_probe_entrypoint() -> io::Result<ExitCode> {
     require_empty_capabilities()?;
     require_only_open_fds(&[])?;
     validate_private_workload_loopback()?;
-    validate_udp_mtu_and_fragments()?;
+    validate_udp_mtu_and_fragments(true)?;
     let host_ipv4_port = parse_probe_port(2)?;
     let host_ipv6_port = parse_probe_port(3)?;
     let host_udp_ipv4_port = parse_probe_port(4)?;
@@ -2403,7 +2416,11 @@ mod tests {
 
     #[test]
     fn teardown_plan_closes_veth_before_any_other_resource() {
-        let plan = RoutingPlan::new(9, NonZeroU16::new(15_001).expect("test port is nonzero"));
+        let plan = RoutingPlan::new(
+            9,
+            NonZeroU16::new(15_001).expect("test port is nonzero"),
+            true,
+        );
         let first = plan.teardown_commands().first().expect("teardown command");
         assert_eq!(first.command().program(), "ip");
         assert_eq!(
@@ -2466,7 +2483,11 @@ mod tests {
 
     #[test]
     fn ipv6_gateway_setup_failures_keep_the_closed_ipv6_reason() {
-        let plan = RoutingPlan::new(9, NonZeroU16::new(15_001).expect("test port is nonzero"));
+        let plan = RoutingPlan::new(
+            9,
+            NonZeroU16::new(15_001).expect("test port is nonzero"),
+            true,
+        );
         let (index, command) = plan
             .setup_commands()
             .iter()

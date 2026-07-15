@@ -1,0 +1,6 @@
+[test-groups]
+real-netns = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^real_(rootless_substrate|system_composer_)/)'
+test-group = 'real-netns'

@@ -11,7 +11,7 @@ use hiloop_core::capture::CaptureTransportDegradationReason;
 use hiloop_interceptor::netns::{
     FragmentedUdpBehavior, NamespaceCommand, NetworkProvisioner, PreflightReport, ProvisionError,
     ProvisionRequest, StartupStage, SubstrateExit, SubstrateInfo,
-    testing::{FakeNetworkProvisioner, FakeProvisionerCall},
+    testing::{FakeNetworkProvisioner, FakeProvisionerCall, force_dual_stack},
 };
 
 const WORKER_PROBE_ROLE: &str = "__hiloop-netns-worker-probe";
@@ -104,9 +104,11 @@ async fn real_rootless_substrate_contract() {
         .map(PathBuf::from)
         .expect("set HILOOP_TEST_PASTA to the pinned pasta binary");
     let helper = PathBuf::from(env!("CARGO_BIN_EXE_hiloop-interceptor"));
-    let provisioner = SystemNetworkProvisioner::new(&pasta)
-        .expect("system provisioner")
-        .with_helper_executable(&helper);
+    let provisioner = force_dual_stack(
+        SystemNetworkProvisioner::new(&pasta)
+            .expect("system provisioner")
+            .with_helper_executable(&helper),
+    );
 
     let preflight = provisioner.preflight().await;
     wait_for_cleanup(&helper, &[&pasta]);

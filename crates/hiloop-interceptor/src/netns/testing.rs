@@ -10,9 +10,21 @@ use hiloop_core::capture::CaptureTransportDegradationReason;
 
 use super::{
     FatalReport, NetnsRun, NetworkProvisioner, NetworkSession, PreflightReport, ProvisionError,
-    ProvisionRequest, StartupStage, SubstrateExit, SubstrateInfo,
+    ProvisionRequest, StartupStage, SubstrateExit, SubstrateInfo, SystemNetworkProvisioner,
 };
 use crate::supervisor::RunOptions;
+
+/// Force the real provisioner to expose only IPv4 host egress in substrate tests.
+#[must_use]
+pub fn force_ipv4_only(provisioner: SystemNetworkProvisioner) -> SystemNetworkProvisioner {
+    provisioner.force_ipv4_only()
+}
+
+/// Force both host IP families for real dual-stack substrate tests.
+#[must_use]
+pub fn force_dual_stack(provisioner: SystemNetworkProvisioner) -> SystemNetworkProvisioner {
+    provisioner.force_dual_stack()
+}
 
 /// One observable call through the composed netns-run port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

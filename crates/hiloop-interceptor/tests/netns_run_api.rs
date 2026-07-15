@@ -16,7 +16,7 @@ use hiloop_interceptor::{
         SystemNetworkProvisioner,
         testing::{
             FakeNetnsRun, FakeNetnsRunCall, FakeNetworkProvisioner, FakeProvisionerCall,
-            FakeSessionOutcome,
+            FakeSessionOutcome, force_ipv4_only,
         },
     },
     run,
@@ -366,4 +366,62 @@ async fn real_system_composer_captures_cleartext_http_without_proxy_environment(
         .collect::<Vec<_>>();
     assert!(event_names.contains(&serde_json::Value::String("http.request".to_owned())));
     assert!(event_names.contains(&serde_json::Value::String("http.response".to_owned())));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires unprivileged user/net/PID namespaces, nft TPROXY, /dev/net/tun, curl, internet access, and pinned pasta"]
+async fn real_system_composer_reaches_dual_stack_https_with_forced_ipv4_only_egress() {
+    let pasta = std::env::var_os("HILOOP_TEST_PASTA")
+        .map(PathBuf::from)
+        .expect("set HILOOP_TEST_PASTA to the pinned pasta binary");
+    let helper = PathBuf::from(env!("CARGO_BIN_EXE_hiloop-interceptor"));
+    let provisioner = force_ipv4_only(
+        SystemNetworkProvisioner::new(&pasta)
+            .expect("system provisioner")
+            .with_helper_executable(&helper),
+    );
+    let runner = Arc::new(SystemNetnsRun::with_provisioner(
+        Arc::new(provisioner),
+        &helper,
+    ));
+    let preflight = runner.preflight().await;
+    assert_eq!(
+        preflight.result(),
+        CapturePreflight::Passed,
+        "{}",
+        preflight.diagnostic().unwrap_or("preflight failed")
+    );
+    assert!(preflight.ipv4_available());
+    assert!(!preflight.ipv6_available());
+
+    let temp = tempfile::tempdir().expect("capture directory");
+    let options = RunOptions::new(
+        RunContext::new_local_root(),
+        vec![
+            "curl".to_owned(),
+            "--fail".to_owned(),
+            "--silent".to_owned(),
+            "--show-error".to_owned(),
+            "--connect-timeout".to_owned(),
+            "10".to_owned(),
+            "--max-time".to_owned(),
+            "30".to_owned(),
+            "--output".to_owned(),
+            "/dev/null".to_owned(),
+            "https://example.com".to_owned(),
+        ],
+        Some(temp.path().join("events.jsonl")),
+        None,
+        Some(temp.path().join("blobs")),
+        false,
+        NetworkCapture::netns(NetCaptureMode::Netns, preflight, runner),
+        None,
+        None,
+    );
+    let code = tokio::time::timeout(Duration::from_secs(90), run(&options))
+        .await
+        .expect("composed run timed out")
+        .expect("composed run");
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
 }
