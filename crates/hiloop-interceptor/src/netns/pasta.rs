@@ -31,8 +31,13 @@ pub(super) struct PastaCommand {
 }
 
 impl PastaCommand {
-    pub(super) fn attach(program: impl Into<PathBuf>, target_pid: u32, pid_file: &Path) -> Self {
-        Self {
+    pub(super) fn attach(
+        program: impl Into<PathBuf>,
+        target_pid: u32,
+        pid_file: &Path,
+        enable_ipv6: bool,
+    ) -> Self {
+        let mut command = Self {
             program: program.into(),
             args: [
                 OsString::from("--foreground"),
@@ -62,7 +67,13 @@ impl PastaCommand {
             ]
             .into_iter()
             .collect(),
+        };
+        if !enable_ipv6 {
+            command
+                .args
+                .insert(command.args.len() - 1, OsString::from("--ipv4-only"));
         }
+        command
     }
 
     #[cfg(test)]
@@ -278,7 +289,7 @@ mod tests {
 
     #[test]
     fn attach_arguments_pin_isolation_mtu_and_no_inbound_forwarding() {
-        let command = PastaCommand::attach("/bundle/pasta", 42, Path::new("/tmp/pasta.pid"));
+        let command = PastaCommand::attach("/bundle/pasta", 42, Path::new("/tmp/pasta.pid"), true);
         assert_eq!(command.program(), Path::new("/bundle/pasta"));
         assert_eq!(
             command.arguments(),
@@ -310,6 +321,13 @@ mod tests {
             ]
             .map(OsString::from)
         );
+    }
+
+    #[test]
+    fn attach_disables_ipv6_when_host_egress_is_ipv4_only() {
+        let command = PastaCommand::attach("/bundle/pasta", 42, Path::new("/tmp/pasta.pid"), false);
+
+        assert!(command.arguments().contains(&OsString::from("--ipv4-only")));
     }
 
     #[test]

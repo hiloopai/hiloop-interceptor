@@ -91,10 +91,10 @@ pub(super) struct RoutingPlan {
 }
 
 impl RoutingPlan {
-    pub(super) fn new(workload_pid: u32, intercept_port: NonZeroU16) -> Self {
+    pub(super) fn new(workload_pid: u32, intercept_port: NonZeroU16, enable_ipv6: bool) -> Self {
         Self {
-            setup: setup_commands(workload_pid),
-            teardown: teardown_commands(),
+            setup: setup_commands(workload_pid, enable_ipv6),
+            teardown: teardown_commands(enable_ipv6),
             nft_script: nft_script(intercept_port),
         }
     }
@@ -112,7 +112,7 @@ impl RoutingPlan {
     }
 }
 
-fn setup_commands(workload_pid: u32) -> Vec<NamespacedCommand> {
+fn setup_commands(workload_pid: u32, enable_ipv6: bool) -> Vec<NamespacedCommand> {
     let gateway_ipv4 = GATEWAY_IPV4.to_string();
     let gateway_ipv6 = GATEWAY_IPV6.to_string();
     let gateway_ipv4_cidr = format!("{GATEWAY_IPV4}/{IPV4_PREFIX_LENGTH}");
@@ -125,7 +125,7 @@ fn setup_commands(workload_pid: u32) -> Vec<NamespacedCommand> {
     let table = TPROXY_TABLE.to_string();
     let priority = TPROXY_RULE_PRIORITY.to_string();
 
-    vec![
+    let mut commands = vec![
         gateway_command(
             "ip",
             [
@@ -298,15 +298,21 @@ fn setup_commands(workload_pid: u32) -> Vec<NamespacedCommand> {
             ],
         ),
         gateway_command("nft", ["-f", "-"]),
-    ]
+    ];
+    if !enable_ipv6 {
+        commands.retain(|command| {
+            command.command().arguments().first().map(String::as_str) != Some("-6")
+        });
+    }
+    commands
 }
 
-fn teardown_commands() -> Vec<NamespacedCommand> {
+fn teardown_commands(enable_ipv6: bool) -> Vec<NamespacedCommand> {
     let mark = format!("{TPROXY_MARK:#x}");
     let table = TPROXY_TABLE.to_string();
     let priority = TPROXY_RULE_PRIORITY.to_string();
 
-    vec![
+    let mut commands = vec![
         gateway_command("ip", ["link", "delete", "dev", GATEWAY_INTERFACE]),
         gateway_command("nft", ["delete", "table", "inet", NFT_TABLE]),
         gateway_command(
@@ -365,7 +371,13 @@ fn teardown_commands() -> Vec<NamespacedCommand> {
                 table.as_str(),
             ],
         ),
-    ]
+    ];
+    if !enable_ipv6 {
+        commands.retain(|command| {
+            command.command().arguments().first().map(String::as_str) != Some("-6")
+        });
+    }
+    commands
 }
 
 fn nft_script(intercept_port: NonZeroU16) -> String {
@@ -506,6 +518,7 @@ mod tests {
         let plan = RoutingPlan::new(
             4_242,
             NonZeroU16::new(15_001).expect("test port is nonzero"),
+            true,
         );
 
         assert_eq!(
@@ -535,10 +548,25 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_only_setup_does_not_advertise_ipv6_to_the_workload() {
+        let plan = RoutingPlan::new(
+            4_242,
+            NonZeroU16::new(15_001).expect("test port is nonzero"),
+            false,
+        );
+        let setup = command_lines(plan.setup_commands());
+        let teardown = command_lines(plan.teardown_commands());
+
+        assert!(setup.iter().all(|command| !command.contains("ip -6")));
+        assert!(teardown.iter().all(|command| !command.contains("ip -6")));
+    }
+
+    #[test]
     fn teardown_closes_veth_before_gateway_policy_cleanup() {
         let plan = RoutingPlan::new(
             4_242,
             NonZeroU16::new(15_001).expect("test port is nonzero"),
+            true,
         );
 
         assert_eq!(
@@ -564,6 +592,7 @@ mod tests {
         let plan = RoutingPlan::new(
             4_242,
             NonZeroU16::new(15_001).expect("test port is nonzero"),
+            true,
         );
 
         assert_eq!(
@@ -597,7 +626,11 @@ mod tests {
 
     #[test]
     fn nft_scope_and_fragment_order_cannot_silently_widen() {
-        let plan = RoutingPlan::new(9, NonZeroU16::new(32_000).expect("test port is nonzero"));
+        let plan = RoutingPlan::new(
+            9,
+            NonZeroU16::new(32_000).expect("test port is nonzero"),
+            true,
+        );
         let script = plan.nft_script();
 
         assert_eq!(script.matches("iifname \"hlgate0\"").count(), 11);

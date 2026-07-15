@@ -62,6 +62,12 @@ impl SystemNetworkProvisioner {
         self.forced_host_ip_families = Some((true, false));
         self
     }
+
+    #[cfg(feature = "test-support")]
+    pub(super) fn force_dual_stack(mut self) -> Self {
+        self.forced_host_ip_families = Some((true, true));
+        self
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -136,7 +142,7 @@ mod linux {
         NetworkSession, PreflightReport, ProvisionError, ProvisionRequest, StartupStage,
         SubstrateExit, SubstrateInfo,
         dns_relay::{HostDnsRelay, relay_socket_environment},
-        manager::{MANAGER_ROLE, WORKER_PROBE_ROLE, WORKLOAD_PROBE_ROLE},
+        manager::{IPV4_ONLY_PROBE_ARG, MANAGER_ROLE, WORKER_PROBE_ROLE, WORKLOAD_PROBE_ROLE},
         pasta::{
             PastaCommand, PastaStartupFailure, classify_startup_stderr, verify_version,
             wait_until_ready,
@@ -168,10 +174,14 @@ mod linux {
             return report;
         }
 
-        let workload =
+        let mut workload =
             crate::netns::NamespaceCommand::new(&provisioner.helper_path).arg(WORKLOAD_PROBE_ROLE);
-        let worker =
+        let mut worker =
             crate::netns::NamespaceCommand::new(&provisioner.helper_path).arg(WORKER_PROBE_ROLE);
+        if !connectivity.ipv6 {
+            workload = workload.arg(IPV4_ONLY_PROBE_ARG);
+            worker = worker.arg(IPV4_ONLY_PROBE_ARG);
+        }
         let request = ProvisionRequest::new(workload, worker);
         match launch(provisioner, request, connectivity.ipv6, true).await {
             Ok(mut session) => {
@@ -460,7 +470,7 @@ mod linux {
             }
         };
 
-        resources.start_pasta(provisioner, gateway_pid)?;
+        resources.start_pasta(provisioner, gateway_pid, require_ipv6)?;
         resources
             .wait_for_pasta_ready(provisioner.startup_timeout, require_ipv6)
             .await?;
@@ -675,6 +685,7 @@ mod linux {
             &mut self,
             provisioner: &SystemNetworkProvisioner,
             gateway_pid: u32,
+            enable_ipv6: bool,
         ) -> Result<(), LaunchFailure> {
             let (pid_file, pid_file_path) = anonymous_readiness_file().map_err(|error| {
                 LaunchFailure::Error(pasta_startup_from_io(
@@ -683,9 +694,13 @@ mod linux {
                     error,
                 ))
             })?;
-            let mut command =
-                PastaCommand::attach(&provisioner.pasta_path, gateway_pid, &pid_file_path)
-                    .into_tokio_command();
+            let mut command = PastaCommand::attach(
+                &provisioner.pasta_path,
+                gateway_pid,
+                &pid_file_path,
+                enable_ipv6,
+            )
+            .into_tokio_command();
             let sanitizer = PreExecDescriptorSanitizer::prepare(&[]).map_err(|error| {
                 LaunchFailure::Error(pasta_startup_from_io(
                     CaptureTransportDegradationReason::NetnsStartupFailed,
