@@ -60,7 +60,7 @@ pub use fatal::{
 pub use fatal::{GatewayFatalController, GatewayFatalError};
 pub use ingress::{
     AdmittedTcpFlow, ConnectedTcpFlow, DirectTcpConnector, IngressError, TcpUpstreamConnector,
-    TransparentTcpIngress, connect_authorized, recover_original_destination,
+    TransparentTcpIngress, admit_client, connect_authorized, recover_original_destination,
 };
 #[cfg(target_os = "linux")]
 pub use listener::{GatewayListeners, GatewayWorkerBootstrap};

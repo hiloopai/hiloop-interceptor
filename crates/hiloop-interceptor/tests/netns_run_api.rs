@@ -427,6 +427,108 @@ async fn real_system_composer_captures_cleartext_http_without_proxy_environment(
     assert!(event_names.contains(&serde_json::Value::String("http.response".to_owned())));
 }
 
+/// A claude/bun-shaped client aborts speculative connections (happy-eyeballs losers,
+/// cancelled preconnects) with an RST before sending a byte. That is one flow's
+/// lifecycle: the dataplane must keep serving and the run must still succeed.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires unprivileged user/net/PID namespaces, nft TPROXY, /dev/net/tun, curl, python3, and pinned pasta"]
+async fn real_system_composer_survives_client_aborted_connections() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let pasta = std::env::var_os("HILOOP_TEST_PASTA")
+        .map(PathBuf::from)
+        .expect("set HILOOP_TEST_PASTA to the pinned pasta binary");
+    let helper = PathBuf::from(env!("CARGO_BIN_EXE_hiloop-interceptor"));
+    let provisioner = SystemNetworkProvisioner::new(&pasta)
+        .expect("system provisioner")
+        .with_helper_executable(&helper);
+    let runner = Arc::new(SystemNetnsRun::with_provisioner(
+        Arc::new(provisioner),
+        &helper,
+    ));
+    let preflight = runner.preflight().await;
+    assert_eq!(
+        preflight.result(),
+        CapturePreflight::Passed,
+        "{}",
+        preflight.diagnostic().unwrap_or("preflight failed")
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("host HTTP fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    let fixture = tokio::spawn(async move {
+        // Serve until one complete request arrives; aborted connections are expected.
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("fixture accept");
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0_u8; 1024];
+                let Ok(length) = stream.read(&mut buffer).await else {
+                    break;
+                };
+                if length == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..length]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .expect("fixture response");
+                    return;
+                }
+            }
+        }
+    });
+
+    let abort_then_fetch = format!(
+        "python3 -c 'import socket, struct\n\
+         s = socket.create_connection((\"169.254.2.2\", {port}))\n\
+         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(\"ii\", 1, 0))\n\
+         s.close()'\n\
+         sleep 1\n\
+         exec curl --fail --silent http://169.254.2.2:{port}/"
+    );
+    let temp = tempfile::tempdir().expect("capture directory");
+    let events = temp.path().join("events.jsonl");
+    let options = RunOptions::new(
+        RunContext::new_local_root(),
+        vec!["sh".to_owned(), "-c".to_owned(), abort_then_fetch],
+        Some(events.clone()),
+        None,
+        Some(temp.path().join("blobs")),
+        false,
+        NetworkCapture::netns(NetCaptureMode::Netns, preflight, runner),
+        None,
+        None,
+    );
+    let code = tokio::time::timeout(Duration::from_secs(90), run(&options))
+        .await
+        .expect("composed run timed out")
+        .expect("an aborted client connection must not fail the run");
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    fixture.await.expect("fixture task");
+
+    let contents = std::fs::read_to_string(events).expect("events");
+    let event_names = contents
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("event JSON")["name"].clone()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !event_names.contains(&serde_json::Value::String("capture.fatal".to_owned())),
+        "aborted client connections must not be dataplane-fatal: {event_names:?}"
+    );
+    assert!(event_names.contains(&serde_json::Value::String("http.request".to_owned())));
+    assert!(event_names.contains(&serde_json::Value::String("http.response".to_owned())));
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires unprivileged user/net/PID namespaces, nft TPROXY, /dev/net/tun, curl, internet access, and pinned pasta"]

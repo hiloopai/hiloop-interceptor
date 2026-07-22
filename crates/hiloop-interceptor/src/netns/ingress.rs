@@ -44,26 +44,27 @@ impl TransparentTcpIngress {
         })
     }
 
+    /// Accept one intercepted client socket without classifying or authorizing it.
+    ///
+    /// Errors here concern the shared listeners, so an accept loop may treat them as
+    /// dataplane-level; everything after the accepted socket exists is that one flow's
+    /// problem and belongs in [`admit_client`].
+    pub async fn accept_client(&self) -> io::Result<TcpStream> {
+        let (client, _) = tokio::select! {
+            result = self.ipv4.accept() => result,
+            result = self.ipv6.accept() => result,
+        }?;
+        Ok(client)
+    }
+
     /// Accept, classify, and authorize one flow without opening an upstream socket.
     pub async fn accept(
         &self,
         policy: &EgressPolicy,
         dns: &dyn DnsAnswerEvidence,
     ) -> Result<AdmittedTcpFlow, IngressError> {
-        let (client, _) = tokio::select! {
-            result = self.ipv4.accept() => result,
-            result = self.ipv6.accept() => result,
-        }
-        .map_err(IngressError::Socket)?;
-        let original_destination =
-            recover_original_destination(&client).map_err(IngressError::Socket)?;
-        let protocol = classify_stream(&client).await?;
-        let route = authorize_route(policy, dns, original_destination, &protocol)?;
-        Ok(AdmittedTcpFlow {
-            client,
-            route,
-            protocol,
-        })
+        let client = self.accept_client().await.map_err(IngressError::Socket)?;
+        admit_client(client, policy, dns).await
     }
 
     /// Accept and authorize before asking the connector to open the upstream socket.
@@ -161,6 +162,27 @@ impl<S> ConnectedTcpFlow<S> {
     }
 }
 
+/// Classify and authorize one accepted client socket without opening an upstream socket.
+///
+/// Every error is scoped to the supplied client: a peer that resets, closes, or stalls its
+/// own connection before classification completes has abandoned that flow and nothing else.
+/// Callers serving a shared dataplane must drop the flow and keep accepting.
+pub async fn admit_client(
+    client: TcpStream,
+    policy: &EgressPolicy,
+    dns: &dyn DnsAnswerEvidence,
+) -> Result<AdmittedTcpFlow, IngressError> {
+    let original_destination =
+        recover_original_destination(&client).map_err(IngressError::Socket)?;
+    let protocol = classify_stream(&client).await?;
+    let route = authorize_route(policy, dns, original_destination, &protocol)?;
+    Ok(AdmittedTcpFlow {
+        client,
+        route,
+        protocol,
+    })
+}
+
 /// Open an upstream socket only for a previously authorized flow.
 pub async fn connect_authorized<C: TcpUpstreamConnector>(
     flow: AdmittedTcpFlow,
@@ -242,6 +264,62 @@ mod tests {
         egress::{EgressMode, EgressPolicy},
         netns::{NoDnsAnswerEvidence, RoutingIdentitySource, authorize_route},
     };
+
+    #[tokio::test]
+    async fn client_abort_before_classification_is_per_flow_and_ingress_keeps_serving() {
+        // A reset (happy-eyeballs loser, cancelled preconnect) and a clean close are both
+        // ordinary client lifecycle; each must fail only its own flow.
+        for reset in [true, false] {
+            let (ingress, ipv4, _) = ingress().expect("dual-stack ingress");
+            let aborter = TcpStream::connect(ipv4).await.expect("connect");
+            if reset {
+                #[expect(
+                    deprecated,
+                    reason = "linger-0 close is the portable way to force the RST this test needs; the blocking-drop hazard is immaterial for one test socket"
+                )]
+                aborter.set_linger(Some(Duration::ZERO)).expect("linger");
+            }
+            let accepted = ingress.accept_client().await.expect("accept client");
+            drop(aborter);
+            let error = admit_client(accepted, &EgressPolicy::default(), &NoDnsAnswerEvidence)
+                .await
+                .expect_err("aborted client cannot be admitted");
+            assert!(
+                matches!(error, IngressError::Socket(_)),
+                "abort classifies as a per-flow socket error: {error}"
+            );
+
+            let follow_up = tokio::spawn(async move {
+                let mut stream = TcpStream::connect(ipv4).await.expect("connect");
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                    .await
+                    .expect("write request");
+                stream
+            });
+            let admitted = ingress
+                .accept(&EgressPolicy::default(), &NoDnsAnswerEvidence)
+                .await
+                .expect("the ingress serves the next flow after an abort");
+            assert_eq!(admitted.route().original_destination().port(), ipv4.port());
+            drop(follow_up.await.expect("client task"));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_client_past_the_deadline_is_a_per_flow_timeout() {
+        let (ingress, ipv4, _) = ingress().expect("dual-stack ingress");
+        let idle = TcpStream::connect(ipv4).await.expect("connect");
+        let accepted = ingress.accept_client().await.expect("accept client");
+        let error = admit_client(accepted, &EgressPolicy::default(), &NoDnsAnswerEvidence)
+            .await
+            .expect_err("a silent client cannot be admitted");
+        assert!(
+            matches!(error, IngressError::ClassificationTimeout),
+            "idle preconnect classifies as a per-flow timeout: {error}"
+        );
+        drop(idle);
+    }
 
     #[tokio::test]
     async fn recovers_ipv4_and_ipv6_original_destinations() {

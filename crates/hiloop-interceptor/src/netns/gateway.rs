@@ -58,8 +58,8 @@ use crate::{
 use super::{
     AdmittedTcpFlow, AuthorizedRoute, DataplaneClosed, DirectTcpConnector, DnsAnswerTracker,
     DnsRelayClient, FatalReport, GatewayDnsRelay, GatewayFatalController, GatewayWorkerBootstrap,
-    IngressError, NamespaceCommand, NetworkCapture, RequestAuthorityRejection, SecretRoute,
-    TcpProtocol, TlsPolicyEngine, TlsPolicyFlow, TlsTransportDecision, TransparentTcpIngress,
+    NamespaceCommand, NetworkCapture, RequestAuthorityRejection, SecretRoute, TcpProtocol,
+    TlsPolicyEngine, TlsPolicyFlow, TlsTransportDecision, TransparentTcpIngress,
     TransparentUdpChildSink, TransparentUdpIngress, UdpFlowRelay, UdpIngressError,
     classifier::HTTP2_PREFACE,
     classify_client_handshake_error, connect_authorized,
@@ -507,20 +507,40 @@ struct TcpGateway {
 
 async fn serve_tcp(gateway: TcpGateway) -> io::Result<()> {
     loop {
-        let admitted = match gateway
-            .ingress
-            .accept(&gateway.egress, &*gateway.tracker)
-            .await
-        {
-            Ok(flow) => flow,
-            Err(IngressError::Denied(_)) => continue,
-            Err(error) => return Err(io::Error::other(error)),
+        let client = match gateway.ingress.accept_client().await {
+            Ok(client) => client,
+            // A connection that dies while queued behind accept is that client's
+            // lifecycle, not a listener failure.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         let gateway = gateway.clone();
         tokio::spawn(async move {
             let latch = gateway.latch.clone();
-            let _ = Box::pin(latch.run(handle_tcp_flow(gateway, admitted))).await;
+            let _ = Box::pin(latch.run(admit_and_handle_tcp_flow(gateway, client))).await;
         });
+    }
+}
+
+/// Classify, authorize, and serve one accepted client without touching the shared dataplane.
+///
+/// Admission failures are contained to the flow: clients routinely reset happy-eyeballs
+/// losers, close speculative preconnects, or stall past the classification deadline, and
+/// none of that says anything about the gateway's ability to serve other flows.
+async fn admit_and_handle_tcp_flow(
+    gateway: TcpGateway,
+    client: tokio::net::TcpStream,
+) -> io::Result<()> {
+    match super::admit_client(client, &gateway.egress, &*gateway.tracker).await {
+        Ok(admitted) => handle_tcp_flow(gateway, admitted).await,
+        Err(_) => Ok(()),
     }
 }
 
@@ -1003,9 +1023,121 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use crate::netns::{
-        ClassificationProgress, FragmentedUdpBehavior, SubstrateInfo, classify_tcp_prefix,
+        ClassificationProgress, DataplaneLatch, FragmentedUdpBehavior, SubstrateInfo,
+        classify_tcp_prefix,
     };
     use tokio::io::AsyncWriteExt as _;
+
+    struct TcpGatewayFixture {
+        gateway: TcpGateway,
+        fatal_rx: mpsc::Receiver<FatalReport>,
+        ipv4: SocketAddr,
+        _temp: tempfile::TempDir,
+        _raw_rx: mpsc::Receiver<Result<RawSignal, SourceError>>,
+        _event_rx: mpsc::Receiver<Event>,
+    }
+
+    async fn tcp_gateway(egress: EgressPolicy) -> TcpGatewayFixture {
+        let ipv4 = std::net::TcpListener::bind("127.0.0.1:0").expect("IPv4 listener");
+        let ipv6 = std::net::TcpListener::bind("[::1]:0").expect("IPv6 listener");
+        let ipv4_address = ipv4.local_addr().expect("IPv4 address");
+        let ingress = Arc::new(TransparentTcpIngress::from_std(ipv4, ipv6).expect("ingress"));
+        let egress = Arc::new(egress);
+        let temp = tempfile::tempdir().expect("blob directory");
+        let blob_store: Arc<dyn BlobStore> = Arc::new(
+            DirBlobStore::create(temp.path().join("blobs"))
+                .await
+                .expect("blob store"),
+        );
+        let clock = Arc::new(HlcClock::new());
+        let (raw_tx, raw_rx) = mpsc::channel(64);
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (fatal_tx, fatal_rx) = mpsc::channel(1);
+        let handler = CaptureHandler::new(
+            raw_tx,
+            Arc::clone(&clock),
+            blob_store,
+            None,
+            RedactionPolicy::disabled(),
+            Arc::clone(&egress),
+            Arc::new(AnomalyConfig::default()),
+            None,
+        );
+        let policy = Arc::new(TlsPolicyEngine::new(
+            false,
+            &egress,
+            CompatibilityRegistry::current(),
+        ));
+        TcpGatewayFixture {
+            gateway: TcpGateway {
+                ingress,
+                context: Arc::new(RunContext::new_local_root()),
+                clock,
+                egress,
+                tracker: Arc::new(DnsAnswerTracker::default()),
+                policy,
+                bound_hosts: Arc::new(Vec::new()),
+                handler,
+                ca: Arc::new(ProxyCa::generate().expect("interception CA")),
+                event_tx,
+                fatal_tx,
+                latch: DataplaneLatch::new(),
+            },
+            fatal_rx,
+            ipv4: ipv4_address,
+            _temp: temp,
+            _raw_rx: raw_rx,
+            _event_rx: event_rx,
+        }
+    }
+
+    #[tokio::test]
+    async fn per_client_aborts_never_stop_the_tcp_gateway_or_report_fatal() {
+        let policy = EgressPolicy::new(EgressMode::Allow, ["blocked.example.com".to_owned()], [])
+            .expect("egress policy");
+        let mut fixture = tcp_gateway(policy).await;
+        let serve = tokio::spawn(serve_tcp(fixture.gateway));
+
+        // Reset (linger-0 close), clean close, and a policy-denied flow: each is one
+        // client's lifecycle and none may end the shared accept loop.
+        for reset in [true, false] {
+            let client = tokio::net::TcpStream::connect(fixture.ipv4)
+                .await
+                .expect("connect");
+            if reset {
+                #[expect(
+                    deprecated,
+                    reason = "linger-0 close is the portable way to force the RST this test needs; the blocking-drop hazard is immaterial for one test socket"
+                )]
+                client.set_linger(Some(Duration::ZERO)).expect("linger");
+            }
+            // Let the gateway accept and start classifying before the abort lands.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(client);
+        }
+        let mut denied = tokio::net::TcpStream::connect(fixture.ipv4)
+            .await
+            .expect("connect");
+        denied
+            .write_all(b"GET / HTTP/1.1\r\nHost: blocked.example.com\r\n\r\n")
+            .await
+            .expect("write denied request");
+        drop(denied);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            matches!(
+                fixture.fatal_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "per-client aborts must not report a dataplane fatal"
+        );
+        assert!(
+            !serve.is_finished(),
+            "per-client aborts must not stop the transparent TCP accept loop"
+        );
+        serve.abort();
+    }
 
     #[tokio::test]
     async fn production_dispatch_consumes_every_tls_transport_decision_variant() {
