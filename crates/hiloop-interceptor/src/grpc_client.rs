@@ -1,8 +1,9 @@
 //! Shared plumbing for gRPC clients of a hiloop telemetry gateway: channel construction with the
-//! interceptor's TLS trust policy, Bearer auth sourced from the environment, and compact rendering
-//! of rejection `Status` chains. Used by the event exporter ([`crate::grpc_export`]) and the blob
-//! uploader ([`crate::blob_upload`]) so the two clients can never drift on endpoint, trust, or
-//! credential handling.
+//! interceptor's TLS trust policy, the shared refreshable Bearer credential
+//! ([`GatewayCredential`], sourced from the environment or an explicit token), and compact
+//! rendering of rejection `Status` chains. Used by the event exporter ([`crate::grpc_export`])
+//! and the blob uploader ([`crate::blob_upload`]) so the two clients can never drift on
+//! endpoint, trust, or credential handling.
 
 use std::error::Error as StdError;
 use std::future::Future;
