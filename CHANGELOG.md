@@ -18,6 +18,19 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- An `UNAUTHENTICATED` gateway rejection of a refreshable credential is now retryable-after-refresh
+  instead of a permanent drop. The gateway credential is a shared, rotatable handle
+  (`GatewayCredential`, one per run, presented by both the event exporter and the blob uploader),
+  and an embedding wrapper can install a refresh hook (`RefreshBearer`, via
+  `GrpcExportOptions::bearer_refresh`) — e.g. a CLI's cached login session. On the first
+  `UNAUTHENTICATED` judgment the credential rotates once (single-flight across both legs, loud on
+  stderr) and the same batch/probe/upload is redelivered; a static credential, a failed rotation,
+  or a rejection of the freshly rotated bearer keeps the previous permanent classification, and a
+  rotation still in flight classifies as transient so spooled batches park and redeliver. The
+  `capture.drain` health record gains `capture.auth.refreshes` (rotation count, present whenever a
+  gRPC export ran) so a mid-run token expiry is queryable from the run's own trace, and transparent
+  (netns) runs now emit the `capture.drain` record too — previously their drain accounting was
+  stderr-only.
 - Wire-capture fidelity metadata on proxy request/response events: `http.request.wire_size` /
   `http.response.wire_size` record the body bytes actually observed on the wire (pre-cap,
   pre-redaction), so a capture truncated at `--max-capture-bytes` no longer loses the true
