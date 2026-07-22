@@ -266,6 +266,9 @@ impl RunArgs {
             insecure: self.insecure_grpc,
             tenant_id: self.tenant_id.filter(|t| !t.is_empty()),
             project_id: self.project_id,
+            // The standalone CLI's credential is the static HILOOP_API_KEY environment
+            // token; only an embedding wrapper can renew a rejected bearer.
+            bearer_refresh: None,
         });
 
         let export_flush_interval = (self.export_flush_interval_ms > 0)

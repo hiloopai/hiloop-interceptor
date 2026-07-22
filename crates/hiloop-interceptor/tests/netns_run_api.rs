@@ -232,6 +232,65 @@ async fn system_composer_builds_the_production_worker_and_ca_only_workload_comma
     assert_eq!(first["attributes"]["selected"], "netns");
 }
 
+/// The transparent lane's in-trace capture-health contract: a gRPC-exported netns run records
+/// one `capture.drain` event — with the auth-refresh accounting — so export degradation is
+/// queryable from the run's trace instead of living only in stderr. The gateway here is
+/// unreachable on purpose: the record must still land in the local JSONL sink.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn system_composer_records_the_capture_drain_health_event() {
+    use hiloop_interceptor::{DrainRetryPolicy, GrpcExportOptions};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events = temp.path().join("events.jsonl");
+    let blobs = temp.path().join("blobs");
+    let (provisioner, _handle) = FakeNetworkProvisioner::passing(
+        PreflightReport::passed(true),
+        info(),
+        SubstrateExit::Code(0),
+    );
+    let runner = Arc::new(SystemNetnsRun::with_provisioner(
+        Arc::new(provisioner),
+        "/fixture/hiloop-interceptor",
+    ));
+    let report = runner.preflight().await;
+    let capture = NetworkCapture::netns(NetCaptureMode::Netns, report, runner);
+    let options = RunOptions::new(
+        RunContext::new_local_root(),
+        vec!["fixture-child".to_owned()],
+        Some(events.clone()),
+        None,
+        Some(blobs),
+        false,
+        capture,
+        None,
+        Some(GrpcExportOptions {
+            endpoint: "http://127.0.0.1:9".to_owned(),
+            insecure: true,
+            tenant_id: None,
+            project_id: "default".to_owned(),
+            bearer_refresh: None,
+        }),
+    )
+    .with_blob_drain_retry(DrainRetryPolicy {
+        attempts: 1,
+        initial_backoff: Duration::from_millis(1),
+    });
+
+    run(&options).await.expect("composed fake run");
+
+    let contents = std::fs::read_to_string(&events).expect("events");
+    let drain = contents
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event JSON"))
+        .find(|event| event["name"] == "capture.drain")
+        .expect("the transparent lane records its capture-health event");
+    assert_eq!(drain["attributes"]["capture.auth.refreshes"], 0);
+    // Spooled-but-undelivered (the unreachable gateway) is a backlog, never a loss.
+    assert_eq!(drain["attributes"]["capture.events.rejected"], 0);
+    assert_eq!(drain["attributes"]["capture.complete"], true);
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn system_composer_preserves_close_first_fatal_order_and_durable_reason() {

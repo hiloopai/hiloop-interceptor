@@ -3,7 +3,7 @@
 //! request's Bearer token, so the client omits `tenant_id` (`None`) there; `project_id` selects the
 //! project to record under. Against an unauthenticated local gateway, set `tenant_id` explicitly.
 
-use crate::grpc_client::{AuthInterceptor, build_channel, fold_status_message};
+use crate::grpc_client::{AuthInterceptor, GatewayCredential, build_channel, fold_status_message};
 use crate::seams::{ExportError, Exporter};
 use async_trait::async_trait;
 use hiloop_core::event::{AttributeValue, Event, PayloadRef, SignalType};
@@ -26,6 +26,7 @@ const INGEST_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// Ships events to the telemetry gateway over gRPC.
 pub struct GrpcIngestExporter {
     client: AuthedClient,
+    credential: GatewayCredential,
     tenant_id: Option<String>,
     project_id: String,
 }
@@ -48,15 +49,55 @@ impl GrpcIngestExporter {
         project_id: impl Into<String>,
         insecure: bool,
     ) -> Result<Self, ExportError> {
+        let credential = GatewayCredential::from_env().map_err(client_config_error)?;
+        Self::with_credential(endpoint, tenant_id, project_id, insecure, credential)
+    }
+
+    /// Like [`connect`](Self::connect), but presenting an explicit (possibly refreshable)
+    /// `credential` instead of reading [`crate::grpc_client::TOKEN_ENV`]. Share one
+    /// [`GatewayCredential`] across the event exporter and the blob uploader so a refresh
+    /// triggered by either leg re-authenticates both.
+    pub fn with_credential(
+        endpoint: impl Into<String>,
+        tenant_id: Option<String>,
+        project_id: impl Into<String>,
+        insecure: bool,
+        credential: GatewayCredential,
+    ) -> Result<Self, ExportError> {
         let endpoint = endpoint.into();
         let channel = build_channel(&endpoint, insecure).map_err(client_config_error)?;
-        let interceptor = AuthInterceptor::from_env().map_err(client_config_error)?;
+        let interceptor = AuthInterceptor::new(credential.clone());
         let client = TelemetryIngestServiceClient::with_interceptor(channel, interceptor);
         Ok(Self {
             client,
+            credential,
             tenant_id,
             project_id: project_id.into(),
         })
+    }
+}
+
+/// How one `Ingest` RPC attempt failed, kept unmapped so the retry-after-refresh path can
+/// inspect the raw gateway status before it is folded onto the [`ExportError`] taxonomy.
+enum IngestFailure {
+    Timeout(std::time::Duration),
+    Rpc(Status),
+    Mismatch { accepted: u64, expected: u64 },
+}
+
+impl IngestFailure {
+    fn into_export_error(self) -> ExportError {
+        match self {
+            Self::Timeout(deadline) => ExportError::unavailable(
+                "grpc",
+                format!("ingest timed out after {}s", deadline.as_secs_f64()),
+            ),
+            Self::Rpc(status) => ingest_error(&status),
+            Self::Mismatch { accepted, expected } => ExportError::other(
+                "grpc",
+                format!("gateway accepted {accepted} of {expected} events"),
+            ),
+        }
     }
 }
 
@@ -64,19 +105,15 @@ impl GrpcIngestExporter {
     /// One deadline-bounded `Ingest` RPC. The deadline is a parameter so a regression test can
     /// exercise the timeout path against a stalling gateway without waiting out the production
     /// [`INGEST_RPC_TIMEOUT`].
-    async fn ingest_within(
+    async fn ingest_once(
         &self,
-        events: &[Event],
+        proto_events: &[proto::Event],
         deadline: std::time::Duration,
-    ) -> Result<(), ExportError> {
-        if events.is_empty() {
-            return Ok(());
-        }
-        let proto_events: Vec<proto::Event> = events.iter().map(to_proto_event).collect();
+    ) -> Result<(), IngestFailure> {
         let expected = u64::try_from(proto_events.len()).unwrap_or(u64::MAX);
         let mut client = self.client.clone();
         let rpc = client.ingest(Request::new(proto::IngestRequest {
-            events: proto_events,
+            events: proto_events.to_vec(),
             // proto3 has no optional scalar here: the empty string is the wire form of
             // "absent", which is exactly what an authenticated gateway expects (it derives
             // the tenant from the Bearer token).
@@ -85,22 +122,65 @@ impl GrpcIngestExporter {
         }));
         let accepted = tokio::time::timeout(deadline, rpc)
             .await
-            .map_err(|_elapsed| {
-                ExportError::unavailable(
-                    "grpc",
-                    format!("ingest timed out after {}s", deadline.as_secs_f64()),
-                )
-            })?
-            .map_err(|status| ingest_error(&status))?
+            .map_err(|_elapsed| IngestFailure::Timeout(deadline))?
+            .map_err(IngestFailure::Rpc)?
             .into_inner()
             .accepted;
         if accepted != expected {
-            return Err(ExportError::other(
-                "grpc",
-                format!("gateway accepted {accepted} of {expected} events"),
-            ));
+            return Err(IngestFailure::Mismatch { accepted, expected });
         }
         Ok(())
+    }
+
+    /// Deliver one batch, riding out an aged-out credential: an `UNAUTHENTICATED` rejection of a
+    /// refreshable bearer is retryable-after-refresh — rotate once (single-flight across legs)
+    /// and redeliver the same batch before classifying anything permanent. A static credential,
+    /// a failed rotation, or a rejection of the freshly rotated bearer keeps today's permanent
+    /// [`ExportError::Rejected`]; a rotation still in flight past its wait bound classifies as
+    /// transient so a spooling wrapper parks the batch and redelivers it later.
+    async fn ingest_within(
+        &self,
+        events: &[Event],
+        deadline: std::time::Duration,
+    ) -> Result<(), ExportError> {
+        use crate::grpc_client::RefreshOutcome;
+
+        if events.is_empty() {
+            return Ok(());
+        }
+        let proto_events: Vec<proto::Event> = events.iter().map(to_proto_event).collect();
+        let presented = self.credential.bearer();
+        let failure = match self.ingest_once(&proto_events, deadline).await {
+            Ok(()) => return Ok(()),
+            Err(failure) => failure,
+        };
+        let IngestFailure::Rpc(status) = &failure else {
+            return Err(failure.into_export_error());
+        };
+        if status.code() != tonic::Code::Unauthenticated {
+            return Err(failure.into_export_error());
+        }
+        match self.credential.refresh_rejected(presented.as_ref()).await {
+            RefreshOutcome::Refreshed => self
+                .ingest_once(&proto_events, deadline)
+                .await
+                .map_err(IngestFailure::into_export_error),
+            RefreshOutcome::Unrefreshable => Err(failure.into_export_error()),
+            RefreshOutcome::Failed(reason) => Err(ExportError::rejected(
+                "grpc",
+                format!(
+                    "{}; refreshing the export credential failed: {reason}",
+                    ingest_rejection_message(status)
+                ),
+            )),
+            RefreshOutcome::Pending => Err(ExportError::unavailable(
+                "grpc",
+                format!(
+                    "{}; a credential refresh is still in flight, so the batch parks for redelivery",
+                    ingest_rejection_message(status)
+                ),
+            )),
+        }
     }
 }
 

@@ -16,12 +16,14 @@ use super::PreflightReport;
 #[cfg(target_os = "linux")]
 use crate::{
     blob::{BlobUploader, DirBlobStore, UnavailableUploader},
-    blob_drain::BlobDrainer,
+    blob_drain::{BlobDrainOutcome, BlobDrainer},
     blob_upload::GrpcBlobUploader,
     exporters::{FanOutExporter, JsonlExporter},
+    grpc_client::GatewayCredential,
     grpc_export::GrpcIngestExporter,
     seams::{Exporter, NormalizationContext},
     spool::{SpoolPolicy, SpoolingExporter},
+    supervisor::{CAPTURE_HEALTH_EXPORT_TIMEOUT, capture_drain_event, export_supervisor_record},
 };
 
 #[cfg(target_os = "linux")]
@@ -300,7 +302,16 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         },
         PathBuf::from,
     );
-    let (exporter, spool) = build_exporter(options).await?;
+    // One shared credential for the event exporter and the blob uploader, so an auth refresh
+    // triggered by either leg re-authenticates both.
+    let gateway_credential = match options.grpc_export() {
+        Some(grpc) => Some(
+            GatewayCredential::from_env_with_refresher(grpc.bearer_refresh.clone())
+                .context("build transparent-run gateway credential")?,
+        ),
+        None => None,
+    };
+    let (exporter, spool) = build_exporter(options, gateway_credential.as_ref()).await?;
     let relay = EventRelayServer::bind(&event_socket, Arc::clone(&exporter))
         .context("bind transparent-run event relay")?;
     let (relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -346,6 +357,47 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         .await
         .context("flush transparent-run events");
 
+    let blob_outcome = drain_blobs(options, &blob_dir, gateway_credential.as_ref()).await;
+    let blobs_complete = blob_outcome
+        .as_ref()
+        .is_none_or(BlobDrainOutcome::is_complete);
+    if !blobs_complete && let Some(scratch) = scratch_blobs {
+        eprintln!(
+            "hiloop-interceptor: warning: captured payload blobs kept at `{}`",
+            scratch.keep().display()
+        );
+    }
+
+    // The capture-health record ships BEFORE the final event-spool drain on purpose: spool
+    // redelivery is strictly in arrival order, so this record reaching the gateway certifies
+    // that everything spooled before it landed too (the supervisor lane's ordering contract).
+    if blob_outcome.is_some() || spool.is_some() {
+        let spool_report = match &spool {
+            Some(spool) => Some(spool.report().await),
+            None => None,
+        };
+        let health_event = capture_drain_event(
+            &NormalizationContext::new(options.context().clone())
+                .with_attributes(options.attributes().clone()),
+            hiloop_core::identity::HlcClock::new().tick(),
+            blob_outcome.as_ref(),
+            spool_report,
+            gateway_credential
+                .as_ref()
+                .map(GatewayCredential::refreshes),
+        );
+        if let Err(warning) = export_supervisor_record(
+            &exporter,
+            health_event,
+            "capture-health",
+            CAPTURE_HEALTH_EXPORT_TIMEOUT,
+        )
+        .await
+        {
+            eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
+        }
+    }
+
     if let Some(spool) = spool {
         let report = spool.drain(options.blob_drain_retry()).await;
         if report.pending_events > 0 || report.dropped_events > 0 || report.rejected_events > 0 {
@@ -354,13 +406,6 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
                 report.pending_events, report.dropped_events, report.rejected_events
             );
         }
-    }
-    let blobs_complete = drain_blobs(options, &blob_dir).await;
-    if !blobs_complete && let Some(scratch) = scratch_blobs {
-        eprintln!(
-            "hiloop-interceptor: warning: captured payload blobs kept at `{}`",
-            scratch.keep().display()
-        );
     }
 
     let cleanup_error = combined_cleanup_error(relay_result, flush_result);
@@ -401,6 +446,7 @@ type NetnsSpool = SpoolingExporter<GrpcIngestExporter>;
 #[cfg(target_os = "linux")]
 async fn build_exporter(
     options: &RunOptions,
+    gateway_credential: Option<&GatewayCredential>,
 ) -> anyhow::Result<(Arc<dyn Exporter>, Option<Arc<NetnsSpool>>)> {
     let mut exporters: Vec<Box<dyn Exporter>> = Vec::new();
     if let Some(path) = options.events_jsonl() {
@@ -410,11 +456,15 @@ async fn build_exporter(
     }
     let mut spool = None;
     if let Some(grpc) = options.grpc_export() {
-        let ingest = GrpcIngestExporter::connect(
+        let credential = gateway_credential
+            .expect("run_system builds the gateway credential whenever a gRPC export is configured")
+            .clone();
+        let ingest = GrpcIngestExporter::with_credential(
             &grpc.endpoint,
             grpc.tenant_id.clone(),
             &grpc.project_id,
             grpc.insecure,
+            credential,
         )
         .with_context(|| format!("build gRPC exporter for `{}`", grpc.endpoint))?;
         let created = Arc::new(SpoolingExporter::new(ingest, SpoolPolicy::default()));
@@ -424,36 +474,51 @@ async fn build_exporter(
     Ok((Arc::new(FanOutExporter::new(exporters)), spool))
 }
 
+/// The authoritative run-end blob drain, or `None` when no gRPC export is configured. A store
+/// that cannot even be opened yields an errored, incomplete outcome so the health record and the
+/// scratch-keep decision see the loss instead of a silent skip.
 #[cfg(target_os = "linux")]
-async fn drain_blobs(options: &RunOptions, blob_dir: &std::path::Path) -> bool {
-    let Some(grpc) = options.grpc_export() else {
-        return true;
-    };
+async fn drain_blobs(
+    options: &RunOptions,
+    blob_dir: &std::path::Path,
+    gateway_credential: Option<&GatewayCredential>,
+) -> Option<BlobDrainOutcome> {
+    let grpc = options.grpc_export()?;
     let store = match DirBlobStore::create(blob_dir).await {
         Ok(store) => store,
         Err(error) => {
             eprintln!("hiloop-interceptor: warning: open transparent blob store: {error:#}");
-            return false;
+            return Some(BlobDrainOutcome {
+                report: crate::blob_drain::BlobDrainReport::default(),
+                error: Some(error),
+            });
         }
     };
-    let uploader: Arc<dyn BlobUploader> =
-        match GrpcBlobUploader::connect(&grpc.endpoint, grpc.tenant_id.clone(), grpc.insecure) {
-            Ok(uploader) => Arc::new(uploader),
-            Err(error) => Arc::new(UnavailableUploader::new(format!(
-                "build transparent blob uploader: {error:#}"
-            ))),
-        };
+    let credential = gateway_credential
+        .expect("run_system builds the gateway credential whenever a gRPC export is configured")
+        .clone();
+    let uploader: Arc<dyn BlobUploader> = match GrpcBlobUploader::with_credential(
+        &grpc.endpoint,
+        grpc.tenant_id.clone(),
+        grpc.insecure,
+        credential,
+    ) {
+        Ok(uploader) => Arc::new(uploader),
+        Err(error) => Arc::new(UnavailableUploader::new(format!(
+            "build transparent blob uploader: {error:#}",
+            error = anyhow::Error::new(error)
+        ))),
+    };
     let outcome = BlobDrainer::new(store, uploader)
         .finish(options.blob_drain_retry())
         .await;
-    let complete = outcome.is_complete();
-    if !complete {
+    if !outcome.is_complete() {
         eprintln!(
             "hiloop-interceptor: warning: transparent capture blob drain incomplete: {} of {} blob(s) missing",
             outcome.report.missing, outcome.report.found
         );
     }
-    complete
+    Some(outcome)
 }
 
 #[cfg(target_os = "linux")]

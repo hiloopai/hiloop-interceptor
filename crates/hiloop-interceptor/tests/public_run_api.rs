@@ -84,6 +84,7 @@ async fn grpc_export_options_are_part_of_the_public_surface() {
         insecure: true,
         tenant_id: Some("dev".to_owned()),
         project_id: "local".to_owned(),
+        bearer_refresh: None,
     };
     let options = options_for(vec!["true".to_owned()], Some(export));
 

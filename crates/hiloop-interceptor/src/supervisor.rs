@@ -13,6 +13,7 @@ use crate::{
     exec_events::{ExecLifecycleEmitter, ExecLifecycleNormalizer, captured_env_values},
     exporters::{FanOutExporter, JsonlExporter},
     framing::LineFramer,
+    grpc_client::{GatewayCredential, RefreshBearer},
     grpc_export::GrpcIngestExporter,
     netns::NetworkCapture,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
@@ -68,7 +69,7 @@ const DEFAULT_BLOB_DRAIN_INTERVAL: Duration = DEFAULT_EXPORT_FLUSH_INTERVAL;
 /// Bound on exporting the run-end capture-health record: it shares the drain's best-effort
 /// contract and must never hang the wrapper's exit. By run end the export channel is warm, so
 /// this stays tight.
-const CAPTURE_HEALTH_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CAPTURE_HEALTH_EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on exporting the spawn-failure record. This is the process's FIRST network use — on
 /// guests with a degraded resolver the cold lookup alone can exceed 10s while later exports on a
 /// warm channel are instant — and the child never ran, so trading extra seconds on the failure
@@ -88,6 +89,7 @@ mod capture_keys {
     pub(super) const EVENTS_DROPPED: &str = "capture.events.dropped";
     pub(super) const EVENTS_REJECTED: &str = "capture.events.rejected";
     pub(super) const EVENTS_PENDING: &str = "capture.events.pending";
+    pub(super) const AUTH_REFRESHES: &str = "capture.auth.refreshes";
     pub(super) const COMPLETE: &str = "capture.complete";
     pub(super) const ERROR: &str = "capture.error";
 }
@@ -216,6 +218,10 @@ pub struct GrpcExportOptions {
     pub tenant_id: Option<String>,
     /// Project to record events under.
     pub project_id: String,
+    /// Refresh hook for a bearer the gateway rejects as unauthenticated mid-run (an embedding
+    /// CLI's renewable login session). `None` means the credential is static: an authentication
+    /// rejection is permanent and the refused batch is dropped with a loud warning.
+    pub bearer_refresh: Option<Arc<dyn RefreshBearer>>,
 }
 
 /// Configuration for a single supervised run.
@@ -762,17 +768,28 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
         // killing the pipeline; the supervisor keeps a handle for the run-end drain
         // and its loss accounting.
         let mut event_spool: Option<Arc<SpoolingExporter<GrpcIngestExporter>>> = None;
+        let mut gateway_credential: Option<GatewayCredential> = None;
         if let Some(grpc) = &options.export_grpc {
-            let ingest = GrpcIngestExporter::connect(
+            let credential =
+                GatewayCredential::from_env_with_refresher(grpc.bearer_refresh.clone())
+                    .with_context(|| {
+                        format!(
+                            "failed to build the gateway credential for `{}`",
+                            grpc.endpoint
+                        )
+                    })?;
+            let ingest = GrpcIngestExporter::with_credential(
                 &grpc.endpoint,
                 grpc.tenant_id.clone(),
                 &grpc.project_id,
                 grpc.insecure,
+                credential.clone(),
             )
             .with_context(|| format!("failed to build gRPC exporter for `{}`", grpc.endpoint))?;
             let spool = Arc::new(SpoolingExporter::new(ingest, SpoolPolicy::default()));
             exporters.push(Box::new(Arc::clone(&spool)));
             event_spool = Some(spool);
+            gateway_credential = Some(credential);
         }
         let exporter = FanOutExporter::new(exporters);
         if let Some(raw_path) = &options.raw_jsonl {
@@ -787,6 +804,7 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
                 &exporter,
                 Some(&raw_store),
                 event_spool.as_deref(),
+                gateway_credential.as_ref(),
             ))
             .await
             .map(CapturedRun::into_exit_code);
@@ -796,6 +814,7 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
             &exporter,
             None,
             event_spool.as_deref(),
+            gateway_credential.as_ref(),
         ))
         .await
         .map(CapturedRun::into_exit_code);
@@ -839,6 +858,7 @@ async fn run_captured<E>(
     exporter: &E,
     raw_store: Option<&dyn RawStore>,
     event_spool: Option<&SpoolingExporter<GrpcIngestExporter>>,
+    gateway_credential: Option<&GatewayCredential>,
 ) -> Result<CapturedRun>
 where
     E: Exporter,
@@ -1089,16 +1109,27 @@ where
     // reports the loss instead of skipping silently.
     let blob_drainer = match (&blob_store, &options.export_grpc) {
         (Some(store), Some(grpc)) => {
-            let uploader: Arc<dyn BlobUploader> = match GrpcBlobUploader::connect(
-                &grpc.endpoint,
-                grpc.tenant_id.clone(),
-                grpc.insecure,
-            ) {
+            // The uploader shares the event exporter's credential handle, so an auth refresh
+            // triggered by either leg re-authenticates both. Only the exporterless test path
+            // arrives without one and builds its own.
+            let credential = match gateway_credential {
+                Some(credential) => Ok(credential.clone()),
+                None => GatewayCredential::from_env_with_refresher(grpc.bearer_refresh.clone())
+                    .map_err(anyhow::Error::new),
+            };
+            let uploader: Arc<dyn BlobUploader> = match credential.and_then(|credential| {
+                GrpcBlobUploader::with_credential(
+                    &grpc.endpoint,
+                    grpc.tenant_id.clone(),
+                    grpc.insecure,
+                    credential,
+                )
+                .map_err(anyhow::Error::new)
+            }) {
                 Ok(uploader) => Arc::new(uploader),
                 Err(error) => Arc::new(UnavailableUploader::new(format!(
-                    "failed to build the blob uploader for `{}`: {:#}",
-                    grpc.endpoint,
-                    anyhow::Error::new(error)
+                    "failed to build the blob uploader for `{}`: {error:#}",
+                    grpc.endpoint
                 ))),
             };
             Some(BlobDrainer::new(store.as_ref().clone(), uploader))
@@ -1317,6 +1348,7 @@ where
             clock.tick(),
             blob_outcome.as_ref(),
             spool_report,
+            gateway_credential.map(GatewayCredential::refreshes),
         );
         if let Err(warning) = export_supervisor_record(
             exporter,
@@ -1372,7 +1404,7 @@ where
     if options.command.is_empty() {
         bail!("no command given; usage: hiloop-interceptor run -- <cmd> [args...]");
     }
-    Box::pin(run_captured(options, exporter, None, None))
+    Box::pin(run_captured(options, exporter, None, None, None))
         .await
         .map(CapturedRun::into_exit_code)
 }
@@ -1410,11 +1442,15 @@ fn drain_problem(outcome: BlobDrainOutcome) -> Option<anyhow::Error> {
 /// event-spool counters are loss counters — events still awaiting redelivery do not
 /// count against completeness, because redelivery is strictly in order: this record
 /// reaching the gateway certifies everything spooled before it landed too.
-fn capture_drain_event(
+/// `capture.auth.refreshes` (when a gateway credential exists) counts mid-run
+/// credential rotations, so an access token that expired during the run is queryable
+/// from the trace instead of living only in stderr.
+pub(crate) fn capture_drain_event(
     context: &NormalizationContext,
     ts: Hlc,
     blob_outcome: Option<&BlobDrainOutcome>,
     spool_report: Option<SpoolReport>,
+    auth_refreshes: Option<u64>,
 ) -> Event {
     let event = Event::new(
         context.run_context(),
@@ -1474,6 +1510,12 @@ fn capture_drain_event(
                 AttributeKey::from_static(capture_keys::EVENTS_PENDING),
                 count_attr(report.pending_events),
             );
+    }
+    if let Some(refreshes) = auth_refreshes {
+        event = event.with_attribute(
+            AttributeKey::from_static(capture_keys::AUTH_REFRESHES),
+            i64::try_from(refreshes).unwrap_or(i64::MAX),
+        );
     }
     event.with_attribute(AttributeKey::from_static(capture_keys::COMPLETE), complete)
 }
@@ -1539,7 +1581,7 @@ fn spawn_failure_event(options: &RunOptions, ts: Hlc, error: &io::Error) -> Even
 /// Export one supervisor-emitted record event (capture-health, spawn-failure) within a hard
 /// per-record deadline: best-effort like every wind-down step, so it never hangs the wrapper's
 /// exit.
-async fn export_supervisor_record<E: Exporter>(
+pub(crate) async fn export_supervisor_record<E: Exporter>(
     exporter: &E,
     event: Event,
     what: &str,
@@ -2909,6 +2951,7 @@ mod tests {
                 error: None,
             }),
             Some(SpoolReport::default()),
+            Some(0),
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
@@ -2955,11 +2998,14 @@ mod tests {
                 dropped_events: 2,
                 rejected_events: 1,
             }),
+            Some(1),
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
         assert_eq!(value["attributes"]["capture.events.dropped"], 2);
         assert_eq!(value["attributes"]["capture.events.rejected"], 1);
+        // A mid-run credential rotation is queryable from the trace, not stderr-only.
+        assert_eq!(value["attributes"]["capture.auth.refreshes"], 1);
         // Loss makes the capture incomplete; pending events do not (in-order
         // redelivery means this record landing certifies everything before it).
         assert_eq!(value["attributes"]["capture.complete"], false);
@@ -2993,10 +3039,16 @@ mod tests {
                 dropped_events: 1,
                 rejected_events: 0,
             }),
+            None,
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
         assert_eq!(value["attributes"]["capture.blobs.found"], 0);
+        assert_eq!(
+            value["attributes"].get("capture.auth.refreshes"),
+            None,
+            "no gateway credential, so no auth accounting is claimed"
+        );
         assert_eq!(value["attributes"]["capture.events.dropped"], 1);
         assert_eq!(
             value["attributes"]["capture.complete"], false,
@@ -3198,6 +3250,7 @@ mod tests {
                 insecure: true,
                 tenant_id: None,
                 project_id: "default".to_owned(),
+                bearer_refresh: None,
             }),
         )
         .with_blob_drain_retry(DrainRetryPolicy {
@@ -3228,6 +3281,7 @@ mod tests {
                 insecure: true,
                 tenant_id: None,
                 project_id: "default".to_owned(),
+                bearer_refresh: None,
             }),
         )
         .with_blob_drain_interval(Duration::ZERO)
@@ -3263,7 +3317,7 @@ mod tests {
             None,
         );
 
-        let captured = Box::pin(run_captured(&options, &FailingExporter, None, None))
+        let captured = Box::pin(run_captured(&options, &FailingExporter, None, None, None))
             .await
             .expect("a successful child's exit code wins over an export failure");
 
@@ -3299,7 +3353,7 @@ mod tests {
             None,
         );
 
-        let captured = Box::pin(run_captured(&options, &FailingExporter, None, None))
+        let captured = Box::pin(run_captured(&options, &FailingExporter, None, None, None))
             .await
             .expect("the child's own exit code wins over an export failure");
 

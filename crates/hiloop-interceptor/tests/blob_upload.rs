@@ -17,6 +17,7 @@ use hiloop_interceptor::grpc_client::proto::telemetry_blob_service_server::{
 use hiloop_interceptor::grpc_client::proto::{
     HasBlobsRequest, HasBlobsResponse, UploadBlobRequest, UploadBlobResponse,
 };
+use hiloop_interceptor::grpc_client::{GatewayCredential, RefreshBearer, RefreshFuture};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -228,6 +229,127 @@ async fn empty_blob_uploads_as_a_single_identity_frame() {
     assert!(rec.uploads[0].bytes.is_empty());
     // `None` tenant (the authenticated-gateway path) collapses to proto3's empty-string "absent".
     assert_eq!(rec.uploads[0].tenant_id, "");
+}
+
+/// Blob service that mirrors an authenticated gateway: any request not presenting
+/// `Bearer <expected>` is refused `UNAUTHENTICATED`; a correctly authenticated one delegates
+/// to the recording contract fake.
+#[derive(Clone)]
+struct AuthGatedBlobService {
+    expected_token: &'static str,
+    inner: RecordingBlobService,
+    rejections: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AuthGatedBlobService {
+    fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let presented = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        if presented == Some(&format!("Bearer {}", self.expected_token)) {
+            return Ok(());
+        }
+        self.rejections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(Status::unauthenticated(
+            "The request does not have valid authentication credentials",
+        ))
+    }
+}
+
+#[tonic::async_trait]
+impl TelemetryBlobService for AuthGatedBlobService {
+    async fn has_blobs(
+        &self,
+        request: Request<HasBlobsRequest>,
+    ) -> Result<Response<HasBlobsResponse>, Status> {
+        self.authorize(&request)?;
+        self.inner.has_blobs(request).await
+    }
+
+    async fn upload_blob(
+        &self,
+        request: Request<Streaming<UploadBlobRequest>>,
+    ) -> Result<Response<UploadBlobResponse>, Status> {
+        self.authorize(&request)?;
+        self.inner.upload_blob(request).await
+    }
+}
+
+/// [`RefreshBearer`] fake yielding one fixed replacement token.
+#[derive(Debug)]
+struct FakeSessionRefresher {
+    replacement: &'static str,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RefreshBearer for FakeSessionRefresher {
+    fn refresh<'a>(&'a self, _rejected: Option<&'a str>) -> RefreshFuture<'a> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.replacement.to_owned())
+        })
+    }
+}
+
+/// The blob leg of the mid-run token expiry (HIL-2129's stranded-blobs shape): the probe and the
+/// upload must refresh a rejected session credential and retry, so the drain can complete
+/// instead of stranding captured bodies locally.
+#[tokio::test]
+async fn an_unauthenticated_probe_refreshes_the_credential_and_retries() {
+    let bytes = b"survives token expiry".to_vec();
+    let digest = digest_of(&bytes);
+    let service = AuthGatedBlobService {
+        expected_token: "fresh-token",
+        inner: RecordingBlobService::default(),
+        rejections: Arc::default(),
+    };
+    let recorded = service.inner.recorded();
+    let rejections = Arc::clone(&service.rejections);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(TelemetryBlobServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("serve");
+    });
+
+    let refresher = Arc::new(FakeSessionRefresher {
+        replacement: "fresh-token",
+        calls: Arc::default(),
+    });
+    let credential =
+        GatewayCredential::new(Some("expired-token"), Some(Arc::clone(&refresher) as _))
+            .expect("credential");
+    let uploader =
+        GrpcBlobUploader::with_credential(format!("http://{addr}"), None, true, credential)
+            .expect("connect");
+
+    let missing = uploader
+        .find_missing(std::slice::from_ref(&digest))
+        .await
+        .expect("the probe must succeed under the refreshed credential");
+    assert_eq!(missing, vec![digest.clone()]);
+
+    uploader
+        .upload(&digest, &bytes)
+        .await
+        .expect("the upload proceeds under the already-refreshed credential");
+
+    let rec = recorded.lock().expect("lock");
+    assert_eq!(rec.uploads.len(), 1);
+    assert_eq!(rec.uploads[0].bytes, bytes);
+    assert_eq!(
+        refresher.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one rejection, one rotation, shared across the leg"
+    );
+    assert_eq!(rejections.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

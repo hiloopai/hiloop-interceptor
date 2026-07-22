@@ -8,14 +8,16 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use hiloop_core::event::PayloadDigest;
-use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
+use tonic::{Request, Status};
 
 use crate::blob::{BlobStoreError, BlobUploader, MAX_UPLOAD_BLOB_BYTES};
 use crate::grpc_client::proto::telemetry_blob_service_client::TelemetryBlobServiceClient;
 use crate::grpc_client::proto::{HasBlobsRequest, UploadBlobRequest};
-use crate::grpc_client::{AuthInterceptor, GrpcClientError, build_channel, fold_status_message};
+use crate::grpc_client::{
+    AuthInterceptor, GatewayCredential, GrpcClientError, build_channel, fold_status_message,
+};
 
 const STORE_NAME: &str = "grpc-blob";
 
@@ -36,6 +38,7 @@ type AuthedClient = TelemetryBlobServiceClient<InterceptedService<Channel, AuthI
 /// Uploads content-addressed payload blobs to a telemetry gateway.
 pub struct GrpcBlobUploader {
     client: AuthedClient,
+    credential: GatewayCredential,
     tenant_id: Option<String>,
 }
 
@@ -52,11 +55,29 @@ impl GrpcBlobUploader {
         tenant_id: Option<String>,
         insecure: bool,
     ) -> Result<Self, BlobStoreError> {
+        let credential = GatewayCredential::from_env().map_err(client_config_error)?;
+        Self::with_credential(endpoint, tenant_id, insecure, credential)
+    }
+
+    /// Like [`connect`](Self::connect), but presenting an explicit (possibly refreshable)
+    /// `credential` instead of reading `HILOOP_API_KEY`. Share one [`GatewayCredential`] across
+    /// the event exporter and the blob uploader so a refresh triggered by either leg
+    /// re-authenticates both.
+    pub fn with_credential(
+        endpoint: impl Into<String>,
+        tenant_id: Option<String>,
+        insecure: bool,
+        credential: GatewayCredential,
+    ) -> Result<Self, BlobStoreError> {
         let endpoint = endpoint.into();
         let channel = build_channel(&endpoint, insecure).map_err(client_config_error)?;
-        let interceptor = AuthInterceptor::from_env().map_err(client_config_error)?;
+        let interceptor = AuthInterceptor::new(credential.clone());
         let client = TelemetryBlobServiceClient::with_interceptor(channel, interceptor);
-        Ok(Self { client, tenant_id })
+        Ok(Self {
+            client,
+            credential,
+            tenant_id,
+        })
     }
 
     fn tenant_wire_value(&self) -> String {
@@ -64,6 +85,120 @@ impl GrpcBlobUploader {
         // which is exactly what an authenticated gateway expects (it derives the tenant from
         // the Bearer token).
         self.tenant_id.clone().unwrap_or_default()
+    }
+
+    /// Decide the fate of a failed RPC attempt, riding out an aged-out credential the same way
+    /// the event exporter does: an `UNAUTHENTICATED` judgment of a refreshable bearer rotates it
+    /// once (single-flight, shared with the event leg) and returns `Ok(())` so the caller
+    /// retries the attempt; any other failure — or a rotation that is impossible, failed, or
+    /// still in flight — is the final error (the blob drain retries every pass within its
+    /// bounded budget anyway). `presented` is the bearer captured before the failed attempt.
+    async fn refresh_or_fail(
+        &self,
+        failure: BlobCallFailure,
+        presented: Option<&tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    ) -> Result<(), BlobStoreError> {
+        use crate::grpc_client::RefreshOutcome;
+
+        let BlobCallFailure::Auth { message } = failure else {
+            return Err(failure.into_error());
+        };
+        match self.credential.refresh_rejected(presented).await {
+            RefreshOutcome::Refreshed => Ok(()),
+            RefreshOutcome::Unrefreshable => Err(BlobStoreError::other(STORE_NAME, message)),
+            RefreshOutcome::Failed(reason) => Err(BlobStoreError::other(
+                STORE_NAME,
+                format!("{message}; refreshing the credential failed: {reason}"),
+            )),
+            RefreshOutcome::Pending => Err(BlobStoreError::other(
+                STORE_NAME,
+                format!("{message}; a credential refresh is still in flight"),
+            )),
+        }
+    }
+}
+
+/// One failed blob RPC attempt, rendered but still distinguishing an `UNAUTHENTICATED`
+/// judgment so [`GrpcBlobUploader::call_with_refresh`] can rotate the credential and retry.
+enum BlobCallFailure {
+    /// The gateway judged the credential unauthenticated.
+    Auth { message: String },
+    /// Any other failure (timeout, transport, non-auth rejection).
+    Other { message: String },
+}
+
+impl BlobCallFailure {
+    fn from_status(status: &Status, message: String) -> Self {
+        if status.code() == tonic::Code::Unauthenticated {
+            Self::Auth { message }
+        } else {
+            Self::Other { message }
+        }
+    }
+
+    fn into_error(self) -> BlobStoreError {
+        let (Self::Auth { message } | Self::Other { message }) = self;
+        BlobStoreError::other(STORE_NAME, message)
+    }
+}
+
+impl GrpcBlobUploader {
+    /// One deadline-bounded `HasBlobs` probe.
+    async fn has_blobs_once(
+        &self,
+        digests: &[PayloadDigest],
+    ) -> Result<Vec<String>, BlobCallFailure> {
+        let mut client = self.client.clone();
+        let request = Request::new(HasBlobsRequest {
+            digests: digests
+                .iter()
+                .map(|digest| digest.as_str().to_owned())
+                .collect(),
+            tenant_id: self.tenant_wire_value(),
+        });
+        let response = tokio::time::timeout(PROBE_TIMEOUT, client.has_blobs(request))
+            .await
+            .map_err(|_elapsed| BlobCallFailure::Other {
+                message: format!("blob probe timed out after {}s", PROBE_TIMEOUT.as_secs()),
+            })?
+            .map_err(|status| {
+                BlobCallFailure::from_status(
+                    &status,
+                    format!("blob probe rejected: {}", fold_status_message(&status)),
+                )
+            })?;
+        Ok(response.into_inner().missing_digests)
+    }
+
+    /// One deadline-bounded client-streaming `UploadBlob`, returning the stored size.
+    async fn upload_once(
+        &self,
+        digest: &PayloadDigest,
+        bytes: &[u8],
+    ) -> Result<u64, BlobCallFailure> {
+        let frames = upload_frames(digest, &self.tenant_wire_value(), bytes);
+        let mut client = self.client.clone();
+        let response = tokio::time::timeout(
+            UPLOAD_TIMEOUT,
+            client.upload_blob(tokio_stream::iter(frames)),
+        )
+        .await
+        .map_err(|_elapsed| BlobCallFailure::Other {
+            message: format!(
+                "blob upload of {digest} timed out after {}s",
+                UPLOAD_TIMEOUT.as_secs()
+            ),
+        })?
+        .map_err(|status| {
+            BlobCallFailure::from_status(
+                &status,
+                format!(
+                    "blob upload of {digest} rejected: {}",
+                    fold_status_message(&status)
+                ),
+            )
+        })?;
+        Ok(response.into_inner().size_bytes)
     }
 }
 
@@ -76,29 +211,16 @@ impl BlobUploader for GrpcBlobUploader {
         if digests.is_empty() {
             return Ok(Vec::new());
         }
-        let mut client = self.client.clone();
-        let request = Request::new(HasBlobsRequest {
-            digests: digests
-                .iter()
-                .map(|digest| digest.as_str().to_owned())
-                .collect(),
-            tenant_id: self.tenant_wire_value(),
-        });
-        let response = tokio::time::timeout(PROBE_TIMEOUT, client.has_blobs(request))
-            .await
-            .map_err(|_elapsed| {
-                BlobStoreError::other(
-                    STORE_NAME,
-                    format!("blob probe timed out after {}s", PROBE_TIMEOUT.as_secs()),
-                )
-            })?
-            .map_err(|status| {
-                BlobStoreError::other(
-                    STORE_NAME,
-                    format!("blob probe rejected: {}", fold_status_message(&status)),
-                )
-            })?
-            .into_inner();
+        let presented = self.credential.bearer();
+        let missing_digests = match self.has_blobs_once(digests).await {
+            Ok(missing) => missing,
+            Err(failure) => {
+                self.refresh_or_fail(failure, presented.as_ref()).await?;
+                self.has_blobs_once(digests)
+                    .await
+                    .map_err(BlobCallFailure::into_error)?
+            }
+        };
 
         // The gateway echoes missing digests verbatim as requested, so each echo must map back to
         // a digest we asked about; anything else is a contract violation, not data.
@@ -106,8 +228,7 @@ impl BlobUploader for GrpcBlobUploader {
             .iter()
             .map(|digest| (digest.as_str(), digest))
             .collect();
-        response
-            .missing_digests
+        missing_digests
             .iter()
             .map(|raw| {
                 requested
@@ -133,33 +254,16 @@ impl BlobUploader for GrpcBlobUploader {
                 ),
             ));
         }
-        let frames = upload_frames(digest, &self.tenant_wire_value(), bytes);
-        let mut client = self.client.clone();
-        let stored = tokio::time::timeout(
-            UPLOAD_TIMEOUT,
-            client.upload_blob(tokio_stream::iter(frames)),
-        )
-        .await
-        .map_err(|_elapsed| {
-            BlobStoreError::other(
-                STORE_NAME,
-                format!(
-                    "blob upload of {digest} timed out after {}s",
-                    UPLOAD_TIMEOUT.as_secs()
-                ),
-            )
-        })?
-        .map_err(|status| {
-            BlobStoreError::other(
-                STORE_NAME,
-                format!(
-                    "blob upload of {digest} rejected: {}",
-                    fold_status_message(&status)
-                ),
-            )
-        })?
-        .into_inner()
-        .size_bytes;
+        let presented = self.credential.bearer();
+        let stored = match self.upload_once(digest, bytes).await {
+            Ok(stored) => stored,
+            Err(failure) => {
+                self.refresh_or_fail(failure, presented.as_ref()).await?;
+                self.upload_once(digest, bytes)
+                    .await
+                    .map_err(BlobCallFailure::into_error)?
+            }
+        };
         if stored != size {
             return Err(BlobStoreError::other(
                 STORE_NAME,
