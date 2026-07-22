@@ -109,9 +109,10 @@ pub type RefreshFuture<'a> =
 /// Exchanges a bearer the gateway rejected as unauthenticated for a fresh one.
 ///
 /// Installed on a [`GatewayCredential`] only when the credential is renewable (e.g. a wrapping
-/// CLI's cached login session — never a static API key). Implementations must be safe to call
-/// concurrently and should serialize their own rotation (the credential handle serializes the
-/// common path, but a cancelled waiter can admit a second call while a rotation is in flight).
+/// CLI's cached login session — never a static API key). The credential handle serializes calls
+/// (single-flight: at most one rotation in flight, even across timed-out waiters), but an
+/// implementation whose rotation burns the previous token should still guard its own critical
+/// section against concurrent processes.
 pub trait RefreshBearer: Send + Sync + std::fmt::Debug {
     /// Return a bearer token that replaces `rejected` (`None` when no token was presented) —
     /// either one a concurrent rotation already produced, or a freshly minted one.
@@ -150,8 +151,10 @@ pub struct GatewayCredential {
 struct CredentialState {
     bearer: std::sync::RwLock<Option<MetadataValue<Ascii>>>,
     refresher: Option<Arc<dyn RefreshBearer>>,
-    /// Serializes rotations; held across the refresh await so concurrent rejections coalesce.
-    refresh_gate: tokio::sync::Mutex<()>,
+    /// Serializes rotations. The guard is OWNED BY THE ROTATION TASK, not by the caller that
+    /// started it, so a caller timing out ([`RefreshOutcome::Pending`]) can never admit a
+    /// duplicate rotation while the first is still in flight.
+    refresh_gate: Arc<tokio::sync::Mutex<()>>,
     /// Successful rotations, reported on the run's `capture.drain` health record.
     refreshes: AtomicU64,
 }
@@ -182,7 +185,7 @@ impl GatewayCredential {
             inner: Arc::new(CredentialState {
                 bearer: std::sync::RwLock::new(bearer),
                 refresher,
-                refresh_gate: tokio::sync::Mutex::new(()),
+                refresh_gate: Arc::new(tokio::sync::Mutex::new(())),
                 refreshes: AtomicU64::new(0),
             }),
         })
@@ -226,10 +229,12 @@ impl GatewayCredential {
     /// the refresher (single-flight — concurrent rejections coalesce into one rotation) and
     /// report how the caller should classify the failed delivery.
     ///
-    /// The rotation itself runs on a detached task: cancelling the waiter (a caller-imposed
-    /// delivery deadline) must never strand a rotation that may already have burned the previous
-    /// token server-side. A waiter that times out gets [`RefreshOutcome::Pending`]; the rotation
-    /// still installs the fresh bearer when it lands, so parked payloads redeliver.
+    /// The rotation runs on a detached task that OWNS the single-flight gate: cancelling or
+    /// timing out the waiter (a caller-imposed delivery deadline) must neither strand a rotation
+    /// that may already have burned the previous token server-side, nor admit a duplicate
+    /// rotation while the first is still in flight. A waiter that times out — on the gate or on
+    /// the rotation — gets [`RefreshOutcome::Pending`]; the rotation still installs the fresh
+    /// bearer when it lands, so parked payloads redeliver.
     pub(crate) async fn refresh_rejected(
         &self,
         presented: Option<&MetadataValue<Ascii>>,
@@ -237,7 +242,16 @@ impl GatewayCredential {
         if self.inner.refresher.is_none() {
             return RefreshOutcome::Unrefreshable;
         }
-        let _gate = self.inner.refresh_gate.lock().await;
+        // Acquiring the gate waits out any in-flight rotation (its task holds the guard).
+        let gate = match tokio::time::timeout(
+            REFRESH_WAIT_TIMEOUT,
+            Arc::clone(&self.inner.refresh_gate).lock_owned(),
+        )
+        .await
+        {
+            Ok(gate) => gate,
+            Err(_elapsed) => return RefreshOutcome::Pending,
+        };
         if self.bearer().as_ref() != presented {
             // Another leg already rotated past the rejected bearer: just retry with the
             // current one.
@@ -252,6 +266,7 @@ impl GatewayCredential {
         });
         let inner = Arc::clone(&self.inner);
         let rotation = tokio::spawn(async move {
+            let _gate = gate;
             let refresher = inner
                 .refresher
                 .as_ref()
@@ -489,6 +504,45 @@ mod tests {
             credential.bearer(),
             presented,
             "a failed refresh must not clobber the current bearer"
+        );
+        assert_eq!(credential.refreshes(), 0);
+    }
+
+    /// [`RefreshBearer`] whose rotation never resolves, for the timed-out-waiter path.
+    #[derive(Debug, Default)]
+    struct HangingRefresher {
+        calls: AtomicU64,
+    }
+
+    impl RefreshBearer for HangingRefresher {
+        fn refresh<'a>(&'a self, _rejected: Option<&'a str>) -> RefreshFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                unreachable!("pending future never resolves")
+            })
+        }
+    }
+
+    /// Single-flight survives a timed-out waiter: the rotation task owns the gate, so a second
+    /// rejection arriving after the first waiter gave up must park (`Pending`) — never start a
+    /// duplicate rotation that could burn a rotate-on-use refresh token.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_rotation_blocks_duplicates_and_reports_pending() {
+        let refresher = Arc::new(HangingRefresher::default());
+        let credential = GatewayCredential::new(Some("stale"), Some(Arc::clone(&refresher) as _))
+            .expect("credential");
+        let presented = credential.bearer();
+
+        let first = credential.refresh_rejected(presented.as_ref()).await;
+        assert!(matches!(first, RefreshOutcome::Pending), "{first:?}");
+
+        let second = credential.refresh_rejected(presented.as_ref()).await;
+        assert!(matches!(second, RefreshOutcome::Pending), "{second:?}");
+        assert_eq!(
+            refresher.calls.load(Ordering::SeqCst),
+            1,
+            "the in-flight rotation must block a duplicate, not race it"
         );
         assert_eq!(credential.refreshes(), 0);
     }
