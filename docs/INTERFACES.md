@@ -154,6 +154,20 @@ implementation — it composes `LineFramer` and tees bytes verbatim before frami
 drives a source through `Pipeline::run_source` (input-exhausted exit) or `run_source_until`
 (external shutdown trigger).
 
+`CaptureSession` is the reusable lifecycle above that pipeline. It owns one bounded raw-signal
+fan-in for the lifetime of a local wrapper or sandbox runtime, rather than for the lifetime of one
+child process. Runtime adapters clone `CaptureControl`, attach any number of `Source` values, and
+poll the returned `SourceHandle` futures in their own task hierarchy. A source may end without
+ending the session; later execs can attach new sources to the same session. `shutdown` atomically
+stops new attachments, asks server-style sources to drain, and closes the pipeline after every
+source releases its sink. The lifecycle owner polls `CaptureSession::finish` concurrently for the
+whole session so back-pressure remains live, and observes its final `PipelineReport` only after the
+exporter and optional raw store flush.
+
+The session never spawns sources itself. Local command supervision, a sandbox entrypoint, exec,
+and SSH each retain their own cancellation and error ownership while sharing exactly the same
+source-to-normalizer-to-export path.
+
 `RawSignal` now also carries an optional, additive out-of-line body reference via
 `RawSignal::with_payload_ref(PayloadRef)`. `RawSignal::new` is unchanged; when `payload_ref` is
 `Some` it is where the body lives and `body` may be empty (aligned with
