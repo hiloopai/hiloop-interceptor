@@ -110,7 +110,7 @@ impl CaptureControl {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        let _ = self.inner.shutdown_tx.send(true);
+        self.inner.shutdown_tx.send_replace(true);
     }
 
     pub(crate) fn signal_sender(
@@ -173,5 +173,21 @@ struct ShutdownOnDrop(CaptureControl);
 impl Drop for ShutdownOnDrop {
     fn drop(&mut self) {
         self.0.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_state_is_durable_without_an_attached_source() {
+        let session = CaptureSession::start(PipelineOptions::default());
+        let control = session.control();
+        assert_eq!(control.inner.shutdown_tx.receiver_count(), 0);
+
+        control.shutdown();
+
+        assert!(*control.inner.shutdown_tx.subscribe().borrow());
     }
 }
