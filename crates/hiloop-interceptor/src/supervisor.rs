@@ -17,9 +17,7 @@ use crate::{
     grpc_export::GrpcIngestExporter,
     netns::NetworkCapture,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
-    pipeline::{
-        DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL, Pipeline, PipelineOptions,
-    },
+    pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL, PipelineOptions},
     proxy::{ProxyCa, ProxyNormalizer, ProxyServer},
     raw::JsonlRawStore,
     redact::RedactionPolicy,
@@ -28,6 +26,7 @@ use crate::{
         RawRetentionPolicy, RawSignal, RawStore, SourceError, provenance_keys,
     },
     secret::{BrokerConfig, SecretBinding, SecretInjector},
+    session::CaptureSession,
     spool::{SpoolPolicy, SpoolReport, SpoolingExporter},
     stdio::StdioLogNormalizer,
 };
@@ -1023,7 +1022,11 @@ where
         options_pipeline =
             options_pipeline.with_raw_retention_override(RawRetentionPolicy::Preserve);
     }
-    let (signal_tx, signal_rx) = mpsc::channel(options_pipeline.raw_queue_capacity());
+    let capture_session = CaptureSession::start(options_pipeline);
+    let capture_control = capture_session.control();
+    let signal_tx = capture_control
+        .signal_sender()
+        .expect("new capture session is open");
 
     // Process-boundary lifecycle capture: `process.start` now, `process.signal`
     // on each forwarded terminating signal, `process.exit` once the child exits.
@@ -1216,13 +1219,7 @@ where
     // The pipeline consumes the context; the run-end capture-health event reuses a clone so
     // it carries the same run identity and static attributes as every captured event.
     let health_context = normalization_context.clone();
-    let stream = tokio_stream::wrappers::ReceiverStream::new(signal_rx);
-    let mut pipeline_builder =
-        Pipeline::with_router(normalization_context, router, exporter).options(options_pipeline);
-    if let Some(raw_store) = raw_store {
-        pipeline_builder = pipeline_builder.raw_store(raw_store);
-    }
-    let pipeline = pipeline_builder.run(stream);
+    let pipeline = capture_session.finish(normalization_context, router, exporter, raw_store);
 
     // The child exiting is the cue to stop the capture servers: dropping their
     // senders lets the pipeline drain and finish.
@@ -1254,6 +1251,7 @@ where
         for shutdown_tx in [otlp_shutdown_tx, proxy_shutdown_tx].into_iter().flatten() {
             let _ = shutdown_tx.send(());
         }
+        capture_control.shutdown();
         status
     };
     let otlp_task = async {
