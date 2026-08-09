@@ -275,6 +275,46 @@ pub struct FinalizedBlob {
 }
 
 impl DirBlobStore {
+    /// Resolve one finalized blob by its content digest without scanning the store.
+    pub(crate) async fn finalized_blob(
+        &self,
+        digest: &PayloadDigest,
+    ) -> Result<Option<FinalizedBlob>, BlobStoreError> {
+        let Some(hex) = digest.as_str().strip_prefix("blake3:") else {
+            return Err(BlobStoreError::other(
+                STORE_NAME,
+                format!("unsupported payload digest `{digest}`"),
+            ));
+        };
+        if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(BlobStoreError::other(
+                STORE_NAME,
+                format!("invalid blake3 payload digest `{digest}`"),
+            ));
+        }
+
+        let path = self.dir.join(format!("blake3-{hex}"));
+        let metadata = match fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(BlobStoreError::with_source(
+                    STORE_NAME,
+                    "failed to stat blob",
+                    error,
+                ));
+            }
+        };
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(FinalizedBlob {
+            digest: digest.clone(),
+            path,
+            size_bytes: metadata.len(),
+        }))
+    }
+
     /// List the store's finalized blobs (`blake3-<hex>` files; temp and foreign files are
     /// ignored), sorted by digest so callers see a deterministic probe and upload order.
     pub async fn finalized_blobs(&self) -> Result<Vec<FinalizedBlob>, BlobStoreError> {
@@ -574,6 +614,42 @@ mod tests {
             .expect("create store");
 
         assert!(store.finalized_blobs().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalized_blob_resolves_only_the_requested_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+        let wanted = store_blob(&store, b"wanted").await;
+        store_blob(&store, b"unrelated").await;
+
+        let blob = store
+            .finalized_blob(&wanted)
+            .await
+            .expect("lookup")
+            .expect("wanted blob");
+
+        assert_eq!(blob.digest, wanted);
+        assert_eq!(blob.size_bytes, 6);
+        assert_eq!(tokio::fs::read(blob.path).await.expect("read"), b"wanted");
+    }
+
+    #[tokio::test]
+    async fn finalized_blob_returns_none_for_an_absent_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+
+        assert!(
+            store
+                .finalized_blob(&digest("absent"))
+                .await
+                .expect("lookup")
+                .is_none()
+        );
     }
 
     #[tokio::test]
