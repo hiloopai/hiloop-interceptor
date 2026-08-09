@@ -10,6 +10,7 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use hiloop_core::event::PayloadDigest;
 use tokio::fs;
 
@@ -220,10 +221,13 @@ impl BlobDrainer {
             if !missing.contains(&blob.digest) {
                 continue;
             }
-            let bytes = fs::read(&blob.path).await.map_err(|error| {
-                BlobStoreError::with_source(STORE_NAME, "failed to read blob", error)
-            })?;
-            self.uploader.upload(&blob.digest, &bytes).await?;
+            let bytes = fs::read(&blob.path)
+                .await
+                .map(Bytes::from)
+                .map_err(|error| {
+                    BlobStoreError::with_source(STORE_NAME, "failed to read blob", error)
+                })?;
+            self.uploader.upload(&blob.digest, bytes).await?;
             self.landed.insert(blob.digest.clone());
             self.uploaded += 1;
         }
@@ -319,7 +323,7 @@ mod tests {
             self.inner.find_missing(digests).await
         }
 
-        async fn upload(&self, digest: &PayloadDigest, bytes: &[u8]) -> Result<(), BlobStoreError> {
+        async fn upload(&self, digest: &PayloadDigest, bytes: Bytes) -> Result<(), BlobStoreError> {
             self.blow_fuse()?;
             self.inner.upload(digest, bytes).await
         }
@@ -341,7 +345,7 @@ mod tests {
             self.inner.find_missing(digests).await
         }
 
-        async fn upload(&self, digest: &PayloadDigest, bytes: &[u8]) -> Result<(), BlobStoreError> {
+        async fn upload(&self, digest: &PayloadDigest, bytes: Bytes) -> Result<(), BlobStoreError> {
             {
                 let mut left = self.upload_failures_left.lock().expect("lock");
                 if *left > 0 {

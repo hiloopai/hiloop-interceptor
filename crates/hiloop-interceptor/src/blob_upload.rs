@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::stream;
 use hiloop_core::event::PayloadDigest;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -212,31 +214,28 @@ impl GrpcBlobUploader {
     async fn upload_once(
         &self,
         digest: &PayloadDigest,
-        bytes: &[u8],
+        bytes: Bytes,
     ) -> Result<u64, BlobCallFailure> {
         let frames = upload_frames(digest, &self.tenant_wire_value(), bytes);
         let mut client = self.client.clone();
-        let response = tokio::time::timeout(
-            UPLOAD_TIMEOUT,
-            client.upload_blob(tokio_stream::iter(frames)),
-        )
-        .await
-        .map_err(|_elapsed| BlobCallFailure::Classified {
-            kind: BlobStoreErrorKind::Unavailable,
-            message: format!(
-                "blob upload of {digest} timed out after {}s",
-                UPLOAD_TIMEOUT.as_secs()
-            ),
-        })?
-        .map_err(|status| {
-            BlobCallFailure::from_status(
-                &status,
-                format!(
-                    "blob upload of {digest} rejected: {}",
-                    fold_status_message(&status)
+        let response = tokio::time::timeout(UPLOAD_TIMEOUT, client.upload_blob(frames))
+            .await
+            .map_err(|_elapsed| BlobCallFailure::Classified {
+                kind: BlobStoreErrorKind::Unavailable,
+                message: format!(
+                    "blob upload of {digest} timed out after {}s",
+                    UPLOAD_TIMEOUT.as_secs()
                 ),
-            )
-        })?;
+            })?
+            .map_err(|status| {
+                BlobCallFailure::from_status(
+                    &status,
+                    format!(
+                        "blob upload of {digest} rejected: {}",
+                        fold_status_message(&status)
+                    ),
+                )
+            })?;
         Ok(response.into_inner().size_bytes)
     }
 }
@@ -283,7 +282,7 @@ impl BlobUploader for GrpcBlobUploader {
             .collect()
     }
 
-    async fn upload(&self, digest: &PayloadDigest, bytes: &[u8]) -> Result<(), BlobStoreError> {
+    async fn upload(&self, digest: &PayloadDigest, bytes: Bytes) -> Result<(), BlobStoreError> {
         let size = bytes.len() as u64;
         if size > MAX_UPLOAD_BLOB_BYTES {
             return Err(BlobStoreError::rejected(
@@ -294,7 +293,7 @@ impl BlobUploader for GrpcBlobUploader {
             ));
         }
         let presented = self.credential.bearer();
-        let stored = match self.upload_once(digest, bytes).await {
+        let stored = match self.upload_once(digest, bytes.clone()).await {
             Ok(stored) => stored,
             Err(failure) => {
                 self.refresh_or_fail(failure, presented.as_ref()).await?;
@@ -319,37 +318,51 @@ fn client_config_error(error: GrpcClientError) -> BlobStoreError {
 
 /// Chunk one blob into `UploadBlob` frames: the first frame declares the digest and tenancy (and
 /// carries the first chunk — for an empty blob, no bytes), later frames carry content only.
-fn upload_frames(digest: &PayloadDigest, org_id: &str, bytes: &[u8]) -> Vec<UploadBlobRequest> {
-    let mut chunks = bytes.chunks(UPLOAD_CHUNK_BYTES);
-    let first = UploadBlobRequest {
-        digest: digest.as_str().to_owned(),
-        data: chunks.next().unwrap_or_default().to_vec(),
-        org_id: org_id.to_owned(),
-    };
-    std::iter::once(first)
-        .chain(chunks.map(|chunk| UploadBlobRequest {
-            digest: String::new(),
-            data: chunk.to_vec(),
-            org_id: String::new(),
-        }))
-        .collect()
+fn upload_frames(
+    digest: &PayloadDigest,
+    org_id: &str,
+    bytes: Bytes,
+) -> impl futures_core::Stream<Item = UploadBlobRequest> + Send + 'static {
+    stream::unfold(
+        (
+            bytes,
+            0_usize,
+            Some((digest.to_string(), org_id.to_owned())),
+        ),
+        |(bytes, offset, identity)| async move {
+            if offset == bytes.len() && identity.is_none() {
+                return None;
+            }
+            let end = offset.saturating_add(UPLOAD_CHUNK_BYTES).min(bytes.len());
+            let (digest, org_id) = identity.unwrap_or_default();
+            let frame = UploadBlobRequest {
+                digest,
+                data: bytes.slice(offset..end).to_vec(),
+                org_id,
+            };
+            Some((frame, (bytes, end, None)))
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt as _;
 
     fn digest_of(content: &[u8]) -> PayloadDigest {
         let hex = blake3::hash(content).to_hex().to_string();
         PayloadDigest::new(format!("blake3:{hex}")).expect("valid digest")
     }
 
-    #[test]
-    fn frames_chunk_content_and_declare_identity_once() {
+    #[tokio::test]
+    async fn frames_chunk_content_and_declare_identity_once() {
         let bytes = vec![7u8; UPLOAD_CHUNK_BYTES * 2 + 3];
         let digest = digest_of(&bytes);
 
-        let frames = upload_frames(&digest, "tenant-x", &bytes);
+        let frames: Vec<_> = upload_frames(&digest, "tenant-x", Bytes::from(bytes.clone()))
+            .collect()
+            .await;
 
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].digest, digest.as_str());
@@ -364,10 +377,10 @@ mod tests {
         assert_eq!(assembled, bytes);
     }
 
-    #[test]
-    fn empty_blob_is_a_single_identity_frame() {
+    #[tokio::test]
+    async fn empty_blob_is_a_single_identity_frame() {
         let digest = digest_of(b"");
-        let frames = upload_frames(&digest, "", b"");
+        let frames: Vec<_> = upload_frames(&digest, "", Bytes::new()).collect().await;
 
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].digest, digest.as_str());
@@ -419,7 +432,7 @@ mod tests {
 
         // The endpoint above is unroutable: the rejection must happen before any RPC.
         let error = uploader
-            .upload(&digest_of(&bytes), &bytes)
+            .upload(&digest_of(&bytes), Bytes::from(bytes))
             .await
             .expect_err("over-cap blob must be rejected");
         assert_eq!(error.kind(), BlobStoreErrorKind::Rejected);

@@ -15,6 +15,7 @@ use std::{
 
 use async_trait::async_trait;
 use blake3::Hasher;
+use bytes::Bytes;
 use hiloop_core::event::{PayloadDigest, PayloadRef};
 use thiserror::Error;
 use tokio::{
@@ -282,9 +283,10 @@ pub trait BlobUploader: Send + Sync {
     ) -> Result<Vec<PayloadDigest>, BlobStoreError>;
 
     /// Upload one blob's bytes; the backend re-hashes and rejects a mismatch.
-    // Takes the full bytes (bounded by MAX_UPLOAD_BLOB_BYTES); a streaming reader is a future
-    // refinement.
-    async fn upload(&self, digest: &PayloadDigest, bytes: &[u8]) -> Result<(), BlobStoreError>;
+    ///
+    /// [`Bytes`] lets a streaming transport retain the bounded blob without copying the whole
+    /// value again while it emits frames.
+    async fn upload(&self, digest: &PayloadDigest, bytes: Bytes) -> Result<(), BlobStoreError>;
 }
 
 /// Standalone/air-gapped default: reports nothing missing, so blobs stay local.
@@ -300,7 +302,7 @@ impl BlobUploader for NoopUploader {
         Ok(Vec::new())
     }
 
-    async fn upload(&self, _digest: &PayloadDigest, _bytes: &[u8]) -> Result<(), BlobStoreError> {
+    async fn upload(&self, _digest: &PayloadDigest, _bytes: Bytes) -> Result<(), BlobStoreError> {
         Ok(())
     }
 }
@@ -329,7 +331,7 @@ impl BlobUploader for UnavailableUploader {
         Err(BlobStoreError::other("unavailable", self.reason.clone()))
     }
 
-    async fn upload(&self, _digest: &PayloadDigest, _bytes: &[u8]) -> Result<(), BlobStoreError> {
+    async fn upload(&self, _digest: &PayloadDigest, _bytes: Bytes) -> Result<(), BlobStoreError> {
         Err(BlobStoreError::other("unavailable", self.reason.clone()))
     }
 }
@@ -430,6 +432,7 @@ impl DirBlobStore {
 pub mod testing {
     use super::{BlobFuture, BlobStore, BlobStoreError, BlobUploader, BlobWriter};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use hiloop_core::event::{PayloadDigest, PayloadRef};
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
@@ -542,7 +545,7 @@ pub mod testing {
                 .collect())
         }
 
-        async fn upload(&self, digest: &PayloadDigest, bytes: &[u8]) -> Result<(), BlobStoreError> {
+        async fn upload(&self, digest: &PayloadDigest, bytes: Bytes) -> Result<(), BlobStoreError> {
             self.uploaded
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -827,7 +830,7 @@ mod tests {
             .await
             .expect_err("probe must fail");
         let upload = uploader
-            .upload(&digest("a"), b"bytes")
+            .upload(&digest("a"), Bytes::from_static(b"bytes"))
             .await
             .expect_err("upload must fail");
 
