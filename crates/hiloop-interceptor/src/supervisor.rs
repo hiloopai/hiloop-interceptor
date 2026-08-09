@@ -2546,7 +2546,7 @@ mod tests {
         assert_eq!(
             vars.get("OTEL_BSP_MAX_EXPORT_BATCH_SIZE")
                 .map(String::as_str),
-            Some(MAX_OTLP_EXPORT_BATCH_SPANS)
+            Some("64")
         );
     }
 
