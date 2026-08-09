@@ -14,6 +14,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,6 +25,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use prost::Message as _;
 use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use hiloop_core::event::{AttributeKey, AttributeValue, Event, EventName, FiniteF64, SignalType};
 use hiloop_core::identity::{Hlc, HlcClock};
@@ -42,6 +44,10 @@ const OTLP_SOURCE: &str = "otlp";
 const OTLP_TRACES_KIND: &str = "traces";
 const TRACES_PATH: &str = "/v1/traces";
 const MAX_OTLP_BODY_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
+// The permit follows the body's shared bytes through the pipeline, bounding both active reads and
+// queued raw signals to 64 MiB rather than only limiting socket tasks.
+const MAX_IN_FLIGHT_OTLP_BODIES: usize = 4;
+const OTLP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const DESCRIPTOR: NormalizerDescriptor =
     NormalizerDescriptor::new("otlp-trace", env!("CARGO_PKG_VERSION"), "hiloop.event.v1");
 
@@ -49,6 +55,8 @@ const DESCRIPTOR: NormalizerDescriptor =
 pub struct OtlpReceiver {
     listener: TcpListener,
     clock: Arc<HlcClock>,
+    body_slots: Arc<Semaphore>,
+    body_read_timeout: Duration,
 }
 
 impl OtlpReceiver {
@@ -59,8 +67,28 @@ impl OtlpReceiver {
 
     /// Bind the receiver on an explicit address.
     pub async fn bind_addr(addr: SocketAddr, clock: Arc<HlcClock>) -> std::io::Result<Self> {
+        Self::bind_with_admission(
+            addr,
+            clock,
+            MAX_IN_FLIGHT_OTLP_BODIES,
+            OTLP_BODY_READ_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn bind_with_admission(
+        addr: SocketAddr,
+        clock: Arc<HlcClock>,
+        max_in_flight_bodies: usize,
+        body_read_timeout: Duration,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        Ok(Self { listener, clock })
+        Ok(Self {
+            listener,
+            clock,
+            body_slots: Arc::new(Semaphore::new(max_in_flight_bodies)),
+            body_read_timeout,
+        })
     }
 
     /// The bound address. Inject `OTEL_EXPORTER_OTLP_ENDPOINT=http://{addr}`.
@@ -92,9 +120,17 @@ impl OtlpReceiver {
                     let io = TokioIo::new(stream);
                     let sink = sink.clone();
                     let clock = Arc::clone(&self.clock);
+                    let body_slots = Arc::clone(&self.body_slots);
+                    let body_read_timeout = self.body_read_timeout;
                     tokio::spawn(async move {
                         let service = service_fn(move |request| {
-                            handle_request(request, sink.clone(), Arc::clone(&clock))
+                            handle_request(
+                                request,
+                                sink.clone(),
+                                Arc::clone(&clock),
+                                Arc::clone(&body_slots),
+                                body_read_timeout,
+                            )
                         });
                         if let Err(error) = hyper::server::conn::http1::Builder::new()
                             .serve_connection(io, service)
@@ -132,17 +168,27 @@ async fn handle_request(
     request: Request<Incoming>,
     sink: RawSignalSink,
     clock: Arc<HlcClock>,
+    body_slots: Arc<Semaphore>,
+    body_read_timeout: Duration,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.method() != Method::POST || request.uri().path() != TRACES_PATH {
         return Ok(empty_response(StatusCode::NOT_FOUND));
     }
 
-    let body = match Limited::new(request.into_body(), MAX_OTLP_BODY_BYTES as usize)
-        .collect()
-        .await
+    let Ok(permit) = body_slots.try_acquire_owned() else {
+        return Ok(empty_response(StatusCode::TOO_MANY_REQUESTS));
+    };
+    let body = match tokio::time::timeout(
+        body_read_timeout,
+        Limited::new(request.into_body(), MAX_OTLP_BODY_BYTES as usize).collect(),
+    )
+    .await
     {
-        Ok(collected) => collected.to_bytes(),
-        Err(error) => {
+        Ok(Ok(collected)) => Bytes::from_owner(AdmittedBody {
+            bytes: collected.to_bytes(),
+            _permit: permit,
+        }),
+        Ok(Err(error)) => {
             // A body exceeding the cap surfaces as `LengthLimitError`; report it
             // as 413 so the caller can distinguish it from a malformed request.
             if error.downcast_ref::<LengthLimitError>().is_some() {
@@ -151,6 +197,7 @@ async fn handle_request(
             eprintln!("hiloop-interceptor: OTLP body read error: {error}");
             return Ok(empty_response(StatusCode::BAD_REQUEST));
         }
+        Err(_) => return Ok(empty_response(StatusCode::REQUEST_TIMEOUT)),
     };
 
     let raw = RawSignal::new(OTLP_SOURCE, OTLP_TRACES_KIND, clock.tick(), body)
@@ -163,6 +210,17 @@ async fn handle_request(
     Ok(protobuf_response(
         ExportTraceServiceResponse::default().encode_to_vec(),
     ))
+}
+
+struct AdmittedBody {
+    bytes: Bytes,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for AdmittedBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
@@ -366,6 +424,35 @@ mod tests {
                 ..Default::default()
             }],
         }
+    }
+
+    fn otlp_head(addr: SocketAddr, content_length: usize) -> String {
+        format!(
+            "POST /v1/traces HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    async fn post_otlp(addr: SocketAddr, body: &[u8]) -> Vec<u8> {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(otlp_head(addr, body.len()).as_bytes())
+            .await
+            .expect("write head");
+        stream.write_all(body).await.expect("write body");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        response
+    }
+
+    fn assert_http_status(response: &[u8], status: u16) {
+        assert!(
+            String::from_utf8_lossy(response).starts_with(&format!("HTTP/1.1 {status}")),
+            "unexpected response: {}",
+            String::from_utf8_lossy(response)
+        );
     }
 
     #[tokio::test]
@@ -770,6 +857,92 @@ mod tests {
             rx.try_recv().is_err(),
             "oversize body must not produce a raw signal"
         );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn stalled_body_is_bounded_and_releases_receiver_capacity() {
+        let clock = Arc::new(HlcClock::new());
+        let receiver = OtlpReceiver::bind_with_admission(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            Arc::clone(&clock),
+            1,
+            std::time::Duration::from_millis(40),
+        )
+        .await
+        .expect("bind");
+        let addr = receiver.local_addr().expect("addr");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(receiver.serve(RawSignalSink::new(tx), async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        let body = request(vec![span("op", 1, vec![])]).encode_to_vec();
+        let mut stalled = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stalled
+            .write_all(otlp_head(addr, body.len()).as_bytes())
+            .await
+            .expect("write head");
+        stalled
+            .write_all(&body[..1])
+            .await
+            .expect("write partial body");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert_http_status(&post_otlp(addr, &body).await, 429);
+
+        let mut stalled_response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            stalled.read_to_end(&mut stalled_response),
+        )
+        .await
+        .expect("stalled request reaches its body deadline")
+        .expect("read timeout response");
+        assert_http_status(&stalled_response, 408);
+
+        assert_http_status(&post_otlp(addr, &body).await, 200);
+        assert_eq!(
+            rx.recv()
+                .await
+                .expect("captured retry")
+                .expect("raw signal")
+                .body
+                .as_ref(),
+            body
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn body_admission_remains_held_while_the_raw_signal_is_queued() {
+        let clock = Arc::new(HlcClock::new());
+        let receiver = OtlpReceiver::bind_with_admission(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            Arc::clone(&clock),
+            1,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("bind");
+        let addr = receiver.local_addr().expect("addr");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(receiver.serve(RawSignalSink::new(tx), async move {
+            let _ = shutdown_rx.await;
+        }));
+        let body = request(vec![span("op", 1, vec![])]).encode_to_vec();
+        assert_http_status(&post_otlp(addr, &body).await, 200);
+        assert_http_status(&post_otlp(addr, &body).await, 429);
+
+        drop(rx.recv().await.expect("first raw signal"));
+
+        assert_http_status(&post_otlp(addr, &body).await, 200);
 
         let _ = shutdown_tx.send(());
         let _ = server.await;
