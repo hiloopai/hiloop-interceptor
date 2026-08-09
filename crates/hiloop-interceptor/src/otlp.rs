@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -178,14 +178,20 @@ async fn handle_request(
     let Ok(permit) = body_slots.try_acquire_owned() else {
         return Ok(empty_response(StatusCode::TOO_MANY_REQUESTS));
     };
-    let body = match tokio::time::timeout(
-        body_read_timeout,
-        Limited::new(request.into_body(), MAX_OTLP_BODY_BYTES as usize).collect(),
-    )
+    let body = match tokio::time::timeout(body_read_timeout, async {
+        let mut incoming = Limited::new(request.into_body(), MAX_OTLP_BODY_BYTES as usize);
+        let mut bytes = BytesMut::with_capacity(MAX_OTLP_BODY_BYTES as usize);
+        while let Some(frame) = incoming.frame().await {
+            if let Ok(data) = frame?.into_data() {
+                bytes.extend_from_slice(&data);
+            }
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(bytes.freeze())
+    })
     .await
     {
-        Ok(Ok(collected)) => Bytes::from_owner(AdmittedBody {
-            bytes: collected.to_bytes(),
+        Ok(Ok(bytes)) => Bytes::from_owner(AdmittedBody {
+            bytes,
             _permit: permit,
         }),
         Ok(Err(error)) => {
@@ -786,7 +792,9 @@ mod tests {
             body.len()
         );
         stream.write_all(head.as_bytes()).await.expect("write head");
-        stream.write_all(&body).await.expect("write body");
+        for chunk in body.chunks(3) {
+            stream.write_all(chunk).await.expect("write body chunk");
+        }
 
         let mut response = Vec::new();
         stream
