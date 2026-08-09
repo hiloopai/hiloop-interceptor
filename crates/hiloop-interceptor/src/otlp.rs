@@ -24,7 +24,6 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use prost::Message as _;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 
 use hiloop_core::event::{AttributeKey, AttributeValue, Event, EventName, FiniteF64, SignalType};
 use hiloop_core::identity::{Hlc, HlcClock};
@@ -36,7 +35,7 @@ use opentelemetry_proto::tonic::trace::v1::Span;
 
 use crate::seams::{
     NormalizationContext, NormalizationOutcome, NormalizeError, Normalizer, NormalizerDescriptor,
-    NormalizerSupport, RawSignal, SourceError,
+    NormalizerSupport, RawSignal, RawSignalSink, ShutdownSignal, SinkSend, Source, SourceError,
 };
 
 const OTLP_SOURCE: &str = "otlp";
@@ -55,7 +54,12 @@ pub struct OtlpReceiver {
 impl OtlpReceiver {
     /// Bind the receiver on `127.0.0.1:0`.
     pub async fn bind(clock: Arc<HlcClock>) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        Self::bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)), clock).await
+    }
+
+    /// Bind the receiver on an explicit address.
+    pub async fn bind_addr(addr: SocketAddr, clock: Arc<HlcClock>) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
         Ok(Self { listener, clock })
     }
 
@@ -66,14 +70,11 @@ impl OtlpReceiver {
 
     /// Accept and serve OTLP exports until `shutdown` resolves.
     ///
-    /// Each accepted export is forwarded as one raw `traces` signal on
-    /// `signal_tx`; [`OtlpTraceNormalizer`] turns it into events downstream.
+    /// Each accepted export is forwarded as one raw `traces` signal through
+    /// `sink`; [`OtlpTraceNormalizer`] turns it into events downstream.
     /// In-flight connections after `shutdown` are dropped, not drained.
-    pub async fn serve<S>(
-        self,
-        signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
-        shutdown: S,
-    ) where
+    pub async fn serve<S>(self, sink: RawSignalSink, shutdown: S)
+    where
         S: std::future::Future<Output = ()>,
     {
         tokio::pin!(shutdown);
@@ -89,11 +90,11 @@ impl OtlpReceiver {
                         }
                     };
                     let io = TokioIo::new(stream);
-                    let signal_tx = signal_tx.clone();
+                    let sink = sink.clone();
                     let clock = Arc::clone(&self.clock);
                     tokio::spawn(async move {
                         let service = service_fn(move |request| {
-                            handle_request(request, signal_tx.clone(), Arc::clone(&clock))
+                            handle_request(request, sink.clone(), Arc::clone(&clock))
                         });
                         if let Err(error) = hyper::server::conn::http1::Builder::new()
                             .serve_connection(io, service)
@@ -111,9 +112,25 @@ impl OtlpReceiver {
     }
 }
 
+#[async_trait]
+impl Source for OtlpReceiver {
+    fn name(&self) -> &'static str {
+        OTLP_SOURCE
+    }
+
+    async fn run(
+        self: Box<Self>,
+        sink: RawSignalSink,
+        shutdown: ShutdownSignal,
+    ) -> Result<(), SourceError> {
+        self.serve(sink, shutdown).await;
+        Ok(())
+    }
+}
+
 async fn handle_request(
     request: Request<Incoming>,
-    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    sink: RawSignalSink,
     clock: Arc<HlcClock>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.method() != Method::POST || request.uri().path() != TRACES_PATH {
@@ -138,7 +155,7 @@ async fn handle_request(
 
     let raw = RawSignal::new(OTLP_SOURCE, OTLP_TRACES_KIND, clock.tick(), body)
         .with_attribute("otlp.path", TRACES_PATH);
-    if signal_tx.send(Ok(raw)).await.is_err() {
+    if sink.send(raw).await == SinkSend::Closed {
         // The pipeline has gone away; the wrapper is shutting down.
         return Ok(empty_response(StatusCode::SERVICE_UNAVAILABLE));
     }
@@ -297,6 +314,13 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiver_is_a_capture_session_source() {
+        fn assert_source<T: crate::seams::Source>() {}
+
+        assert_source::<OtlpReceiver>();
+    }
     use hiloop_core::identity::RunContext;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans};
@@ -662,9 +686,9 @@ mod tests {
         let clock = Arc::new(HlcClock::new());
         let receiver = OtlpReceiver::bind(Arc::clone(&clock)).await.expect("bind");
         let addr = receiver.local_addr().expect("addr");
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(receiver.serve(tx, async move {
+        let server = tokio::spawn(receiver.serve(RawSignalSink::new(tx), async move {
             let _ = shutdown_rx.await;
         }));
 
@@ -702,9 +726,9 @@ mod tests {
         let clock = Arc::new(HlcClock::new());
         let receiver = OtlpReceiver::bind(Arc::clone(&clock)).await.expect("bind");
         let addr = receiver.local_addr().expect("addr");
-        let (tx, mut rx) = mpsc::channel(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(receiver.serve(tx, async move {
+        let server = tokio::spawn(receiver.serve(RawSignalSink::new(tx), async move {
             let _ = shutdown_rx.await;
         }));
 

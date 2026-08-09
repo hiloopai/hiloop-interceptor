@@ -154,7 +154,7 @@ impl GrpcBlobUploader {
                 .iter()
                 .map(|digest| digest.as_str().to_owned())
                 .collect(),
-            tenant_id: self.tenant_wire_value(),
+            org_id: self.tenant_wire_value(),
         });
         let response = tokio::time::timeout(PROBE_TIMEOUT, client.has_blobs(request))
             .await
@@ -280,18 +280,18 @@ fn client_config_error(error: GrpcClientError) -> BlobStoreError {
 
 /// Chunk one blob into `UploadBlob` frames: the first frame declares the digest and tenancy (and
 /// carries the first chunk — for an empty blob, no bytes), later frames carry content only.
-fn upload_frames(digest: &PayloadDigest, tenant_id: &str, bytes: &[u8]) -> Vec<UploadBlobRequest> {
+fn upload_frames(digest: &PayloadDigest, org_id: &str, bytes: &[u8]) -> Vec<UploadBlobRequest> {
     let mut chunks = bytes.chunks(UPLOAD_CHUNK_BYTES);
     let first = UploadBlobRequest {
         digest: digest.as_str().to_owned(),
         data: chunks.next().unwrap_or_default().to_vec(),
-        tenant_id: tenant_id.to_owned(),
+        org_id: org_id.to_owned(),
     };
     std::iter::once(first)
         .chain(chunks.map(|chunk| UploadBlobRequest {
             digest: String::new(),
             data: chunk.to_vec(),
-            tenant_id: String::new(),
+            org_id: String::new(),
         }))
         .collect()
 }
@@ -314,11 +314,11 @@ mod tests {
 
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].digest, digest.as_str());
-        assert_eq!(frames[0].tenant_id, "tenant-x");
+        assert_eq!(frames[0].org_id, "tenant-x");
         assert_eq!(frames[0].data.len(), UPLOAD_CHUNK_BYTES);
         for frame in &frames[1..] {
             assert!(frame.digest.is_empty());
-            assert!(frame.tenant_id.is_empty());
+            assert!(frame.org_id.is_empty());
         }
         assert_eq!(frames[2].data.len(), 3);
         let assembled: Vec<u8> = frames.iter().flat_map(|f| f.data.clone()).collect();

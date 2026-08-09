@@ -18,7 +18,7 @@ use crate::{
     netns::NetworkCapture,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
     pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL, PipelineOptions},
-    proxy::{ProxyCa, ProxyNormalizer, ProxyServer},
+    proxy::{ProxyNormalizer, ProxySource, ProxySourceConfig},
     raw::JsonlRawStore,
     redact::RedactionPolicy,
     seams::{
@@ -875,32 +875,6 @@ where
         None
     };
 
-    let proxy_ca = if options.network_capture.uses_proxy() {
-        Some(ProxyCa::generate().context("failed to generate proxy CA")?)
-    } else {
-        None
-    };
-    // The child-scoped CA bundle file must outlive the child, so keep the handle.
-    let proxy_ca_file = match &proxy_ca {
-        Some(ca) => {
-            let mut file =
-                tempfile::NamedTempFile::new().context("failed to create proxy CA bundle file")?;
-            let bundle = union_ca_bundle(read_system_ca_roots().as_deref(), ca.cert_pem());
-            file.write_all(&bundle)
-                .context("failed to write proxy CA bundle")?;
-            Some(file)
-        }
-        None => None,
-    };
-    let proxy_server = if options.network_capture.uses_proxy() {
-        Some(
-            ProxyServer::bind(Arc::clone(&clock))
-                .await
-                .context("failed to bind proxy server")?,
-        )
-    } else {
-        None
-    };
     // With a gRPC export and no explicit blob dir, bodies are staged in a per-run scratch store;
     // the TempDir handle keeps it alive until the post-run blob upload below, then removes it on
     // drop — unless the drain left blobs behind, in which case it is kept (see the drain below).
@@ -937,6 +911,43 @@ where
         )),
         _ => None,
     };
+    let injector = match (&options.secret_broker, options.secret_bindings.is_empty()) {
+        (Some(broker), false) => Some(
+            SecretInjector::new(options.secret_bindings.clone(), broker)
+                .context("failed to build the credential injector from the secret bindings")?,
+        ),
+        _ => None,
+    };
+    let proxy_source = match (&blob_store, options.network_capture.uses_proxy()) {
+        (Some(blob_store), true) => {
+            let blob_store: Arc<dyn crate::blob::BlobStore> = blob_store.clone();
+            let config = ProxySourceConfig::new(blob_store)
+                .with_max_capture_bytes(options.max_capture_bytes)
+                .with_redaction(options.redaction)
+                .with_egress(options.egress.clone())
+                .with_anomaly(options.anomaly.clone())
+                .with_injector(injector)
+                .with_upstream_trust_anchors(load_extra_upstream_trust_anchors());
+            Some(
+                ProxySource::bind(Arc::clone(&clock), config)
+                    .await
+                    .context("failed to bind proxy source")?,
+            )
+        }
+        _ => None,
+    };
+    // The child-scoped CA bundle file must outlive the child, so keep the handle.
+    let proxy_ca_file = match &proxy_source {
+        Some(source) => {
+            let mut file =
+                tempfile::NamedTempFile::new().context("failed to create proxy CA bundle file")?;
+            let bundle = union_ca_bundle(read_system_ca_roots().as_deref(), source.ca_cert_pem());
+            file.write_all(&bundle)
+                .context("failed to write proxy CA bundle")?;
+            Some(file)
+        }
+        None => None,
+    };
 
     let mut command = Command::new(&options.command[0]);
     command.args(&options.command[1..]).kill_on_drop(true);
@@ -960,10 +971,10 @@ where
             .context("failed to read OTLP receiver address")?;
         child_env.set_otlp_endpoint(addr);
     }
-    if let (Some(server), Some(file)) = (&proxy_server, &proxy_ca_file) {
-        let addr = server
+    if let (Some(source), Some(file)) = (&proxy_source, &proxy_ca_file) {
+        let addr = source
             .local_addr()
-            .context("failed to read proxy server address")?;
+            .context("failed to read proxy source address")?;
         child_env.set_proxy(addr, file.path());
     } else if let Some(ca_bundle) = &options.ca_bundle {
         child_env.set_ca_bundle(ca_bundle);
@@ -1087,25 +1098,14 @@ where
         ),
     };
 
-    let (otlp_shutdown_tx, otlp_server) = match otlp_receiver {
-        Some(receiver) => {
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let server = receiver.serve(signal_tx.clone(), async move {
-                let _ = shutdown_rx.await;
-            });
-            (Some(shutdown_tx), Some(server))
-        }
-        None => (None, None),
-    };
-    let egress = Arc::new(options.egress.clone());
-    let anomaly = Arc::new(options.anomaly.clone());
-    let injector = match (&options.secret_broker, options.secret_bindings.is_empty()) {
-        (Some(broker), false) => Some(
-            SecretInjector::new(options.secret_bindings.clone(), broker)
-                .context("failed to build the credential injector from the secret bindings")?,
-        ),
-        _ => None,
-    };
+    let otlp_server = otlp_receiver
+        .map(|receiver| capture_control.attach(Box::new(receiver)))
+        .transpose()
+        .context("failed to attach OTLP receiver to capture session")?;
+    let proxy_server = proxy_source
+        .map(|source| capture_control.attach(Box::new(source)))
+        .transpose()
+        .context("failed to attach proxy source to capture session")?;
     // The proxy consumes the store handle; the drainer keeps its own clone for the
     // incremental and run-end uploads. A gateway client that cannot even be configured
     // still gets a drainer (over an always-failing uploader), so run-end accounting
@@ -1138,27 +1138,6 @@ where
             Some(BlobDrainer::new(store.as_ref().clone(), uploader))
         }
         _ => None,
-    };
-    let (proxy_shutdown_tx, proxy_server_task) = match (proxy_server, proxy_ca, blob_store) {
-        (Some(server), Some(ca), Some(blob_store)) => {
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let task = server.serve(
-                ca,
-                signal_tx.clone(),
-                blob_store,
-                options.max_capture_bytes,
-                options.redaction,
-                Arc::clone(&egress),
-                Arc::clone(&anomaly),
-                injector,
-                load_extra_upstream_trust_anchors(),
-                async move {
-                    let _ = shutdown_rx.await;
-                },
-            );
-            (Some(shutdown_tx), Some(task))
-        }
-        _ => (None, None),
     };
     drop(signal_tx);
 
@@ -1248,21 +1227,18 @@ where
         drop(exec_emitter);
         let _ = stdin_shutdown_tx.send(());
         let _ = drain_stop_tx.send(());
-        for shutdown_tx in [otlp_shutdown_tx, proxy_shutdown_tx].into_iter().flatten() {
-            let _ = shutdown_tx.send(());
-        }
         capture_control.shutdown();
         status
     };
     let otlp_task = async {
         if let Some(server) = otlp_server {
-            server.await;
+            let _ = server.await;
         }
     };
     let proxy_task = async {
         // Capture is best effort: a proxy failure can be diagnosed with --verbose, but is not fatal
         // to the child.
-        if let Some(task) = proxy_server_task
+        if let Some(task) = proxy_server
             && let Err(error) = task.await
             && options.verbose_diagnostics
         {

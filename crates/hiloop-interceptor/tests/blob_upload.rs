@@ -76,7 +76,7 @@ impl TelemetryBlobService for RecordingBlobService {
             .lock()
             .expect("lock")
             .probes
-            .push((req.digests.clone(), req.tenant_id.clone()));
+            .push((req.digests.clone(), req.org_id.clone()));
         let missing_digests = req
             .digests
             .into_iter()
@@ -99,7 +99,7 @@ impl TelemetryBlobService for RecordingBlobService {
             ));
         }
         let digest = first.digest.clone();
-        let tenant_id = first.tenant_id.clone();
+        let tenant_id = first.org_id.clone();
 
         let mut bytes: Vec<u8> = Vec::new();
         let mut frames = 0usize;

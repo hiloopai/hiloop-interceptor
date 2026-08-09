@@ -377,11 +377,14 @@ where
                     let event = stamp_normalization_metadata(
                         event,
                         &context,
-                        descriptor,
-                        retention,
-                        &source,
-                        &kind,
-                        raw_observation.as_ref(),
+                        &NormalizationStamp {
+                            observation: raw.observation_context(),
+                            descriptor,
+                            retention,
+                            source: &source,
+                            kind: &kind,
+                            raw_observation: raw_observation.as_ref(),
+                        },
                     );
                     event_tx
                         .send(event)
@@ -496,39 +499,44 @@ where
     })
 }
 
+struct NormalizationStamp<'a> {
+    observation: Option<&'a crate::seams::ObservationContext>,
+    descriptor: NormalizerDescriptor,
+    retention: RawRetentionPolicy,
+    source: &'a str,
+    kind: &'a str,
+    raw_observation: Option<&'a RawObservationRef>,
+}
+
 fn stamp_normalization_metadata(
     event: Event,
     context: &NormalizationContext,
-    descriptor: NormalizerDescriptor,
-    retention: RawRetentionPolicy,
-    source: &str,
-    kind: &str,
-    raw_observation: Option<&RawObservationRef>,
+    stamp: &NormalizationStamp<'_>,
 ) -> Event {
     use provenance_keys as keys;
 
     let mut event = context
-        .stamp_provenance(event)
+        .stamp_signal_provenance(event, stamp.observation)
         .with_attribute(
             AttributeKey::from_static(keys::NORMALIZER_NAME),
-            descriptor.name(),
+            stamp.descriptor.name(),
         )
         .with_attribute(
             AttributeKey::from_static(keys::NORMALIZER_VERSION),
-            descriptor.version(),
+            stamp.descriptor.version(),
         )
         .with_attribute(
             AttributeKey::from_static(keys::NORMALIZER_OUTPUT_SCHEMA_VERSION),
-            descriptor.output_schema_version(),
+            stamp.descriptor.output_schema_version(),
         )
-        .with_attribute(AttributeKey::from_static(keys::RAW_SOURCE), source)
-        .with_attribute(AttributeKey::from_static(keys::RAW_KIND), kind)
+        .with_attribute(AttributeKey::from_static(keys::RAW_SOURCE), stamp.source)
+        .with_attribute(AttributeKey::from_static(keys::RAW_KIND), stamp.kind)
         .with_attribute(
             AttributeKey::from_static(keys::RAW_RETENTION),
-            retention.as_str(),
+            stamp.retention.as_str(),
         );
 
-    if let Some(raw_observation) = raw_observation {
+    if let Some(raw_observation) = stamp.raw_observation {
         event = event.with_attribute(
             AttributeKey::from_static(keys::RAW_OBSERVATION_ID),
             raw_observation.id(),
@@ -544,7 +552,8 @@ mod tests {
     use crate::{
         exporters::testing::sample_log_event,
         seams::{
-            ExportError, NormalizationOutcome, ProcessContext, RawSignal, testing::MemoryRawStore,
+            ExportError, NormalizationOutcome, ObservationContext, ProcessContext, RawSignal,
+            testing::MemoryRawStore,
         },
         stdio::StdioLogNormalizer,
     };
@@ -782,6 +791,65 @@ mod tests {
         assert_eq!(
             value["attributes"][provenance_keys::WRAPPER_VERSION],
             env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_context_overrides_the_session_process_for_one_execution() {
+        let context =
+            NormalizationContext::new(RunContext::new_local_root()).with_process(ProcessContext {
+                pid: Some(1),
+                command: Some(PathBuf::from("capture-agent")),
+                argv: vec!["capture-agent".to_owned()],
+                cwd: Some(PathBuf::from("/")),
+            });
+        let normalizer = StdioLogNormalizer;
+        let exporter = RecordingExporter::default();
+        let raw = RawSignal::new(
+            "stdio",
+            "stdout",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::from_static(b"hello"),
+        )
+        .with_observation_context(ObservationContext {
+            producer_id: "sandbox-exec".to_owned(),
+            execution_id: Some("exec-2".to_owned()),
+            process: Some(ProcessContext {
+                pid: Some(42),
+                command: Some(PathBuf::from("codex")),
+                argv: vec!["codex".to_owned(), "exec".to_owned()],
+                cwd: Some(PathBuf::from("/workspace")),
+            }),
+        });
+
+        Pipeline::new(context, &normalizer, &exporter)
+            .options(PipelineOptions::new(1, 1, 8).expect("pipeline options"))
+            .run(futures_util::stream::iter([Ok(raw)]))
+            .await
+            .expect("pipeline should run");
+
+        let events = exporter.events();
+        let value = serde_json::to_value(&events[0]).expect("serialize event");
+        assert_eq!(
+            value["attributes"][provenance_keys::PRODUCER_ID],
+            "sandbox-exec"
+        );
+        assert_eq!(value["attributes"][provenance_keys::EXECUTION_ID], "exec-2");
+        assert_eq!(value["attributes"][provenance_keys::PROCESS_PID], 42);
+        assert_eq!(
+            value["attributes"][provenance_keys::PROCESS_COMMAND],
+            "codex"
+        );
+        assert_eq!(
+            value["attributes"][provenance_keys::PROCESS_COMMAND_ARGS],
+            r#"["codex","exec"]"#
+        );
+        assert_eq!(
+            value["attributes"][provenance_keys::PROCESS_CWD],
+            "/workspace"
         );
     }
 

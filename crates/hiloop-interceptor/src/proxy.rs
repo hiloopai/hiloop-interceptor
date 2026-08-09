@@ -56,7 +56,9 @@ use hudsucker::tokio_tungstenite::Connector;
 use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::mpsc;
 
 use hiloop_core::event::{AttributeKey, Event, EventName, MediaType, PayloadRef, SignalType};
 use hiloop_core::identity::HlcClock;
@@ -68,7 +70,7 @@ use crate::egress::{CanonicalHost, Destination, EgressPolicy, canonicalize_host}
 use crate::redact::RedactionPolicy;
 use crate::seams::{
     NormalizationContext, NormalizationOutcome, NormalizeError, Normalizer, NormalizerDescriptor,
-    NormalizerSupport, RawSignal, SourceError,
+    NormalizerSupport, RawSignal, RawSignalSink, ShutdownSignal, Source, SourceError,
 };
 use crate::secret::SecretInjector;
 
@@ -359,67 +361,47 @@ pub(crate) fn upstream_client_config(
         })
 }
 
-/// An intercepting proxy bound to an ephemeral localhost port.
-pub struct ProxyServer {
+struct ProxyServer {
     listener: TcpListener,
     clock: Arc<HlcClock>,
 }
 
 impl ProxyServer {
-    /// Bind the proxy on `127.0.0.1:0`.
-    pub async fn bind(clock: Arc<HlcClock>) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    async fn bind_addr(addr: SocketAddr, clock: Arc<HlcClock>) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
         Ok(Self { listener, clock })
     }
 
-    /// The bound address. Inject `HTTPS_PROXY=http://{addr}`.
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    /// Run the proxy until `shutdown` resolves, capturing traffic to `signal_tx`
-    /// and streaming bodies to `blob_store`.
-    ///
-    /// `egress` enforces the run's egress policy (default allow-all is a no-op),
-    /// `anomaly` inspects original request bodies (default disabled is a no-op), and
-    /// `injector`, when set, injects bound credentials into matching requests.
-    /// `upstream_extra_trust_anchors` are unioned with the public webpki roots for
-    /// the upstream TLS client (see `upstream_root_store` for the trust model);
-    /// empty means public roots only, the previous behavior.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the proxy's capture, redaction, egress, anomaly, injection, and upstream-trust seams are all configured per run; a config struct is deferred while there is a single in-tree caller (the supervisor)"
-    )]
-    pub async fn serve<F>(
+    /// Run the proxy until `shutdown` resolves, capturing traffic to `sink`
+    /// and streaming bodies to the configured blob store.
+    async fn serve<F>(
         self,
         ca: ProxyCa,
-        signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
-        blob_store: Arc<dyn BlobStore>,
-        max_capture_bytes: Option<u64>,
-        redaction: RedactionPolicy,
-        egress: Arc<EgressPolicy>,
-        anomaly: Arc<AnomalyConfig>,
-        injector: Option<SecretInjector>,
-        upstream_extra_trust_anchors: Vec<CertificateDer<'static>>,
+        sink: RawSignalSink,
+        config: ProxySourceConfig,
         shutdown: F,
     ) -> Result<(), ProxyError>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let handler = CaptureHandler::new(
-            signal_tx,
+            sink,
             self.clock,
-            blob_store,
-            max_capture_bytes,
-            redaction,
-            egress,
-            anomaly,
-            injector,
+            config.blob_store,
+            config.max_capture_bytes,
+            config.redaction,
+            config.egress,
+            config.anomaly,
+            config.injector,
         );
         // Mirrors hudsucker's `with_rustls_connector` (HTTPS-or-HTTP, http1+http2 ALPN
         // on the HTTP connector, the un-ALPN'd config on the websocket connector),
         // except the root store is [`upstream_root_store`] instead of webpki-only.
-        let tls_config = upstream_client_config(&upstream_extra_trust_anchors)?;
+        let tls_config = upstream_client_config(&config.upstream_extra_trust_anchors)?;
         let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls_config.clone())
             .https_or_http()
@@ -439,6 +421,133 @@ impl ProxyServer {
             .start()
             .await
             .map_err(|error| ProxyError::Server(error.to_string()))
+    }
+}
+
+/// Capture configuration owned by a [`ProxySource`].
+pub struct ProxySourceConfig {
+    blob_store: Arc<dyn BlobStore>,
+    max_capture_bytes: Option<u64>,
+    redaction: RedactionPolicy,
+    egress: Arc<EgressPolicy>,
+    anomaly: Arc<AnomalyConfig>,
+    injector: Option<SecretInjector>,
+    upstream_extra_trust_anchors: Vec<CertificateDer<'static>>,
+}
+
+impl ProxySourceConfig {
+    /// Configure proxy capture with safe defaults and the required payload store.
+    pub fn new(blob_store: Arc<dyn BlobStore>) -> Self {
+        Self {
+            blob_store,
+            max_capture_bytes: Some(DEFAULT_MAX_CAPTURE_BYTES),
+            redaction: RedactionPolicy::default(),
+            egress: Arc::new(EgressPolicy::default()),
+            anomaly: Arc::new(AnomalyConfig::default()),
+            injector: None,
+            upstream_extra_trust_anchors: Vec::new(),
+        }
+    }
+
+    /// Set the maximum captured copy of each request or response body.
+    #[must_use]
+    pub fn with_max_capture_bytes(mut self, max_capture_bytes: Option<u64>) -> Self {
+        self.max_capture_bytes = max_capture_bytes;
+        self
+    }
+
+    /// Set capture-side secret redaction.
+    #[must_use]
+    pub fn with_redaction(mut self, redaction: RedactionPolicy) -> Self {
+        self.redaction = redaction;
+        self
+    }
+
+    /// Set the cooperative egress policy.
+    #[must_use]
+    pub fn with_egress(mut self, egress: EgressPolicy) -> Self {
+        self.egress = Arc::new(egress);
+        self
+    }
+
+    /// Set request-body anomaly detection.
+    #[must_use]
+    pub fn with_anomaly(mut self, anomaly: AnomalyConfig) -> Self {
+        self.anomaly = Arc::new(anomaly);
+        self
+    }
+
+    /// Configure destination-bound credential injection.
+    #[must_use]
+    pub fn with_injector(mut self, injector: Option<SecretInjector>) -> Self {
+        self.injector = injector;
+        self
+    }
+
+    /// Add private trust anchors for the proxy's upstream TLS hop.
+    #[must_use]
+    pub fn with_upstream_trust_anchors(mut self, anchors: Vec<CertificateDer<'static>>) -> Self {
+        self.upstream_extra_trust_anchors = anchors;
+        self
+    }
+}
+
+/// A configured MITM proxy attached to a [`crate::session::CaptureSession`].
+pub struct ProxySource {
+    server: ProxyServer,
+    ca: ProxyCa,
+    config: ProxySourceConfig,
+}
+
+impl ProxySource {
+    /// Bind to an ephemeral localhost port and mint a private interception CA.
+    pub async fn bind(clock: Arc<HlcClock>, config: ProxySourceConfig) -> Result<Self, ProxyError> {
+        Self::bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)), clock, config).await
+    }
+
+    /// Bind to an explicit address and mint a private interception CA.
+    pub async fn bind_addr(
+        addr: SocketAddr,
+        clock: Arc<HlcClock>,
+        config: ProxySourceConfig,
+    ) -> Result<Self, ProxyError> {
+        let server = ProxyServer::bind_addr(addr, clock)
+            .await
+            .map_err(|error| ProxyError::Server(error.to_string()))?;
+        let ca = ProxyCa::generate()?;
+        Ok(Self { server, ca, config })
+    }
+
+    /// The bound proxy address.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.server.local_addr()
+    }
+
+    /// The public interception CA certificate to install in captured workloads.
+    pub fn ca_cert_pem(&self) -> &str {
+        self.ca.cert_pem()
+    }
+}
+
+#[async_trait]
+impl Source for ProxySource {
+    fn name(&self) -> &'static str {
+        PROXY_SOURCE
+    }
+
+    async fn run(
+        self: Box<Self>,
+        sink: RawSignalSink,
+        shutdown: ShutdownSignal,
+    ) -> Result<(), SourceError> {
+        let Self { server, ca, config } = *self;
+        server
+            .serve(ca, sink, config, shutdown)
+            .await
+            .map_err(|error| SourceError::Other {
+                source_name: PROXY_SOURCE.to_owned(),
+                message: error.to_string(),
+            })
     }
 }
 
@@ -468,7 +577,7 @@ impl ProxyServer {
 /// shared mutable handler that could cross-link two in-flight exchanges.
 #[derive(Clone)]
 pub(crate) struct CaptureHandler {
-    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    sink: RawSignalSink,
     clock: Arc<HlcClock>,
     blob_store: Arc<dyn BlobStore>,
     /// Cap on captured body bytes (blob + reported size); `None` is unlimited.
@@ -515,7 +624,7 @@ impl CaptureHandler {
         reason = "the cooperative proxy and transparent gateway both supply the same independent capture, policy, and injection seams"
     )]
     pub(crate) fn new(
-        signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+        sink: RawSignalSink,
         clock: Arc<HlcClock>,
         blob_store: Arc<dyn BlobStore>,
         max_capture_bytes: Option<u64>,
@@ -525,7 +634,7 @@ impl CaptureHandler {
         injector: Option<SecretInjector>,
     ) -> Self {
         Self {
-            signal_tx,
+            sink,
             clock,
             blob_store,
             max_capture_bytes,
@@ -779,7 +888,7 @@ impl CaptureHandler {
             truncated,
             payload_ref,
         );
-        let _ = self.signal_tx.send(Ok(raw)).await;
+        let _ = self.sink.send(raw).await;
 
         if blocked {
             // The 403 short-circuit never reaches `on_response`, so the exchange's
@@ -818,7 +927,7 @@ impl CaptureHandler {
     /// Inherent (not the trait method) to stay testable without an `HttpContext`.
     async fn on_upstream_error(&mut self, reason: &'static str, detail: String) {
         if let Some(raw) = self.take_abort_signal(reason, Some(detail)) {
-            let _ = self.signal_tx.send(Ok(raw)).await;
+            let _ = self.sink.send(raw).await;
         }
     }
 
@@ -868,7 +977,7 @@ impl CaptureHandler {
         }
         // The pipeline channel is bounded; an egress-deny event is best-effort like the
         // capture signals and must never block request handling.
-        let _ = self.signal_tx.try_send(Ok(raw));
+        let _ = self.sink.try_send(raw);
     }
 
     /// Emit an `egress.denied` event for a destination that failed canonicalization and
@@ -884,7 +993,7 @@ impl CaptureHandler {
         .with_attribute("egress.decision", "unparseable_host")
         .with_attribute("egress.layer", layer)
         .with_attribute("egress.mode", self.egress.mode().to_string());
-        let _ = self.signal_tx.try_send(Ok(raw));
+        let _ = self.sink.try_send(raw);
     }
 
     /// Redact a captured body: the configured pattern policy plus any credentials this
@@ -956,7 +1065,7 @@ impl CaptureHandler {
             capped: false,
             media_type,
             attributes,
-            signal_tx: self.signal_tx.clone(),
+            sink: self.sink.clone(),
             clock: Arc::clone(&self.clock),
             channel,
             inspection,
@@ -1005,7 +1114,7 @@ impl Drop for CaptureHandler {
     fn drop(&mut self) {
         let reason = self.abort_reason.take().unwrap_or("incomplete");
         if let Some(raw) = self.take_abort_signal(reason, None) {
-            let _ = self.signal_tx.try_send(Ok(raw));
+            let _ = self.sink.try_send(raw);
         }
     }
 }
@@ -1081,7 +1190,7 @@ struct TeeState {
     capped: bool,
     media_type: Option<String>,
     attributes: Vec<(&'static str, String)>,
-    signal_tx: mpsc::Sender<Result<RawSignal, SourceError>>,
+    sink: RawSignalSink,
     clock: Arc<HlcClock>,
     channel: TeeChannel,
     /// Request-tee anomaly scan; `None` on response tees or when detection is off.
@@ -1140,7 +1249,7 @@ impl TeeState {
             wire_bytes: self.wire_bytes,
         })
         .await;
-        let _ = self.signal_tx.send(Ok(raw)).await;
+        let _ = self.sink.send(raw).await;
     }
 }
 
@@ -1163,7 +1272,7 @@ impl Drop for TeeState {
         let injected_secrets = std::mem::take(&mut self.injected_secrets);
         let media_type = self.media_type.take();
         let inspection = self.inspection.take();
-        let signal_tx = self.signal_tx.clone();
+        let sink = self.sink.clone();
         tokio::spawn(async move {
             let raw = finalize_tee(FinalizeTee {
                 clock: &clock,
@@ -1179,7 +1288,7 @@ impl Drop for TeeState {
                 wire_bytes,
             })
             .await;
-            let _ = signal_tx.send(Ok(raw)).await;
+            let _ = sink.send(raw).await;
         });
     }
 }
@@ -1778,6 +1887,13 @@ mod tests {
     use hiloop_core::identity::{Hlc, RunContext};
     use hudsucker::hyper::body::Frame;
 
+    #[test]
+    fn configured_proxy_is_a_capture_session_source() {
+        fn assert_source<T: crate::seams::Source>() {}
+
+        assert_source::<ProxySource>();
+    }
+
     fn handler() -> (
         CaptureHandler,
         mpsc::Receiver<Result<RawSignal, SourceError>>,
@@ -1845,7 +1961,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let store = Arc::new(MemoryBlobStore::default());
         let handler = CaptureHandler::new(
-            tx,
+            RawSignalSink::new(tx),
             Arc::new(HlcClock::new()),
             store.clone(),
             max_capture_bytes,
@@ -3958,7 +4074,7 @@ mod tests {
 
     // --- full-proxy streaming integration (real CONNECT + MITM TLS + h2 legs) ---
 
-    /// Run the real proxy (`ProxyServer::serve`) with default policies, trusting
+    /// Run the real proxy source with default policies, trusting
     /// `upstream_ca` on the upstream hop. Returns the proxy address, its CA PEM (the
     /// client's trust anchor), and the capture-signal receiver.
     async fn spawn_proxy_trusting(
@@ -3968,24 +4084,18 @@ mod tests {
         String,
         mpsc::Receiver<Result<RawSignal, SourceError>>,
     ) {
-        let server = ProxyServer::bind(Arc::new(HlcClock::new()))
+        let config = ProxySourceConfig::new(Arc::new(MemoryBlobStore::default()))
+            .with_max_capture_bytes(None)
+            .with_upstream_trust_anchors(vec![ca_trust_anchor(upstream_ca)]);
+        let source = ProxySource::bind(Arc::new(HlcClock::new()), config)
             .await
             .expect("bind proxy");
-        let addr = server.local_addr().expect("proxy addr");
-        let ca = ProxyCa::generate().expect("proxy CA");
-        let ca_pem = ca.cert_pem().to_owned();
+        let addr = source.local_addr().expect("proxy addr");
+        let ca_pem = source.ca_cert_pem().to_owned();
         let (signal_tx, signal_rx) = mpsc::channel(64);
-        tokio::spawn(server.serve(
-            ca,
-            signal_tx,
-            Arc::new(MemoryBlobStore::default()),
-            None,
-            RedactionPolicy::default(),
-            Arc::new(EgressPolicy::default()),
-            Arc::new(AnomalyConfig::default()),
-            None,
-            vec![ca_trust_anchor(upstream_ca)],
-            std::future::pending(),
+        tokio::spawn(Box::new(source).run(
+            RawSignalSink::new(signal_tx),
+            Box::pin(std::future::pending()),
         ));
         (addr, ca_pem, signal_rx)
     }

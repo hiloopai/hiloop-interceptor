@@ -114,11 +114,11 @@ impl GrpcIngestExporter {
         let mut client = self.client.clone();
         let rpc = client.ingest(Request::new(proto::IngestRequest {
             events: proto_events.to_vec(),
+            project_id: self.project_id.clone(),
             // proto3 has no optional scalar here: the empty string is the wire form of
             // "absent", which is exactly what an authenticated gateway expects (it derives
-            // the tenant from the Bearer token).
-            tenant_id: self.tenant_id.clone().unwrap_or_default(),
-            project_id: self.project_id.clone(),
+            // the org from the Bearer token).
+            org_id: self.tenant_id.clone().unwrap_or_default(),
         }));
         let accepted = tokio::time::timeout(deadline, rpc)
             .await
@@ -258,6 +258,24 @@ fn to_proto_event(event: &Event) -> proto::Event {
         event_id: event.event_id.to_string(),
         lineage_path: event.lineage_path.to_string(),
     }
+}
+
+/// Encode one Event-v1 batch for a trusted relay that assigns tenancy and
+/// project identity at its authentication boundary.
+///
+/// The resulting request deliberately leaves both request-level identity
+/// fields empty. It is suitable for an outer, proof-authenticated transport
+/// such as the managed sandbox capture attachment; it must not be sent to an
+/// unauthenticated gateway that trusts body tenancy.
+pub fn encode_trusted_ingest_batch(events: &[Event]) -> Vec<u8> {
+    use prost::Message as _;
+
+    proto::IngestRequest {
+        events: events.iter().map(to_proto_event).collect(),
+        project_id: String::new(),
+        org_id: String::new(),
+    }
+    .encode_to_vec()
 }
 
 fn to_proto_attr(value: &AttributeValue) -> proto::AttributeValue {
@@ -473,6 +491,19 @@ mod tests {
             proto.attributes["stream"].value,
             Some(Value::BoolValue(true))
         );
+    }
+
+    #[test]
+    fn encodes_a_trusted_relay_batch_without_caller_tenancy() {
+        use prost::Message as _;
+
+        let encoded = encode_trusted_ingest_batch(std::slice::from_ref(&sample_event()));
+        let request = proto::IngestRequest::decode(encoded.as_slice()).expect("decode batch");
+
+        assert_eq!(request.events.len(), 1);
+        assert_eq!(request.events[0].name, "gen_ai.request");
+        assert!(request.org_id.is_empty());
+        assert!(request.project_id.is_empty());
     }
 
     #[test]

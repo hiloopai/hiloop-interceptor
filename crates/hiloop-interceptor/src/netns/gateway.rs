@@ -50,7 +50,9 @@ use crate::{
     pipeline::{Pipeline, PipelineOptions},
     proxy::{CaptureHandler, ProxyCa, ProxyNormalizer, upstream_client_config},
     redact::RedactionPolicy,
-    seams::{Exporter, NormalizationContext, NormalizerRouter, RawSignal, SourceError},
+    seams::{
+        Exporter, NormalizationContext, NormalizerRouter, RawSignal, RawSignalSink, SourceError,
+    },
     secret::{BrokerConfig, SecretBinding, SecretInjector},
     supervisor::{RunOptions, run_captured_with_exporter},
 };
@@ -404,7 +406,7 @@ async fn run_gateway(config: GatewayConfig) -> io::Result<ExitCode> {
     let (raw_tx, raw_rx) = mpsc::channel::<Result<RawSignal, SourceError>>(1024);
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(1024);
     let handler = CaptureHandler::new(
-        raw_tx,
+        RawSignalSink::new(raw_tx),
         Arc::clone(&clock),
         blob_store,
         config.max_capture_bytes,

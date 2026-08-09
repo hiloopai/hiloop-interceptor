@@ -26,6 +26,7 @@ pub mod provenance_keys {
     pub const PROCESS_COMMAND_ARGS: &str = "process.command_args";
     pub const PROCESS_CWD: &str = "process.cwd";
     pub const PROCESS_PID: &str = "process.pid";
+    pub const PRODUCER_ID: &str = "producer.id";
     pub const RAW_OBSERVATION_ID: &str = "raw.observation_id";
     pub const RAW_SOURCE: &str = "raw.source";
     pub const RAW_KIND: &str = "raw.kind";
@@ -60,6 +61,10 @@ pub struct RawSignal {
     pub body: Bytes,
     /// Optional out-of-line reference to the body for payloads too large to inline.
     pub payload_ref: Option<PayloadRef>,
+    /// Per-observation producer and process identity. A long-lived capture
+    /// session uses this to distinguish independent executions without
+    /// creating one normalization pipeline per process.
+    pub observation_context: Option<ObservationContext>,
 }
 
 impl RawSignal {
@@ -77,6 +82,7 @@ impl RawSignal {
             attributes: BTreeMap::new(),
             body: body.into(),
             payload_ref: None,
+            observation_context: None,
         }
     }
 
@@ -99,6 +105,18 @@ impl RawSignal {
     pub fn payload_ref(&self) -> Option<&PayloadRef> {
         self.payload_ref.as_ref()
     }
+
+    /// Attach the execution that produced this observation.
+    #[must_use]
+    pub fn with_observation_context(mut self, context: ObservationContext) -> Self {
+        self.observation_context = Some(context);
+        self
+    }
+
+    /// Per-observation execution identity, when the source knows it.
+    pub fn observation_context(&self) -> Option<&ObservationContext> {
+        self.observation_context.as_ref()
+    }
 }
 
 /// Back-pressure behavior for bounded producer/consumer boundaries.
@@ -117,6 +135,8 @@ pub enum Backpressure {
 pub enum SinkSend {
     /// The signal was accepted by the downstream pipeline.
     Delivered,
+    /// The bounded pipeline queue is full and this best-effort signal was not queued.
+    Full,
     /// The pipeline closed its receiver; the source should stop producing.
     Closed,
 }
@@ -124,7 +144,7 @@ pub enum SinkSend {
 impl SinkSend {
     /// Whether the downstream pipeline is still accepting signals.
     pub const fn is_open(self) -> bool {
-        matches!(self, Self::Delivered)
+        !matches!(self, Self::Closed)
     }
 }
 
@@ -158,6 +178,19 @@ impl RawSignalSink {
     /// signals when a source cannot continue.
     pub async fn send_error(&self, error: SourceError) -> SinkSend {
         self.send_result(Err(error)).await
+    }
+
+    /// Try to deliver one best-effort signal without waiting for queue capacity.
+    ///
+    /// This is for synchronous callbacks such as `Drop` and policy decisions
+    /// that cannot await. Ordinary source loops should use [`send`](Self::send)
+    /// so back-pressure reaches the producer.
+    pub fn try_send(&self, raw: RawSignal) -> SinkSend {
+        match self.inner.try_send(Ok(raw)) {
+            Ok(()) => SinkSend::Delivered,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => SinkSend::Full,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => SinkSend::Closed,
+        }
     }
 
     async fn send_result(&self, item: Result<RawSignal, SourceError>) -> SinkSend {
@@ -393,6 +426,22 @@ pub struct ProcessContext {
     pub cwd: Option<PathBuf>,
 }
 
+/// Producer and execution identity for one observation in a long-lived session.
+///
+/// Local `hiloop run` normally has one process for the whole session and uses
+/// [`NormalizationContext::with_process`]. A sandbox capture attachment owns
+/// many entrypoint, exec, and SSH processes, so their sources stamp this
+/// narrower context on each signal instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationContext {
+    /// Stable adapter identity, such as `sandbox-exec` or `sandbox-ssh`.
+    pub producer_id: String,
+    /// Stable identity for one invocation of that producer.
+    pub execution_id: Option<String>,
+    /// Process metadata for this invocation, when known.
+    pub process: Option<ProcessContext>,
+}
+
 /// Interceptor metadata stamped onto normalized output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WrapperContext {
@@ -459,6 +508,14 @@ impl NormalizationContext {
     /// dropped by an event built outside the pipeline.
     #[must_use]
     pub fn stamp_provenance(&self, event: Event) -> Event {
+        self.stamp_signal_provenance(event, None)
+    }
+
+    pub(crate) fn stamp_signal_provenance(
+        &self,
+        event: Event,
+        observation: Option<&ObservationContext>,
+    ) -> Event {
         use provenance_keys as keys;
 
         let mut event = event;
@@ -475,7 +532,27 @@ impl NormalizationContext {
                 self.wrapper.version,
             );
 
-        let Some(process) = &self.process else {
+        if let Some(observation) = observation {
+            if !observation.producer_id.is_empty() {
+                event = event.with_attribute(
+                    AttributeKey::from_static(keys::PRODUCER_ID),
+                    observation.producer_id.clone(),
+                );
+            }
+            if let Some(execution_id) = &observation.execution_id
+                && !execution_id.is_empty()
+            {
+                event = event.with_attribute(
+                    AttributeKey::from_static(keys::EXECUTION_ID),
+                    execution_id.clone(),
+                );
+            }
+        }
+
+        let process = observation
+            .and_then(|context| context.process.as_ref())
+            .or(self.process.as_ref());
+        let Some(process) = process else {
             return event;
         };
         if let Some(pid) = process.pid {
@@ -1242,6 +1319,7 @@ mod tests {
     #[test]
     fn sink_send_is_open() {
         assert!(SinkSend::Delivered.is_open());
+        assert!(SinkSend::Full.is_open());
         assert!(!SinkSend::Closed.is_open());
     }
 
