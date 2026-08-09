@@ -78,13 +78,14 @@ use crate::secret::SecretInjector;
 /// left unspecified. Capture is buffered in memory before redaction/offload, so a
 /// finite default bounds interceptor memory; 8 MiB captures essentially all real API
 /// bodies in full. Only the *captured copy* is bounded — the bytes forwarded to the
-/// client/upstream are never capped. A cap of `0` at the CLI removes the per-exchange cap; the
-/// process-wide capture-buffer budget still prevents concurrent exchanges from exhausting memory.
+/// client/upstream are never capped. A cap of `0` at the CLI removes the per-exchange cap. The
+/// streaming tee still has a process-wide capture-buffer budget; block-on-match anomaly mode must
+/// inspect and retain a complete request before deciding whether forwarding is allowed.
 pub const DEFAULT_MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Aggregate captured-body bytes retained across concurrent proxy exchanges. Forwarding never
-/// waits on this budget: once it is full, additional captured copies are marked truncated while
-/// customer traffic continues unchanged.
+/// Aggregate captured-body bytes retained across concurrent streaming proxy exchanges. Forwarding
+/// never waits on this budget: once it is full, additional captured copies are marked truncated
+/// while customer traffic continues unchanged.
 pub const DEFAULT_CAPTURE_BUFFER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 const PROXY_SOURCE: &str = "proxy";
@@ -1067,7 +1068,7 @@ impl CaptureHandler {
             blob_store: Arc::clone(&self.blob_store),
             captured: Vec::new(),
             capture_budget: Arc::clone(&self.capture_budget),
-            capture_permits: Vec::new(),
+            capture_permit: None,
             max_capture_bytes: self.max_capture_bytes,
             truncated: false,
             redaction: self.redaction,
@@ -1187,7 +1188,7 @@ struct TeeState {
     /// finalize; never the bytes forwarded onward.
     captured: Vec<u8>,
     capture_budget: Arc<Semaphore>,
-    capture_permits: Vec<OwnedSemaphorePermit>,
+    capture_permit: Option<OwnedSemaphorePermit>,
     /// Cap on captured bytes; `None` is unlimited. Forwarding is unaffected.
     max_capture_bytes: Option<u64>,
     /// Set when capture was cut short (cap hit or upstream error).
@@ -1249,7 +1250,7 @@ impl TeeState {
             self.capped = true;
             return;
         };
-        self.capture_permits.push(permit);
+        merge_capture_permit(&mut self.capture_permit, permit);
         self.captured.extend_from_slice(data);
     }
 
@@ -1277,6 +1278,14 @@ impl TeeState {
     }
 }
 
+fn merge_capture_permit(held: &mut Option<OwnedSemaphorePermit>, permit: OwnedSemaphorePermit) {
+    if let Some(held) = held {
+        held.merge(permit);
+    } else {
+        *held = Some(permit);
+    }
+}
+
 impl Drop for TeeState {
     fn drop(&mut self) {
         if self.emitted {
@@ -1292,14 +1301,14 @@ impl Drop for TeeState {
         let attributes = std::mem::take(&mut self.attributes);
         let blob_store = Arc::clone(&self.blob_store);
         let captured = std::mem::take(&mut self.captured);
-        let capture_permits = std::mem::take(&mut self.capture_permits);
+        let capture_permit = self.capture_permit.take();
         let redaction = self.redaction;
         let injected_secrets = std::mem::take(&mut self.injected_secrets);
         let media_type = self.media_type.take();
         let inspection = self.inspection.take();
         let sink = self.sink.clone();
         tokio::spawn(async move {
-            let _capture_permits = capture_permits;
+            let _capture_permit = capture_permit;
             let raw = finalize_tee(FinalizeTee {
                 clock: &clock,
                 channel,
@@ -2511,6 +2520,26 @@ mod tests {
         assert_eq!(signal.attributes["http.response.body_size"], "0");
 
         drop(first);
+    }
+
+    #[test]
+    fn capture_budget_uses_one_permit_owner_across_many_frames() {
+        let budget = Arc::new(Semaphore::new(3));
+        let mut held = None;
+        for _ in 0..3 {
+            let permit = Arc::clone(&budget)
+                .try_acquire_owned()
+                .expect("budget permit");
+            merge_capture_permit(&mut held, permit);
+        }
+
+        assert_eq!(
+            held.as_ref().map(OwnedSemaphorePermit::num_permits),
+            Some(3)
+        );
+        assert_eq!(budget.available_permits(), 0);
+        drop(held);
+        assert_eq!(budget.available_permits(), 3);
     }
 
     #[tokio::test]

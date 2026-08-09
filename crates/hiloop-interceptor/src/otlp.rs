@@ -43,9 +43,9 @@ use crate::seams::{
 const OTLP_SOURCE: &str = "otlp";
 const OTLP_TRACES_KIND: &str = "traces";
 const TRACES_PATH: &str = "/v1/traces";
-const MAX_OTLP_BODY_BYTES: u64 = 256 * 1024; // 256 KiB
+const MAX_OTLP_BODY_BYTES: u64 = 1024 * 1024; // 1 MiB
 // The permit follows the body's shared bytes through the pipeline, bounding both active reads and
-// queued raw signals to 1 MiB rather than only limiting socket tasks. The wire cap also bounds
+// queued raw signals to 4 MiB rather than only limiting socket tasks. The wire cap also bounds
 // protobuf repeated-message expansion before normalized events reach the count-bounded pipeline.
 const MAX_IN_FLIGHT_OTLP_BODIES: usize = 4;
 const OTLP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);

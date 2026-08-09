@@ -598,6 +598,8 @@ impl ChildEnv {
         ));
         self.vars
             .push(("OTEL_EXPORTER_OTLP_PROTOCOL".into(), "http/protobuf".into()));
+        self.vars
+            .push(("OTEL_BSP_MAX_EXPORT_BATCH_SIZE".into(), "64".into()));
     }
 
     fn set_proxy(&mut self, addr: SocketAddr, ca_path: &Path) {
@@ -2514,7 +2516,7 @@ mod tests {
     }
 
     #[test]
-    fn child_env_sets_otlp_endpoint_and_protocol() {
+    fn child_env_sets_otlp_endpoint_protocol_and_bounded_batch() {
         let mut env = ChildEnv::for_run(&RunContext::new_local_root(), None);
         env.set_otlp_endpoint("127.0.0.1:4317".parse().expect("addr"));
 
@@ -2536,6 +2538,11 @@ mod tests {
         assert_eq!(
             vars.get("OTEL_EXPORTER_OTLP_PROTOCOL").map(String::as_str),
             Some("http/protobuf")
+        );
+        assert_eq!(
+            vars.get("OTEL_BSP_MAX_EXPORT_BATCH_SIZE")
+                .map(String::as_str),
+            Some("64")
         );
     }
 
