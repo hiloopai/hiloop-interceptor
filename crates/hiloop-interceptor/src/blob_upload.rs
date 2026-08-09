@@ -98,23 +98,30 @@ impl GrpcBlobUploader {
         failure: BlobCallFailure,
         presented: Option<&tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     ) -> Result<(), BlobStoreError> {
-        use crate::grpc_client::RefreshOutcome;
-
         let BlobCallFailure::Auth { message } = failure else {
             return Err(failure.into_error());
         };
-        match self.credential.refresh_rejected(presented).await {
-            RefreshOutcome::Refreshed => Ok(()),
-            RefreshOutcome::Unrefreshable => Err(BlobStoreError::rejected(STORE_NAME, message)),
-            RefreshOutcome::Failed(reason) => Err(BlobStoreError::unavailable(
-                STORE_NAME,
-                format!("{message}; refreshing the credential failed: {reason}"),
-            )),
-            RefreshOutcome::Pending => Err(BlobStoreError::unavailable(
-                STORE_NAME,
-                format!("{message}; a credential refresh is still in flight"),
-            )),
-        }
+        classify_refresh(self.credential.refresh_rejected(presented).await, message)
+    }
+}
+
+fn classify_refresh(
+    outcome: crate::grpc_client::RefreshOutcome,
+    message: String,
+) -> Result<(), BlobStoreError> {
+    use crate::grpc_client::RefreshOutcome;
+
+    match outcome {
+        RefreshOutcome::Refreshed => Ok(()),
+        RefreshOutcome::Unrefreshable => Err(BlobStoreError::rejected(STORE_NAME, message)),
+        RefreshOutcome::Failed(reason) => Err(BlobStoreError::rejected(
+            STORE_NAME,
+            format!("{message}; refreshing the credential failed: {reason}"),
+        )),
+        RefreshOutcome::Pending => Err(BlobStoreError::unavailable(
+            STORE_NAME,
+            format!("{message}; a credential refresh is still in flight"),
+        )),
     }
 }
 
@@ -390,6 +397,18 @@ mod tests {
             .kind(),
             BlobStoreErrorKind::Rejected
         );
+    }
+
+    #[test]
+    fn failed_credential_refresh_is_rejected() {
+        let error = classify_refresh(
+            crate::grpc_client::RefreshOutcome::Failed("session burned".to_owned()),
+            "credential rejected".to_owned(),
+        )
+        .expect_err("a failed refresh is permanent");
+
+        assert_eq!(error.kind(), BlobStoreErrorKind::Rejected);
+        assert!(error.to_string().contains("session burned"));
     }
 
     #[tokio::test]
