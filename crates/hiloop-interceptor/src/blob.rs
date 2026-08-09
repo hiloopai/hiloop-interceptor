@@ -282,10 +282,7 @@ pub trait BlobUploader: Send + Sync {
         digests: &[PayloadDigest],
     ) -> Result<Vec<PayloadDigest>, BlobStoreError>;
 
-    /// Upload one blob's bytes; the backend re-hashes and rejects a mismatch.
-    ///
-    /// [`Bytes`] lets a streaming transport retain the bounded blob without copying the whole
-    /// value again while it emits frames.
+    /// Upload one blob's immutable bytes; the backend re-hashes and rejects a mismatch.
     async fn upload(&self, digest: &PayloadDigest, bytes: Bytes) -> Result<(), BlobStoreError>;
 }
 
