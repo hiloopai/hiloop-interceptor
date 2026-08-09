@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use hiloop_core::event::PayloadDigest;
 use hiloop_interceptor::blob::{BlobStore, BlobUploader, DirBlobStore};
 use hiloop_interceptor::blob_drain::{BlobDrainer, DrainRetryPolicy};
@@ -200,7 +201,10 @@ async fn upload_chunks_large_blobs_and_declares_identity_once() {
 
     let uploader =
         GrpcBlobUploader::connect(endpoint, Some("tenant-x".to_owned()), true).expect("connect");
-    uploader.upload(&digest, &bytes).await.expect("upload");
+    uploader
+        .upload(&digest, Bytes::from(bytes.clone()))
+        .await
+        .expect("upload");
 
     let rec = recorded.lock().expect("lock");
     assert_eq!(rec.uploads.len(), 1);
@@ -221,7 +225,10 @@ async fn empty_blob_uploads_as_a_single_identity_frame() {
     let endpoint = serve(service).await;
 
     let uploader = GrpcBlobUploader::connect(endpoint, None, true).expect("connect");
-    uploader.upload(&digest, b"").await.expect("upload");
+    uploader
+        .upload(&digest, Bytes::new())
+        .await
+        .expect("upload");
 
     let rec = recorded.lock().expect("lock");
     assert_eq!(rec.uploads.len(), 1);
@@ -337,7 +344,7 @@ async fn an_unauthenticated_probe_refreshes_the_credential_and_retries() {
     assert_eq!(missing, vec![digest.clone()]);
 
     uploader
-        .upload(&digest, &bytes)
+        .upload(&digest, Bytes::from(bytes.clone()))
         .await
         .expect("the upload proceeds under the already-refreshed credential");
 
@@ -361,7 +368,7 @@ async fn gateway_rejection_surfaces_as_a_readable_error() {
     let uploader = GrpcBlobUploader::connect(endpoint, None, true).expect("connect");
     // Mislabeled content: the gateway verifies before storing and must reject.
     let error = uploader
-        .upload(&digest, b"other bytes")
+        .upload(&digest, Bytes::from_static(b"other bytes"))
         .await
         .expect_err("hash mismatch must be rejected");
 
@@ -385,7 +392,7 @@ async fn stored_size_mismatch_is_an_error() {
 
     let uploader = GrpcBlobUploader::connect(endpoint, None, true).expect("connect");
     let error = uploader
-        .upload(&digest, &bytes)
+        .upload(&digest, Bytes::from(bytes))
         .await
         .expect_err("size mismatch must error");
     assert!(error.to_string().contains("stored 99 bytes"));
