@@ -56,9 +56,9 @@ use hudsucker::tokio_tungstenite::Connector;
 use hudsucker::{Body, HttpContext, HttpHandler, Proxy, RequestOrResponse};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 #[cfg(test)]
 use tokio::sync::mpsc;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use hiloop_core::event::{AttributeKey, Event, EventName, MediaType, PayloadRef, SignalType};
 use hiloop_core::identity::HlcClock;
@@ -78,8 +78,14 @@ use crate::secret::SecretInjector;
 /// left unspecified. Capture is buffered in memory before redaction/offload, so a
 /// finite default bounds interceptor memory; 8 MiB captures essentially all real API
 /// bodies in full. Only the *captured copy* is bounded — the bytes forwarded to the
-/// client/upstream are never capped. A cap of `0` at the CLI means unlimited.
+/// client/upstream are never capped. A cap of `0` at the CLI removes the per-exchange cap; the
+/// process-wide capture-buffer budget still prevents concurrent exchanges from exhausting memory.
 pub const DEFAULT_MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Aggregate captured-body bytes retained across concurrent proxy exchanges. Forwarding never
+/// waits on this budget: once it is full, additional captured copies are marked truncated while
+/// customer traffic continues unchanged.
+pub const DEFAULT_CAPTURE_BUFFER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 const PROXY_SOURCE: &str = "proxy";
 const REQUEST_KIND: &str = "http.request";
@@ -583,6 +589,7 @@ pub(crate) struct CaptureHandler {
     /// Cap on captured body bytes (blob + reported size); `None` is unlimited.
     /// Never bounds what is forwarded to the client/upstream.
     max_capture_bytes: Option<u64>,
+    capture_budget: Arc<Semaphore>,
     /// Scrubs secrets from the captured copy before it is persisted; never the
     /// bytes forwarded to the client/upstream.
     redaction: RedactionPolicy,
@@ -638,6 +645,7 @@ impl CaptureHandler {
             clock,
             blob_store,
             max_capture_bytes,
+            capture_budget: Arc::new(Semaphore::new(DEFAULT_CAPTURE_BUFFER_BUDGET_BYTES)),
             redaction,
             egress,
             anomaly,
@@ -1058,6 +1066,8 @@ impl CaptureHandler {
             upstream: Some(BodyStream::new(body)),
             blob_store: Arc::clone(&self.blob_store),
             captured: Vec::new(),
+            capture_budget: Arc::clone(&self.capture_budget),
+            capture_permits: Vec::new(),
             max_capture_bytes: self.max_capture_bytes,
             truncated: false,
             redaction: self.redaction,
@@ -1176,6 +1186,8 @@ struct TeeState {
     /// Captured body bytes, bounded by `max_capture_bytes`. Redacted once at
     /// finalize; never the bytes forwarded onward.
     captured: Vec<u8>,
+    capture_budget: Arc<Semaphore>,
+    capture_permits: Vec<OwnedSemaphorePermit>,
     /// Cap on captured bytes; `None` is unlimited. Forwarding is unaffected.
     max_capture_bytes: Option<u64>,
     /// Set when capture was cut short (cap hit or upstream error).
@@ -1226,6 +1238,18 @@ impl TeeState {
             }
             None => data,
         };
+        if data.is_empty() {
+            return;
+        }
+        let Ok(permits) = u32::try_from(data.len()) else {
+            self.capped = true;
+            return;
+        };
+        let Ok(permit) = Arc::clone(&self.capture_budget).try_acquire_many_owned(permits) else {
+            self.capped = true;
+            return;
+        };
+        self.capture_permits.push(permit);
         self.captured.extend_from_slice(data);
     }
 
@@ -1268,12 +1292,14 @@ impl Drop for TeeState {
         let attributes = std::mem::take(&mut self.attributes);
         let blob_store = Arc::clone(&self.blob_store);
         let captured = std::mem::take(&mut self.captured);
+        let capture_permits = std::mem::take(&mut self.capture_permits);
         let redaction = self.redaction;
         let injected_secrets = std::mem::take(&mut self.injected_secrets);
         let media_type = self.media_type.take();
         let inspection = self.inspection.take();
         let sink = self.sink.clone();
         tokio::spawn(async move {
+            let _capture_permits = capture_permits;
             let raw = finalize_tee(FinalizeTee {
                 clock: &clock,
                 channel,
@@ -2445,6 +2471,46 @@ mod tests {
                 .map(String::as_str),
             Some(full.len().to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_proxy_capture_truncates_at_the_aggregate_buffer_budget() {
+        let (mut handler, mut rx, _store) = handler();
+        handler.capture_budget = Arc::new(Semaphore::new(5));
+
+        let first = handler.tee_body(
+            RESPONSE_TEE,
+            Vec::new(),
+            None,
+            None,
+            streaming_body(&[b"first"]),
+        );
+        let mut first = BodyStream::new(first);
+        let first_frame = first
+            .next()
+            .await
+            .expect("first frame")
+            .expect("first frame body")
+            .into_data()
+            .expect("first data frame");
+        assert_eq!(first_frame, Bytes::from_static(b"first"));
+
+        let second = handler.tee_body(
+            RESPONSE_TEE,
+            Vec::new(),
+            None,
+            None,
+            streaming_body(&[b"second"]),
+        );
+        assert_eq!(
+            drain_body(second).await,
+            vec![Bytes::from_static(b"second")]
+        );
+        let signal = rx.recv().await.expect("second signal").expect("raw signal");
+        assert_eq!(signal.attributes[TRUNCATED_ATTR], "true");
+        assert_eq!(signal.attributes["http.response.body_size"], "0");
+
+        drop(first);
     }
 
     #[tokio::test]
