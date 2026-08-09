@@ -190,7 +190,7 @@ async fn probe_reports_only_gateway_missing_digests() {
 
 #[tokio::test]
 async fn upload_chunks_large_blobs_and_declares_identity_once() {
-    // 2 MiB + change: three 1 MiB frames on the wire.
+    // 2 MiB + change: many bounded frames on the wire.
     let bytes: Vec<u8> = (0..(2 * 1024 * 1024 + 512usize))
         .map(|i| (i % 251) as u8)
         .collect();
@@ -213,7 +213,7 @@ async fn upload_chunks_large_blobs_and_declares_identity_once() {
     // means the chunked reassembly is byte-exact.
     assert_eq!(upload.digest, digest.as_str());
     assert_eq!(upload.tenant_id, "tenant-x");
-    assert_eq!(upload.frames, 3);
+    assert_eq!(upload.frames, bytes.len().div_ceil(24 * 1024));
     assert_eq!(upload.bytes, bytes);
 }
 
