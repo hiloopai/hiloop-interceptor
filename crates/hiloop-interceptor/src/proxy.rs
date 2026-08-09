@@ -78,13 +78,14 @@ use crate::secret::SecretInjector;
 /// left unspecified. Capture is buffered in memory before redaction/offload, so a
 /// finite default bounds interceptor memory; 8 MiB captures essentially all real API
 /// bodies in full. Only the *captured copy* is bounded — the bytes forwarded to the
-/// client/upstream are never capped. A cap of `0` at the CLI removes the per-exchange cap; the
-/// process-wide capture-buffer budget still prevents concurrent exchanges from exhausting memory.
+/// client/upstream are never capped. A cap of `0` at the CLI removes the per-exchange cap. The
+/// streaming tee still has a process-wide capture-buffer budget; block-on-match anomaly mode must
+/// inspect and retain a complete request before deciding whether forwarding is allowed.
 pub const DEFAULT_MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Aggregate captured-body bytes retained across concurrent proxy exchanges. Forwarding never
-/// waits on this budget: once it is full, additional captured copies are marked truncated while
-/// customer traffic continues unchanged.
+/// Aggregate captured-body bytes retained across concurrent streaming proxy exchanges. Forwarding
+/// never waits on this budget: once it is full, additional captured copies are marked truncated
+/// while customer traffic continues unchanged.
 pub const DEFAULT_CAPTURE_BUFFER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 const PROXY_SOURCE: &str = "proxy";
