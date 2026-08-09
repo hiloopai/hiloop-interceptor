@@ -3,10 +3,10 @@
 //! [`BlobDrainer`] pairs a [`DirBlobStore`] with a [`BlobUploader`] and keeps run-scoped
 //! accounting across drain passes. Incremental [`pass`](BlobDrainer::pass)es ship newly
 //! finalized blobs while the run is still alive, so a hard-killed process loses at most the
-//! blobs captured since the last pass. [`ensure`](BlobDrainer::ensure) makes selected payloads
-//! durable before their referring event is exported. Final drains retry transient failures
-//! with bounded exponential backoff and report the end state — the numbers behind the run's
-//! `capture.drain` health record.
+//! blobs captured since the last pass. [`ensure`](BlobDrainer::ensure) lets exporters make
+//! selected payloads durable before their referring event. Final drains retry transient
+//! failures with bounded exponential backoff and report the end state — the numbers behind the
+//! run's `capture.drain` health record.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
