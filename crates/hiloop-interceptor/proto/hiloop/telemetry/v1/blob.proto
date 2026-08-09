@@ -13,11 +13,14 @@ package hiloop.telemetry.v1;
 // (blake3) makes uploads idempotent and already-present content is never re-sent.
 
 message HasBlobsRequest {
+  reserved 2;
+  reserved "tenant_id";
+
   // Candidate blake3 content digests: 64-character lowercase hex, optionally prefixed "blake3:".
   repeated string digests = 1;
-  // Tenant to check under. The backend assigns the tenant from the authenticated request context
+  // Org to check under. The backend assigns the org from the authenticated request context
   // when one is present; the body value is honoured only on unauthenticated local deployments.
-  string tenant_id = 2;
+  string org_id = 3;
 }
 
 message HasBlobsResponse {
@@ -28,15 +31,18 @@ message HasBlobsResponse {
 
 // One frame of a blob upload. The first frame declares the digest (and tenancy); every frame
 // carries a chunk of content, concatenated in arrival order. Later frames may leave `digest` and
-// `tenant_id` empty; a non-empty value that differs from the first frame rejects the upload.
+// `org_id` empty; a non-empty value that differs from the first frame rejects the upload.
 message UploadBlobRequest {
+  reserved 3;
+  reserved "tenant_id";
+
   // blake3 digest the assembled bytes must hash to (64-character lowercase hex, optionally
   // prefixed "blake3:"). The server verifies before storing; a mismatch rejects the upload.
   string digest = 1;
   // The next chunk of blob content.
   bytes data = 2;
-  // Tenant to store under (first frame; same trust rules as HasBlobsRequest.tenant_id).
-  string tenant_id = 3;
+  // Org to store under (first frame; same trust rules as HasBlobsRequest.org_id).
+  string org_id = 4;
 }
 
 message UploadBlobResponse {

@@ -53,13 +53,16 @@ message Event {
   string lineage_path = 10;
 }
 
-// tenant_id and project_id are request-level: the backend assigns them from the authenticated
-// request context (api_key -> tenant) and stamps every event in the batch. They are deliberately
+// org_id and project_id are request-level: the backend assigns them from the authenticated
+// request context (api_key -> org) and stamps every event in the batch. They are deliberately
 // absent from Event so the untrusted per-event payload can never set its own tenancy.
 message IngestRequest {
+  reserved 2;
+  reserved "tenant_id";
+
   repeated Event events = 1;
-  string tenant_id = 2;
   string project_id = 3;
+  string org_id = 4;
 }
 
 message IngestResponse {
@@ -67,9 +70,12 @@ message IngestResponse {
 }
 
 message IngestStreamRequest {
+  reserved 2;
+  reserved "tenant_id";
+
   repeated Event events = 1;
-  string tenant_id = 2;
   string project_id = 3;
+  string org_id = 4;
 }
 
 message IngestStreamResponse {

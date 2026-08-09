@@ -42,7 +42,7 @@ impl TelemetryIngestService for RecordingService {
         let true_count = req.events.len() as u64;
         {
             let mut rec = self.recorded.lock().expect("lock");
-            rec.tenant_id = req.tenant_id;
+            rec.tenant_id = req.org_id;
             rec.project_id = req.project_id;
             rec.events.extend(req.events);
         }
