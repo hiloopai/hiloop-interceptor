@@ -23,9 +23,9 @@ use crate::grpc_client::{
 
 const STORE_NAME: &str = "grpc-blob";
 
-/// One `UploadBlob` frame's content chunk (1 MiB) — far below the gateway's raised 32 MiB
-/// message cap and tonic's 4 MiB default, so a frame never trips a transport limit.
-const UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
+/// One `UploadBlob` frame's content chunk (24 KiB) — below the gateway's bounded 64 KiB frame,
+/// leaving room for digest and tenancy fields without coupling to exact protobuf overhead.
+const UPLOAD_CHUNK_BYTES: usize = 24 * 1024;
 
 /// Deadline on one `HasBlobs` probe. The channel itself has no timeout, and a black-holed
 /// gateway would otherwise hang the run-end drain (and with it the wrapper's exit) forever.
