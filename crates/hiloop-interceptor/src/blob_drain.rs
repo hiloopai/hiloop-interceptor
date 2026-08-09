@@ -3,10 +3,10 @@
 //! [`BlobDrainer`] pairs a [`DirBlobStore`] with a [`BlobUploader`] and keeps run-scoped
 //! accounting across drain passes. Incremental [`pass`](BlobDrainer::pass)es ship newly
 //! finalized blobs while the run is still alive, so a hard-killed process loses at most the
-//! blobs captured since the last pass. The final [`finish`](BlobDrainer::finish) re-probes
-//! every digest against the backend (the backend, not the local cache, is the durability
-//! authority), retries transient failures with bounded exponential backoff, and reports the
-//! end state — the numbers behind the run's `capture.drain` health record.
+//! blobs captured since the last pass. [`ensure`](BlobDrainer::ensure) lets exporters make
+//! selected payloads durable before their referring event. Final drains retry transient
+//! failures with bounded exponential backoff and report the end state — the numbers behind the
+//! run's `capture.drain` health record.
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
@@ -107,10 +107,66 @@ impl BlobDrainer {
         self.drain_once(false).await
     }
 
+    /// Confirm that exactly the requested finalized blobs are durable on the backend.
+    ///
+    /// Digests already confirmed by this drainer make no filesystem or network call. Every
+    /// other digest must resolve to an uploadable local blob, then the normal digest-first
+    /// probe/upload path lands it. Unrelated local blobs are never inspected or shipped.
+    pub async fn ensure(&mut self, digests: &[PayloadDigest]) -> Result<(), BlobStoreError> {
+        let mut pending: Vec<PayloadDigest> = digests
+            .iter()
+            .filter(|digest| !self.landed.contains(*digest))
+            .cloned()
+            .collect();
+        pending.sort();
+        pending.dedup();
+
+        let mut blobs = Vec::with_capacity(pending.len());
+        for digest in pending {
+            let blob = self.store.finalized_blob(&digest).await?.ok_or_else(|| {
+                BlobStoreError::other(
+                    STORE_NAME,
+                    format!("referenced blob `{digest}` is not finalized"),
+                )
+            })?;
+            if blob.size_bytes > self.upload_cap {
+                return Err(BlobStoreError::other(
+                    STORE_NAME,
+                    format!(
+                        "referenced blob `{digest}` exceeds the {} byte upload cap",
+                        self.upload_cap
+                    ),
+                ));
+            }
+            blobs.push(blob);
+        }
+        self.ship(&blobs, false).await
+    }
+
     /// Final authoritative drain: re-probe every digest (ignoring the landed cache), upload
     /// stragglers, and retry per `policy` until complete or the budget is exhausted.
     pub async fn finish(mut self, policy: &DrainRetryPolicy) -> BlobDrainOutcome {
-        let mut outcome = self.drain_once(true).await;
+        self.finish_with(policy, true).await
+    }
+
+    /// Final bounded drain that trusts this drainer's prior durable acknowledgements and
+    /// retries only blobs that have not yet landed.
+    ///
+    /// Use this when shutdown may happen after the uploader's authority has been fenced:
+    /// payloads admitted by [`ensure`](Self::ensure) remain certified without a fresh probe,
+    /// while genuine stragglers still receive the configured retry budget. Use
+    /// [`finish`](Self::finish) when the backend remains reachable and should authoritatively
+    /// re-probe every local digest.
+    pub async fn finish_pending(mut self, policy: &DrainRetryPolicy) -> BlobDrainOutcome {
+        self.finish_with(policy, false).await
+    }
+
+    async fn finish_with(
+        &mut self,
+        policy: &DrainRetryPolicy,
+        reprobe_landed: bool,
+    ) -> BlobDrainOutcome {
+        let mut outcome = self.drain_once(reprobe_landed).await;
         let mut backoff = policy.initial_backoff;
         for _ in 1..policy.attempts.max(1) {
             if outcome.is_complete() {
@@ -118,7 +174,7 @@ impl BlobDrainer {
             }
             tokio::time::sleep(backoff).await;
             backoff = backoff.saturating_mul(2);
-            outcome = self.drain_once(true).await;
+            outcome = self.drain_once(reprobe_landed).await;
         }
         outcome
     }
@@ -382,6 +438,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_ships_only_the_requested_blobs() {
+        let (_temp, store) = dir_store().await;
+        let wanted = store_blob(&store, b"wanted").await;
+        let unrelated = store_blob(&store, b"unrelated").await;
+        let uploader = Arc::new(RecordingUploader::default());
+        let mut drainer = BlobDrainer::new(store, Arc::clone(&uploader) as Arc<dyn BlobUploader>);
+
+        drainer
+            .ensure(std::slice::from_ref(&wanted))
+            .await
+            .expect("ensure wanted blob");
+
+        assert_eq!(uploader.queried(), vec![wanted.clone()]);
+        assert_eq!(uploader.uploaded(), vec![(wanted, b"wanted".to_vec())]);
+        assert!(!uploader.queried().contains(&unrelated));
+    }
+
+    #[tokio::test]
+    async fn ensure_rejects_a_missing_local_blob_without_an_rpc() {
+        let (_temp, store) = dir_store().await;
+        let missing = PayloadDigest::new(format!("blake3:{}", blake3::hash(b"missing").to_hex()))
+            .expect("digest");
+        let uploader = Arc::new(RecordingUploader::default());
+        let mut drainer = BlobDrainer::new(store, Arc::clone(&uploader) as Arc<dyn BlobUploader>);
+
+        let error = drainer
+            .ensure(std::slice::from_ref(&missing))
+            .await
+            .expect_err("missing local blob must fail");
+
+        assert!(error.to_string().contains("not finalized"));
+        assert!(uploader.queried().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_rejects_an_oversize_blob_without_an_rpc() {
+        let (_temp, store) = dir_store().await;
+        let blob = store_blob(&store, b"too large").await;
+        let uploader = Arc::new(RecordingUploader::default());
+        let mut drainer = BlobDrainer::new(store, Arc::clone(&uploader) as Arc<dyn BlobUploader>);
+        drainer.upload_cap = 4;
+
+        let error = drainer
+            .ensure(std::slice::from_ref(&blob))
+            .await
+            .expect_err("oversize referenced blob must fail");
+
+        assert!(error.to_string().contains("upload cap"));
+        assert!(uploader.queried().is_empty());
+    }
+
+    #[tokio::test]
     async fn empty_store_pass_makes_no_rpcs() {
         let (_temp, store) = dir_store().await;
         let uploader = Arc::new(RecordingUploader::default());
@@ -407,6 +515,24 @@ mod tests {
         assert!(outcome.is_complete());
         // Two probes for the same digest: the incremental pass and the authoritative finish.
         assert_eq!(uploader.queried(), vec![blob.clone(), blob]);
+    }
+
+    #[tokio::test]
+    async fn finish_pending_does_not_reprobe_blobs_already_landed() {
+        let (_temp, store) = dir_store().await;
+        let blob = store_blob(&store, b"payload").await;
+        let uploader = Arc::new(FlakyUploader::default());
+        let mut drainer = BlobDrainer::new(store, Arc::clone(&uploader) as Arc<dyn BlobUploader>);
+        drainer
+            .ensure(std::slice::from_ref(&blob))
+            .await
+            .expect("ensure");
+        uploader.failures_left.store(u32::MAX, Ordering::SeqCst);
+
+        let outcome = drainer.finish_pending(&fast_policy(3)).await;
+
+        assert!(outcome.is_complete(), "outcome: {outcome:?}");
+        assert_eq!(uploader.inner.queried(), vec![blob]);
     }
 
     #[tokio::test]

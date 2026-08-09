@@ -78,6 +78,16 @@ impl BlobStoreError {
 }
 
 const STORE_NAME: &str = "blob-dir";
+const BLAKE3_DIGEST_PREFIX: &str = "blake3:";
+const BLAKE3_FILE_PREFIX: &str = "blake3-";
+const BLAKE3_HEX_LEN: usize = 64;
+
+fn is_blake3_hex(value: &str) -> bool {
+    value.len() == BLAKE3_HEX_LEN
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// File-backed content-addressed store: blobs land at `<dir>/blake3-<hex>`.
 #[derive(Debug, Clone)]
@@ -170,7 +180,7 @@ impl BlobWriter for DirBlobWriter {
             drop(open.file);
 
             let hex = open.hasher.finalize().to_hex().to_string();
-            let target = self.dir.join(format!("blake3-{hex}"));
+            let target = self.dir.join(format!("{BLAKE3_FILE_PREFIX}{hex}"));
 
             // Content-addressed dedup: identical content already at the target
             // makes the rename redundant, so drop the temp instead.
@@ -184,9 +194,10 @@ impl BlobWriter for DirBlobWriter {
                     })?;
             }
 
-            let digest = PayloadDigest::new(format!("blake3:{hex}")).map_err(|error| {
-                BlobStoreError::with_source(STORE_NAME, "invalid digest", error)
-            })?;
+            let digest =
+                PayloadDigest::new(format!("{BLAKE3_DIGEST_PREFIX}{hex}")).map_err(|error| {
+                    BlobStoreError::with_source(STORE_NAME, "invalid digest", error)
+                })?;
             Ok(PayloadRef::new(digest).with_size_bytes(open.size))
         })
     }
@@ -275,6 +286,46 @@ pub struct FinalizedBlob {
 }
 
 impl DirBlobStore {
+    /// Resolve one finalized blob by its content digest without scanning the store.
+    pub(crate) async fn finalized_blob(
+        &self,
+        digest: &PayloadDigest,
+    ) -> Result<Option<FinalizedBlob>, BlobStoreError> {
+        let Some(hex) = digest.as_str().strip_prefix(BLAKE3_DIGEST_PREFIX) else {
+            return Err(BlobStoreError::other(
+                STORE_NAME,
+                format!("unsupported payload digest `{digest}`"),
+            ));
+        };
+        if !is_blake3_hex(hex) {
+            return Err(BlobStoreError::other(
+                STORE_NAME,
+                format!("invalid blake3 payload digest `{digest}`"),
+            ));
+        }
+
+        let path = self.dir.join(format!("{BLAKE3_FILE_PREFIX}{hex}"));
+        let metadata = match fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(BlobStoreError::with_source(
+                    STORE_NAME,
+                    "failed to stat blob",
+                    error,
+                ));
+            }
+        };
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(FinalizedBlob {
+            digest: digest.clone(),
+            path,
+            size_bytes: metadata.len(),
+        }))
+    }
+
     /// List the store's finalized blobs (`blake3-<hex>` files; temp and foreign files are
     /// ignored), sorted by digest so callers see a deterministic probe and upload order.
     pub async fn finalized_blobs(&self) -> Result<Vec<FinalizedBlob>, BlobStoreError> {
@@ -286,15 +337,19 @@ impl DirBlobStore {
             BlobStoreError::with_source(STORE_NAME, "failed to list blob dir", error)
         })? {
             let name = entry.file_name();
-            let Some(hex) = name.to_str().and_then(|name| name.strip_prefix("blake3-")) else {
+            let Some(hex) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(BLAKE3_FILE_PREFIX))
+            else {
                 continue;
             };
-            if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            if !is_blake3_hex(hex) {
                 continue;
             }
-            let digest = PayloadDigest::new(format!("blake3:{hex}")).map_err(|error| {
-                BlobStoreError::with_source(STORE_NAME, "invalid digest", error)
-            })?;
+            let digest =
+                PayloadDigest::new(format!("{BLAKE3_DIGEST_PREFIX}{hex}")).map_err(|error| {
+                    BlobStoreError::with_source(STORE_NAME, "invalid digest", error)
+                })?;
             let size_bytes = entry
                 .metadata()
                 .await
@@ -574,6 +629,42 @@ mod tests {
             .expect("create store");
 
         assert!(store.finalized_blobs().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalized_blob_resolves_only_the_requested_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+        let wanted = store_blob(&store, b"wanted").await;
+        store_blob(&store, b"unrelated").await;
+
+        let blob = store
+            .finalized_blob(&wanted)
+            .await
+            .expect("lookup")
+            .expect("wanted blob");
+
+        assert_eq!(blob.digest, wanted);
+        assert_eq!(blob.size_bytes, 6);
+        assert_eq!(tokio::fs::read(blob.path).await.expect("read"), b"wanted");
+    }
+
+    #[tokio::test]
+    async fn finalized_blob_returns_none_for_an_absent_digest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+
+        assert!(
+            store
+                .finalized_blob(&digest("absent"))
+                .await
+                .expect("lookup")
+                .is_none()
+        );
     }
 
     #[tokio::test]
