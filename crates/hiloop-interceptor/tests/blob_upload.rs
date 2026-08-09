@@ -19,8 +19,11 @@ use hiloop_interceptor::grpc_client::proto::{
     HasBlobsRequest, HasBlobsResponse, UploadBlobRequest, UploadBlobResponse,
 };
 use hiloop_interceptor::grpc_client::{GatewayCredential, RefreshBearer, RefreshFuture};
+use prost::Message as _;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
+
+const MAX_BLOB_PROBE_BYTES: usize = 64 * 1024;
 
 /// One completed upload as the fake gateway observed it.
 #[derive(Debug, Clone)]
@@ -35,6 +38,8 @@ struct RecordedUpload {
 struct Recorded {
     probes: Vec<(Vec<String>, String)>,
     uploads: Vec<RecordedUpload>,
+    probe_timeouts: Vec<String>,
+    upload_timeouts: Vec<String>,
 }
 
 /// In-process `TelemetryBlobService` mirroring the gateway contract: `HasBlobs` echoes the
@@ -72,6 +77,13 @@ impl TelemetryBlobService for RecordingBlobService {
         &self,
         request: Request<HasBlobsRequest>,
     ) -> Result<Response<HasBlobsResponse>, Status> {
+        if let Some(timeout) = request.metadata().get("grpc-timeout") {
+            self.recorded
+                .lock()
+                .expect("lock")
+                .probe_timeouts
+                .push(timeout.to_str().expect("ASCII timeout").to_owned());
+        }
         let req = request.into_inner();
         self.recorded
             .lock()
@@ -90,6 +102,13 @@ impl TelemetryBlobService for RecordingBlobService {
         &self,
         request: Request<Streaming<UploadBlobRequest>>,
     ) -> Result<Response<UploadBlobResponse>, Status> {
+        if let Some(timeout) = request.metadata().get("grpc-timeout") {
+            self.recorded
+                .lock()
+                .expect("lock")
+                .upload_timeouts
+                .push(timeout.to_str().expect("ASCII timeout").to_owned());
+        }
         let mut stream = request.into_inner();
         let Some(first) = stream.message().await? else {
             return Err(Status::invalid_argument("upload stream carried no frames"));
@@ -149,7 +168,11 @@ async fn serve(service: RecordingBlobService) -> String {
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(TelemetryBlobServiceServer::new(service))
+            .add_service(
+                TelemetryBlobServiceServer::new(service)
+                    .max_decoding_message_size(MAX_BLOB_PROBE_BYTES)
+                    .max_encoding_message_size(MAX_BLOB_PROBE_BYTES),
+            )
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("serve");
@@ -186,6 +209,133 @@ async fn probe_reports_only_gateway_missing_digests() {
             "tenant-x".to_owned()
         )]
     );
+}
+
+#[tokio::test]
+async fn probe_and_upload_deadlines_reach_the_gateway() {
+    let bytes = Bytes::from_static(b"bounded rpc");
+    let digest = digest_of(&bytes);
+    let service = RecordingBlobService::default();
+    let recorded = service.recorded();
+    let endpoint = serve(service).await;
+    let uploader = GrpcBlobUploader::connect(endpoint, None, true).expect("connect");
+
+    uploader
+        .find_missing(std::slice::from_ref(&digest))
+        .await
+        .expect("probe");
+    uploader.upload(&digest, bytes).await.expect("upload");
+
+    let rec = recorded.lock().expect("lock");
+    assert_eq!(rec.probe_timeouts, ["10000000u"]);
+    assert_eq!(rec.upload_timeouts, ["60000000u"]);
+}
+
+#[tokio::test]
+async fn large_missing_probe_preserves_every_digest_across_bounded_responses() {
+    let digests: Vec<_> = (0..1_000_u32)
+        .map(|index| digest_of(&index.to_be_bytes()))
+        .collect();
+    let service = RecordingBlobService::default();
+    let recorded = service.recorded();
+    let endpoint = serve(service).await;
+    let uploader = GrpcBlobUploader::connect(endpoint, None, true).expect("connect");
+
+    let missing = uploader.find_missing(&digests).await.expect("probe");
+
+    assert_eq!(missing, digests);
+    let rec = recorded.lock().expect("lock");
+    assert!(rec.probes.len() > 1, "the response must cross the wire cap");
+    for (batch, org_id) in &rec.probes {
+        assert!(
+            HasBlobsResponse {
+                missing_digests: batch.clone(),
+            }
+            .encoded_len()
+                <= MAX_BLOB_PROBE_BYTES
+        );
+        assert!(
+            HasBlobsRequest {
+                digests: batch.clone(),
+                org_id: org_id.clone(),
+            }
+            .encoded_len()
+                <= MAX_BLOB_PROBE_BYTES
+        );
+    }
+}
+
+#[tokio::test]
+async fn large_probe_batches_fit_the_gateway_frame_for_pass_and_final_reprobe() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = DirBlobStore::create(temp.path())
+        .await
+        .expect("create store");
+    let mut digests = Vec::new();
+    for index in 0..1_000_u32 {
+        let mut writer = store.writer();
+        writer
+            .write(&index.to_be_bytes())
+            .await
+            .expect("write blob");
+        digests.push(writer.finish().await.expect("finish blob").digest);
+    }
+    let service = RecordingBlobService::with_existing(
+        digests
+            .iter()
+            .map(|digest| bare_hex(digest.as_str()).to_owned()),
+    );
+    let recorded = service.recorded();
+    let endpoint = serve(service).await;
+    let uploader = GrpcBlobUploader::connect(endpoint, None, true).expect("connect");
+    let mut drainer = BlobDrainer::new(store, Arc::new(uploader));
+
+    let pass = drainer.pass().await;
+    assert!(pass.is_complete(), "pass: {pass:?}");
+    let pass_probe_count = {
+        let rec = recorded.lock().expect("lock");
+        assert!(rec.probes.len() > 1, "the probe must cross the wire cap");
+        assert!(rec.probes.iter().all(|(batch, org_id)| {
+            HasBlobsRequest {
+                digests: batch.clone(),
+                org_id: org_id.clone(),
+            }
+            .encoded_len()
+                <= MAX_BLOB_PROBE_BYTES
+        }));
+        let probed: HashSet<_> = rec
+            .probes
+            .iter()
+            .flat_map(|(batch, _)| batch.iter().cloned())
+            .collect();
+        let expected: HashSet<_> = digests
+            .iter()
+            .map(|digest| digest.as_str().to_owned())
+            .collect();
+        assert_eq!(probed, expected, "every candidate is probed exactly once");
+        assert_eq!(
+            rec.probes
+                .iter()
+                .map(|(batch, _)| batch.len())
+                .sum::<usize>(),
+            digests.len(),
+            "batching must not duplicate a candidate"
+        );
+        rec.probes.len()
+    };
+
+    let final_reprobe = drainer.finish(&DrainRetryPolicy::default()).await;
+    assert!(
+        final_reprobe.is_complete(),
+        "final reprobe: {final_reprobe:?}"
+    );
+    let rec = recorded.lock().expect("lock");
+    assert_eq!(
+        rec.probes.len(),
+        pass_probe_count * 2,
+        "the authoritative drain must batch the full digest set again"
+    );
+    assert!(rec.uploads.is_empty(), "the gateway held every blob");
 }
 
 #[tokio::test]

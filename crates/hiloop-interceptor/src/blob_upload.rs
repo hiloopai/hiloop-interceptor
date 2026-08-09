@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream;
 use hiloop_core::event::PayloadDigest;
+use prost::Message as _;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
@@ -26,6 +27,11 @@ const STORE_NAME: &str = "grpc-blob";
 /// One `UploadBlob` frame's content chunk (24 KiB) — below the gateway's bounded 64 KiB frame,
 /// leaving room for digest and tenancy fields without coupling to exact protobuf overhead.
 const UPLOAD_CHUNK_BYTES: usize = 24 * 1024;
+
+/// The gateway applies its bounded 64 KiB frame ceiling to both blob methods. A probe request is
+/// kept under the same ceiling so its worst-case response (every requested digest is missing) also
+/// fits.
+const MAX_BLOB_PROBE_BYTES: usize = 64 * 1024;
 
 /// Deadline on one `HasBlobs` probe. The channel itself has no timeout, and a black-holed
 /// gateway would otherwise hang the run-end drain (and with it the wrapper's exit) forever.
@@ -181,6 +187,50 @@ fn kind_for_status(code: tonic::Code) -> BlobStoreErrorKind {
     }
 }
 
+fn probe_batches(
+    digests: &[PayloadDigest],
+    org_id: &str,
+) -> Result<Vec<std::ops::Range<usize>>, BlobStoreError> {
+    let base_len = HasBlobsRequest {
+        digests: Vec::new(),
+        org_id: org_id.to_owned(),
+    }
+    .encoded_len();
+    if base_len > MAX_BLOB_PROBE_BYTES {
+        return Err(BlobStoreError::rejected(
+            STORE_NAME,
+            "blob probe tenant identity exceeds the gateway frame limit",
+        ));
+    }
+
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut batch_len = base_len;
+    for (index, digest) in digests.iter().enumerate() {
+        let digest_len = HasBlobsRequest {
+            digests: vec![digest.as_str().to_owned()],
+            org_id: String::new(),
+        }
+        .encoded_len();
+        if base_len.saturating_add(digest_len) > MAX_BLOB_PROBE_BYTES {
+            return Err(BlobStoreError::rejected(
+                STORE_NAME,
+                format!("blob digest {digest} exceeds the gateway probe frame limit"),
+            ));
+        }
+        if batch_len.saturating_add(digest_len) > MAX_BLOB_PROBE_BYTES {
+            batches.push(start..index);
+            start = index;
+            batch_len = base_len;
+        }
+        batch_len += digest_len;
+    }
+    if start < digests.len() {
+        batches.push(start..digests.len());
+    }
+    Ok(batches)
+}
+
 impl GrpcBlobUploader {
     /// One deadline-bounded `HasBlobs` probe.
     async fn has_blobs_once(
@@ -188,13 +238,14 @@ impl GrpcBlobUploader {
         digests: &[PayloadDigest],
     ) -> Result<Vec<String>, BlobCallFailure> {
         let mut client = self.client.clone();
-        let request = Request::new(HasBlobsRequest {
+        let mut request = Request::new(HasBlobsRequest {
             digests: digests
                 .iter()
                 .map(|digest| digest.as_str().to_owned())
                 .collect(),
             org_id: self.tenant_wire_value(),
         });
+        request.set_timeout(PROBE_TIMEOUT);
         let response = tokio::time::timeout(PROBE_TIMEOUT, client.has_blobs(request))
             .await
             .map_err(|_elapsed| BlobCallFailure::Classified {
@@ -218,7 +269,9 @@ impl GrpcBlobUploader {
     ) -> Result<u64, BlobCallFailure> {
         let frames = upload_frames(digest, &self.tenant_wire_value(), bytes);
         let mut client = self.client.clone();
-        let response = tokio::time::timeout(UPLOAD_TIMEOUT, client.upload_blob(frames))
+        let mut request = Request::new(frames);
+        request.set_timeout(UPLOAD_TIMEOUT);
+        let response = tokio::time::timeout(UPLOAD_TIMEOUT, client.upload_blob(request))
             .await
             .map_err(|_elapsed| BlobCallFailure::Classified {
                 kind: BlobStoreErrorKind::Unavailable,
@@ -249,16 +302,21 @@ impl BlobUploader for GrpcBlobUploader {
         if digests.is_empty() {
             return Ok(Vec::new());
         }
-        let presented = self.credential.bearer();
-        let missing_digests = match self.has_blobs_once(digests).await {
-            Ok(missing) => missing,
-            Err(failure) => {
-                self.refresh_or_fail(failure, presented.as_ref()).await?;
-                self.has_blobs_once(digests)
-                    .await
-                    .map_err(BlobCallFailure::into_error)?
-            }
-        };
+        let mut missing_digests = Vec::new();
+        for range in probe_batches(digests, &self.tenant_wire_value())? {
+            let batch = &digests[range];
+            let presented = self.credential.bearer();
+            let missing = match self.has_blobs_once(batch).await {
+                Ok(missing) => missing,
+                Err(failure) => {
+                    self.refresh_or_fail(failure, presented.as_ref()).await?;
+                    self.has_blobs_once(batch)
+                        .await
+                        .map_err(BlobCallFailure::into_error)?
+                }
+            };
+            missing_digests.extend(missing);
+        }
 
         // The gateway echoes missing digests verbatim as requested, so each echo must map back to
         // a digest we asked about; anything else is a contract violation, not data.

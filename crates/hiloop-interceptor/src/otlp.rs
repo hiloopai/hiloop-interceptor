@@ -35,6 +35,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
 use opentelemetry_proto::tonic::trace::v1::Span;
 
+use crate::pipeline::DEFAULT_EXPORT_BATCH_SIZE;
 use crate::seams::{
     NormalizationContext, NormalizationOutcome, NormalizeError, Normalizer, NormalizerDescriptor,
     NormalizerSupport, RawSignal, RawSignalSink, ShutdownSignal, SinkSend, Source, SourceError,
@@ -45,8 +46,7 @@ const OTLP_TRACES_KIND: &str = "traces";
 const TRACES_PATH: &str = "/v1/traces";
 const MAX_OTLP_BODY_BYTES: u64 = 1024 * 1024; // 1 MiB
 // The permit follows the body's shared bytes through the pipeline, bounding both active reads and
-// queued raw signals to 4 MiB rather than only limiting socket tasks. The wire cap also bounds
-// protobuf repeated-message expansion before normalized events reach the count-bounded pipeline.
+// queued raw signals to 4 MiB rather than only limiting socket tasks.
 const MAX_IN_FLIGHT_OTLP_BODIES: usize = 4;
 const OTLP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const DESCRIPTOR: NormalizerDescriptor =
@@ -191,10 +191,18 @@ async fn handle_request(
     })
     .await
     {
-        Ok(Ok(bytes)) => Bytes::from_owner(AdmittedBody {
-            bytes,
-            _permit: permit,
-        }),
+        Ok(Ok(bytes)) => match validate_otlp_cardinality(&bytes) {
+            Ok(()) => Bytes::from_owner(AdmittedBody {
+                bytes,
+                _permit: permit,
+            }),
+            Err(OtlpEnvelopeError::Limit { .. }) => {
+                return Ok(empty_response(StatusCode::PAYLOAD_TOO_LARGE));
+            }
+            Err(OtlpEnvelopeError::Malformed(_)) => {
+                return Ok(empty_response(StatusCode::BAD_REQUEST));
+            }
+        },
         Ok(Err(error)) => {
             // A body exceeding the cap surfaces as `LengthLimitError`; report it
             // as 413 so the caller can distinguish it from a malformed request.
@@ -245,6 +253,169 @@ fn protobuf_response(body: Vec<u8>) -> Response<Full<Bytes>> {
         .expect("static protobuf response is valid")
 }
 
+#[derive(Debug)]
+enum OtlpEnvelopeError {
+    Limit { level: &'static str },
+    Malformed(&'static str),
+}
+
+impl std::fmt::Display for OtlpEnvelopeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Limit { level } => write!(
+                formatter,
+                "OTLP {level} limit of {DEFAULT_EXPORT_BATCH_SIZE} exceeded"
+            ),
+            Self::Malformed(message) => write!(formatter, "malformed OTLP envelope: {message}"),
+        }
+    }
+}
+
+/// Validate the shared OTLP export hierarchy without decoding its repeated messages.
+///
+/// Trace, log, and metric exports all nest records as export field 1, resource field 2, scope
+/// field 2. Walking that envelope first prevents a small protobuf full of empty repeated messages
+/// from allocating an arbitrarily large decoded request or event vector.
+fn validate_otlp_cardinality(mut export: &[u8]) -> Result<(), OtlpEnvelopeError> {
+    let mut resources = 0;
+    let mut scopes = 0;
+    let mut records = 0;
+
+    while !export.is_empty() {
+        let (field, wire) = take_key(&mut export)?;
+        if field == 1 && wire == 2 {
+            resources += 1;
+            check_otlp_limit(resources, "resource")?;
+            let resource = take_length_delimited(&mut export)?;
+            validate_resource(resource, &mut scopes, &mut records)?;
+        } else {
+            skip_field(&mut export, field, wire, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_resource(
+    mut resource: &[u8],
+    scopes: &mut usize,
+    records: &mut usize,
+) -> Result<(), OtlpEnvelopeError> {
+    while !resource.is_empty() {
+        let (field, wire) = take_key(&mut resource)?;
+        if field == 2 && wire == 2 {
+            *scopes += 1;
+            check_otlp_limit(*scopes, "scope")?;
+            let scope = take_length_delimited(&mut resource)?;
+            validate_scope(scope, records)?;
+        } else {
+            skip_field(&mut resource, field, wire, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_scope(mut scope: &[u8], records: &mut usize) -> Result<(), OtlpEnvelopeError> {
+    while !scope.is_empty() {
+        let (field, wire) = take_key(&mut scope)?;
+        if field == 2 && wire == 2 {
+            *records += 1;
+            check_otlp_limit(*records, "record")?;
+            let _ = take_length_delimited(&mut scope)?;
+        } else {
+            skip_field(&mut scope, field, wire, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_otlp_limit(count: usize, level: &'static str) -> Result<(), OtlpEnvelopeError> {
+    if count > DEFAULT_EXPORT_BATCH_SIZE {
+        return Err(OtlpEnvelopeError::Limit { level });
+    }
+    Ok(())
+}
+
+fn take_key(input: &mut &[u8]) -> Result<(u32, u8), OtlpEnvelopeError> {
+    let key = take_varint(input)?;
+    let field = u32::try_from(key >> 3)
+        .map_err(|_| OtlpEnvelopeError::Malformed("field number is too large"))?;
+    if field == 0 || field > 0x1fff_ffff {
+        return Err(OtlpEnvelopeError::Malformed("invalid field number"));
+    }
+    Ok((field, (key & 0x07) as u8))
+}
+
+fn take_varint(input: &mut &[u8]) -> Result<u64, OtlpEnvelopeError> {
+    let mut value = 0_u64;
+    for index in 0..10 {
+        let (&byte, rest) = input
+            .split_first()
+            .ok_or(OtlpEnvelopeError::Malformed("truncated varint"))?;
+        *input = rest;
+        if index == 9 && byte > 1 {
+            return Err(OtlpEnvelopeError::Malformed("varint overflow"));
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(OtlpEnvelopeError::Malformed("varint overflow"))
+}
+
+fn take_length_delimited<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], OtlpEnvelopeError> {
+    let length = usize::try_from(take_varint(input)?)
+        .map_err(|_| OtlpEnvelopeError::Malformed("message length is too large"))?;
+    if length > input.len() {
+        return Err(OtlpEnvelopeError::Malformed("truncated message"));
+    }
+    let (value, rest) = input.split_at(length);
+    *input = rest;
+    Ok(value)
+}
+
+fn skip_field(
+    input: &mut &[u8],
+    field: u32,
+    wire: u8,
+    depth: usize,
+) -> Result<(), OtlpEnvelopeError> {
+    let length = match wire {
+        0 => {
+            take_varint(input)?;
+            return Ok(());
+        }
+        1 => 8,
+        2 => {
+            let _ = take_length_delimited(input)?;
+            return Ok(());
+        }
+        3 => {
+            if depth >= 100 {
+                return Err(OtlpEnvelopeError::Malformed("group nesting is too deep"));
+            }
+            loop {
+                let (nested_field, nested_wire) = take_key(input)?;
+                if nested_wire == 4 {
+                    if nested_field != field {
+                        return Err(OtlpEnvelopeError::Malformed("mismatched end group"));
+                    }
+                    return Ok(());
+                }
+                skip_field(input, nested_field, nested_wire, depth + 1)?;
+            }
+        }
+        4 => return Err(OtlpEnvelopeError::Malformed("unexpected end group")),
+        5 => 4,
+        _ => return Err(OtlpEnvelopeError::Malformed("invalid wire type")),
+    };
+    if length > input.len() {
+        return Err(OtlpEnvelopeError::Malformed("truncated fixed-width field"));
+    }
+    *input = &input[length..];
+    Ok(())
+}
+
 /// Decodes OTLP trace exports into fork-stamped events.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OtlpTraceNormalizer;
@@ -268,6 +439,11 @@ impl Normalizer for OtlpTraceNormalizer {
         context: &NormalizationContext,
         raw: RawSignal,
     ) -> Result<NormalizationOutcome, NormalizeError> {
+        validate_otlp_cardinality(raw.body.as_ref()).map_err(|error| NormalizeError::Decode {
+            source_name: raw.source.clone(),
+            kind: raw.kind.clone(),
+            message: error.to_string(),
+        })?;
         let request = ExportTraceServiceRequest::decode(raw.body.as_ref()).map_err(|error| {
             NormalizeError::Decode {
                 source_name: raw.source.clone(),
@@ -276,7 +452,7 @@ impl Normalizer for OtlpTraceNormalizer {
             }
         })?;
 
-        let mut events = Vec::new();
+        let mut events = Vec::with_capacity(DEFAULT_EXPORT_BATCH_SIZE);
         for resource_spans in &request.resource_spans {
             for scope_spans in &resource_spans.scope_spans {
                 for span in &scope_spans.spans {
@@ -433,6 +609,35 @@ mod tests {
         }
     }
 
+    fn repeated_empty_span_body(records: usize) -> Vec<u8> {
+        fn message_field(tag: u32, body: Vec<u8>) -> Vec<u8> {
+            let mut field = Vec::with_capacity(body.len() + 8);
+            prost::encoding::encode_varint(u64::from((tag << 3) | 2), &mut field);
+            prost::encoding::encode_varint(body.len() as u64, &mut field);
+            field.extend(body);
+            field
+        }
+
+        let mut spans = Vec::with_capacity(records * 2);
+        for _ in 0..records {
+            spans.extend([0x12, 0x00]);
+        }
+        message_field(1, message_field(2, spans))
+    }
+
+    fn maximum_repeated_empty_span_body() -> Vec<u8> {
+        let cap = MAX_OTLP_BODY_BYTES as usize;
+        let mut records = cap / 2;
+        loop {
+            let body = repeated_empty_span_body(records);
+            if body.len() <= cap {
+                assert!(repeated_empty_span_body(records + 1).len() > cap);
+                return body;
+            }
+            records -= 1;
+        }
+    }
+
     fn otlp_head(addr: SocketAddr, content_length: usize) -> String {
         format!(
             "POST /v1/traces HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-protobuf\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
@@ -519,6 +724,50 @@ mod tests {
 
         assert_eq!(events[1].signal, SignalType::Span);
         assert_eq!(events[1].name.as_str(), "db.query");
+    }
+
+    #[tokio::test]
+    async fn rejects_more_than_one_export_batch_of_empty_spans() {
+        let body = request(vec![
+            Span::default();
+            crate::pipeline::DEFAULT_EXPORT_BATCH_SIZE + 1
+        ])
+        .encode_to_vec();
+        let raw = RawSignal::new(
+            OTLP_SOURCE,
+            OTLP_TRACES_KIND,
+            Hlc {
+                wall_ns: 0,
+                logical: 0,
+            },
+            body,
+        );
+        let context = NormalizationContext::new(RunContext::new_local_root());
+
+        let error = OtlpTraceNormalizer
+            .normalize(&context, raw)
+            .await
+            .expect_err("one OTLP request cannot expand past the event batch bound");
+
+        assert!(matches!(error, NormalizeError::Decode { .. }));
+        assert!(error.to_string().contains("record limit"));
+    }
+
+    #[test]
+    fn accepts_exactly_one_export_batch_of_empty_spans() {
+        let body = request(vec![Span::default(); DEFAULT_EXPORT_BATCH_SIZE]).encode_to_vec();
+        validate_otlp_cardinality(&body).expect("one batch fits the cardinality bound");
+    }
+
+    #[test]
+    fn rejects_many_empty_resource_messages_before_decode() {
+        let mut body = Vec::new();
+        for _ in 0..=DEFAULT_EXPORT_BATCH_SIZE {
+            body.extend([0x0a, 0x00]);
+        }
+
+        let error = validate_otlp_cardinality(&body).expect_err("resource vector must be bounded");
+        assert!(error.to_string().contains("resource limit"));
     }
 
     #[tokio::test]
@@ -865,6 +1114,29 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "oversize body must not produce a raw signal"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn rejects_maximum_size_repeated_empty_span_request_before_queueing() {
+        let clock = Arc::new(HlcClock::new());
+        let receiver = OtlpReceiver::bind(Arc::clone(&clock)).await.expect("bind");
+        let addr = receiver.local_addr().expect("addr");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(receiver.serve(RawSignalSink::new(tx), async move {
+            let _ = shutdown_rx.await;
+        }));
+        let body = maximum_repeated_empty_span_body();
+        assert!(body.len() <= MAX_OTLP_BODY_BYTES as usize);
+
+        assert_http_status(&post_otlp(addr, &body).await, 413);
+        assert!(
+            rx.try_recv().is_err(),
+            "over-cardinality OTLP must not enter the raw queue"
         );
 
         let _ = shutdown_tx.send(());
