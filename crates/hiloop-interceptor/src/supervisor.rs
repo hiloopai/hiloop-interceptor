@@ -59,6 +59,8 @@ const MAX_STDIO_LINE_BYTES: usize = 64 * 1024;
 const OTEL_RUN_ID: &str = "hiloop.run.id";
 const OTEL_LINEAGE_PATH: &str = "hiloop.run.lineage_path";
 const OTEL_EXECUTION_ID: &str = "hiloop.execution.id";
+/// Spans per child OTLP export, bounded so normal batches fit the receiver body envelope.
+const MAX_OTLP_EXPORT_BATCH_SPANS: &str = "64";
 
 /// Default cadence of the incremental blob drain — the event pipeline's flush default, so
 /// captured bodies are roughly as durable as the events referencing them: a run killed
@@ -598,8 +600,10 @@ impl ChildEnv {
         ));
         self.vars
             .push(("OTEL_EXPORTER_OTLP_PROTOCOL".into(), "http/protobuf".into()));
-        self.vars
-            .push(("OTEL_BSP_MAX_EXPORT_BATCH_SIZE".into(), "64".into()));
+        self.vars.push((
+            "OTEL_BSP_MAX_EXPORT_BATCH_SIZE".into(),
+            MAX_OTLP_EXPORT_BATCH_SPANS.into(),
+        ));
     }
 
     fn set_proxy(&mut self, addr: SocketAddr, ca_path: &Path) {
@@ -2542,7 +2546,7 @@ mod tests {
         assert_eq!(
             vars.get("OTEL_BSP_MAX_EXPORT_BATCH_SIZE")
                 .map(String::as_str),
-            Some("64")
+            Some(MAX_OTLP_EXPORT_BATCH_SPANS)
         );
     }
 
