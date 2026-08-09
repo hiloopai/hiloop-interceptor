@@ -44,36 +44,76 @@ pub trait BlobWriter: Send + Sync {
     fn finish(self: Box<Self>) -> BlobFuture<'static, Result<PayloadRef, BlobStoreError>>;
 }
 
+/// Retry disposition attached to a blob-store or blob-upload failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobStoreErrorKind {
+    /// The backend is applying capacity pressure; retry after backoff.
+    Backpressure,
+    /// A transient dependency or transport failure; retry after backoff.
+    Unavailable,
+    /// The request was permanently judged and retrying it cannot succeed.
+    Rejected,
+    /// The outcome is ambiguous; callers may retry once before backing off.
+    Other,
+}
+
 #[derive(Debug, Error)]
-pub enum BlobStoreError {
-    #[error("blob store `{store}` failed: {message}")]
-    Other {
-        store: String,
-        message: String,
-        #[source]
-        source: Option<Box<dyn StdError + Send + Sync>>,
-    },
+#[error("blob store `{store}` failed: {message}")]
+pub struct BlobStoreError {
+    kind: BlobStoreErrorKind,
+    store: String,
+    message: String,
+    #[source]
+    source: Option<Box<dyn StdError + Send + Sync>>,
 }
 
 impl BlobStoreError {
-    pub fn other(store: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Other {
+    fn new(kind: BlobStoreErrorKind, store: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind,
             store: store.into(),
             message: message.into(),
             source: None,
         }
     }
 
+    /// Construct an ambiguous failure.
+    pub fn other(store: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(BlobStoreErrorKind::Other, store, message)
+    }
+
+    /// Construct a capacity-pressure failure.
+    pub fn backpressure(store: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(BlobStoreErrorKind::Backpressure, store, message)
+    }
+
+    /// Construct a transient dependency or transport failure.
+    pub fn unavailable(store: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(BlobStoreErrorKind::Unavailable, store, message)
+    }
+
+    /// Construct a permanent request judgment.
+    pub fn rejected(store: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(BlobStoreErrorKind::Rejected, store, message)
+    }
+
+    /// Construct an ambiguous failure with its source chain.
     pub fn with_source(
         store: impl Into<String>,
         message: impl Into<String>,
         source: impl StdError + Send + Sync + 'static,
     ) -> Self {
-        Self::Other {
+        Self {
+            kind: BlobStoreErrorKind::Other,
             store: store.into(),
             message: message.into(),
             source: Some(Box::new(source)),
         }
+    }
+
+    /// The retry disposition callers should preserve across adapter boundaries.
+    pub fn kind(&self) -> BlobStoreErrorKind {
+        self.kind
     }
 }
 
@@ -716,6 +756,26 @@ mod tests {
         let display = error.to_string();
         assert!(display.contains("io failed"));
         assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn blob_store_error_preserves_retry_disposition() {
+        assert_eq!(
+            BlobStoreError::rejected("test-store", "bad payload").kind(),
+            BlobStoreErrorKind::Rejected
+        );
+        assert_eq!(
+            BlobStoreError::backpressure("test-store", "full").kind(),
+            BlobStoreErrorKind::Backpressure
+        );
+        assert_eq!(
+            BlobStoreError::unavailable("test-store", "offline").kind(),
+            BlobStoreErrorKind::Unavailable
+        );
+        assert_eq!(
+            BlobStoreError::other("test-store", "unknown").kind(),
+            BlobStoreErrorKind::Other
+        );
     }
 
     #[tokio::test]

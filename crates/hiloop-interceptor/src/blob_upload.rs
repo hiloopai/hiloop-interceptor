@@ -27,11 +27,11 @@ const UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// Deadline on one `HasBlobs` probe. The channel itself has no timeout, and a black-holed
 /// gateway would otherwise hang the run-end drain (and with it the wrapper's exit) forever.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Deadline on one `UploadBlob` stream — generous enough for a cap-sized (64 MiB) blob on a
 /// slow link, small enough that a wedged transfer cannot hang the drain unbounded.
-const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+pub const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
 type AuthedClient = TelemetryBlobServiceClient<InterceptedService<Channel, AuthInterceptor>>;
 
