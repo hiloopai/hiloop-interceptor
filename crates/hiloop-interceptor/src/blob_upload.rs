@@ -12,7 +12,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 
-use crate::blob::{BlobStoreError, BlobUploader, MAX_UPLOAD_BLOB_BYTES};
+use crate::blob::{BlobStoreError, BlobStoreErrorKind, BlobUploader, MAX_UPLOAD_BLOB_BYTES};
 use crate::grpc_client::proto::telemetry_blob_service_client::TelemetryBlobServiceClient;
 use crate::grpc_client::proto::{HasBlobsRequest, UploadBlobRequest};
 use crate::grpc_client::{
@@ -105,12 +105,12 @@ impl GrpcBlobUploader {
         };
         match self.credential.refresh_rejected(presented).await {
             RefreshOutcome::Refreshed => Ok(()),
-            RefreshOutcome::Unrefreshable => Err(BlobStoreError::other(STORE_NAME, message)),
-            RefreshOutcome::Failed(reason) => Err(BlobStoreError::other(
+            RefreshOutcome::Unrefreshable => Err(BlobStoreError::rejected(STORE_NAME, message)),
+            RefreshOutcome::Failed(reason) => Err(BlobStoreError::unavailable(
                 STORE_NAME,
                 format!("{message}; refreshing the credential failed: {reason}"),
             )),
-            RefreshOutcome::Pending => Err(BlobStoreError::other(
+            RefreshOutcome::Pending => Err(BlobStoreError::unavailable(
                 STORE_NAME,
                 format!("{message}; a credential refresh is still in flight"),
             )),
@@ -123,8 +123,11 @@ impl GrpcBlobUploader {
 enum BlobCallFailure {
     /// The gateway judged the credential unauthenticated.
     Auth { message: String },
-    /// Any other failure (timeout, transport, non-auth rejection).
-    Other { message: String },
+    /// A non-auth failure with its retry disposition preserved.
+    Classified {
+        kind: BlobStoreErrorKind,
+        message: String,
+    },
 }
 
 impl BlobCallFailure {
@@ -132,13 +135,40 @@ impl BlobCallFailure {
         if status.code() == tonic::Code::Unauthenticated {
             Self::Auth { message }
         } else {
-            Self::Other { message }
+            Self::Classified {
+                kind: kind_for_status(status.code()),
+                message,
+            }
         }
     }
 
     fn into_error(self) -> BlobStoreError {
-        let (Self::Auth { message } | Self::Other { message }) = self;
-        BlobStoreError::other(STORE_NAME, message)
+        match self {
+            Self::Auth { message } => BlobStoreError::rejected(STORE_NAME, message),
+            Self::Classified { kind, message } => match kind {
+                BlobStoreErrorKind::Backpressure => {
+                    BlobStoreError::backpressure(STORE_NAME, message)
+                }
+                BlobStoreErrorKind::Unavailable => BlobStoreError::unavailable(STORE_NAME, message),
+                BlobStoreErrorKind::Rejected => BlobStoreError::rejected(STORE_NAME, message),
+                BlobStoreErrorKind::Other => BlobStoreError::other(STORE_NAME, message),
+            },
+        }
+    }
+}
+
+fn kind_for_status(code: tonic::Code) -> BlobStoreErrorKind {
+    match code {
+        tonic::Code::ResourceExhausted => BlobStoreErrorKind::Backpressure,
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => BlobStoreErrorKind::Unavailable,
+        tonic::Code::InvalidArgument
+        | tonic::Code::FailedPrecondition
+        | tonic::Code::PermissionDenied
+        | tonic::Code::Unauthenticated
+        | tonic::Code::NotFound
+        | tonic::Code::AlreadyExists
+        | tonic::Code::OutOfRange => BlobStoreErrorKind::Rejected,
+        _ => BlobStoreErrorKind::Other,
     }
 }
 
@@ -158,7 +188,8 @@ impl GrpcBlobUploader {
         });
         let response = tokio::time::timeout(PROBE_TIMEOUT, client.has_blobs(request))
             .await
-            .map_err(|_elapsed| BlobCallFailure::Other {
+            .map_err(|_elapsed| BlobCallFailure::Classified {
+                kind: BlobStoreErrorKind::Unavailable,
                 message: format!("blob probe timed out after {}s", PROBE_TIMEOUT.as_secs()),
             })?
             .map_err(|status| {
@@ -183,7 +214,8 @@ impl GrpcBlobUploader {
             client.upload_blob(tokio_stream::iter(frames)),
         )
         .await
-        .map_err(|_elapsed| BlobCallFailure::Other {
+        .map_err(|_elapsed| BlobCallFailure::Classified {
+            kind: BlobStoreErrorKind::Unavailable,
             message: format!(
                 "blob upload of {digest} timed out after {}s",
                 UPLOAD_TIMEOUT.as_secs()
@@ -235,7 +267,7 @@ impl BlobUploader for GrpcBlobUploader {
                     .get(raw.as_str())
                     .map(|&d| d.clone())
                     .ok_or_else(|| {
-                        BlobStoreError::other(
+                        BlobStoreError::rejected(
                             STORE_NAME,
                             format!("gateway reported unrequested digest {raw:?} as missing"),
                         )
@@ -247,7 +279,7 @@ impl BlobUploader for GrpcBlobUploader {
     async fn upload(&self, digest: &PayloadDigest, bytes: &[u8]) -> Result<(), BlobStoreError> {
         let size = bytes.len() as u64;
         if size > MAX_UPLOAD_BLOB_BYTES {
-            return Err(BlobStoreError::other(
+            return Err(BlobStoreError::rejected(
                 STORE_NAME,
                 format!(
                     "blob {digest} is {size} bytes, over the {MAX_UPLOAD_BLOB_BYTES} byte upload cap"
@@ -265,7 +297,7 @@ impl BlobUploader for GrpcBlobUploader {
             }
         };
         if stored != size {
-            return Err(BlobStoreError::other(
+            return Err(BlobStoreError::rejected(
                 STORE_NAME,
                 format!("gateway stored {stored} bytes of {digest}, expected {size}"),
             ));
@@ -335,6 +367,31 @@ mod tests {
         assert!(frames[0].data.is_empty());
     }
 
+    #[test]
+    fn status_failures_preserve_retry_disposition() {
+        assert_eq!(
+            BlobCallFailure::from_status(&Status::resource_exhausted("full"), "full".to_owned(),)
+                .into_error()
+                .kind(),
+            BlobStoreErrorKind::Backpressure
+        );
+        assert_eq!(
+            BlobCallFailure::from_status(&Status::unavailable("offline"), "offline".to_owned())
+                .into_error()
+                .kind(),
+            BlobStoreErrorKind::Unavailable
+        );
+        assert_eq!(
+            BlobCallFailure::from_status(
+                &Status::invalid_argument("bad digest"),
+                "bad digest".to_owned(),
+            )
+            .into_error()
+            .kind(),
+            BlobStoreErrorKind::Rejected
+        );
+    }
+
     #[tokio::test]
     async fn oversized_blob_is_rejected_client_side() {
         let uploader =
@@ -346,6 +403,7 @@ mod tests {
             .upload(&digest_of(&bytes), &bytes)
             .await
             .expect_err("over-cap blob must be rejected");
+        assert_eq!(error.kind(), BlobStoreErrorKind::Rejected);
         assert!(error.to_string().contains("upload cap"));
     }
 
