@@ -12,6 +12,21 @@ use crate::{
     identity::{Hlc, RunContext},
 };
 
+/// Spans per captured child OTLP export, bounded so normal batches fit the receiver body envelope.
+pub const CAPTURE_OTLP_MAX_EXPORT_BATCH_SIZE: usize = 64;
+
+/// Return the minimum queue override needed to keep the injected batch size valid.
+///
+/// A missing, invalid, zero, or already-large queue keeps the SDK's/customer's queue semantics;
+/// only an explicitly smaller positive queue conflicts with the capture batch bound.
+#[must_use]
+pub fn capture_otlp_queue_override(current: Option<&str>) -> Option<usize> {
+    current
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|queue| *queue > 0 && *queue < CAPTURE_OTLP_MAX_EXPORT_BATCH_SIZE)
+        .map(|_| CAPTURE_OTLP_MAX_EXPORT_BATCH_SIZE)
+}
+
 const CLIENT_HELLO_FINGERPRINT: &str = "client_hello_fingerprint";
 const DOWNSTREAM_BYTES: &str = "downstream_bytes";
 const L7_CAPTURE: &str = "l7_capture";

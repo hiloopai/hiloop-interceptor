@@ -33,6 +33,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use hiloop_core::{
+    capture::{CAPTURE_OTLP_MAX_EXPORT_BATCH_SIZE, capture_otlp_queue_override},
     event::{AttributeKey, AttributeValue, Attributes, Event, EventName, SignalType},
     identity::{Hlc, RunContext},
 };
@@ -59,8 +60,6 @@ const MAX_STDIO_LINE_BYTES: usize = 64 * 1024;
 const OTEL_RUN_ID: &str = "hiloop.run.id";
 const OTEL_LINEAGE_PATH: &str = "hiloop.run.lineage_path";
 const OTEL_EXECUTION_ID: &str = "hiloop.execution.id";
-/// Spans per child OTLP export, bounded so normal batches fit the receiver body envelope.
-const MAX_OTLP_EXPORT_BATCH_SPANS: &str = "64";
 
 /// Default cadence of the incremental blob drain — the event pipeline's flush default, so
 /// captured bodies are roughly as durable as the events referencing them: a run killed
@@ -594,6 +593,9 @@ impl ChildEnv {
     }
 
     fn set_otlp_endpoint(&mut self, addr: SocketAddr) {
+        let queue_override = self
+            .child_value("OTEL_BSP_MAX_QUEUE_SIZE")
+            .and_then(|value| capture_otlp_queue_override(value.to_str()));
         self.vars.push((
             "OTEL_EXPORTER_OTLP_ENDPOINT".into(),
             format!("http://{addr}").into(),
@@ -602,8 +604,14 @@ impl ChildEnv {
             .push(("OTEL_EXPORTER_OTLP_PROTOCOL".into(), "http/protobuf".into()));
         self.vars.push((
             "OTEL_BSP_MAX_EXPORT_BATCH_SIZE".into(),
-            MAX_OTLP_EXPORT_BATCH_SPANS.into(),
+            CAPTURE_OTLP_MAX_EXPORT_BATCH_SIZE.to_string().into(),
         ));
+        if let Some(queue_size) = queue_override {
+            self.vars.push((
+                "OTEL_BSP_MAX_QUEUE_SIZE".into(),
+                queue_size.to_string().into(),
+            ));
+        }
     }
 
     fn set_proxy(&mut self, addr: SocketAddr, ca_path: &Path) {
@@ -2548,6 +2556,23 @@ mod tests {
                 .map(String::as_str),
             Some("64")
         );
+        assert!(!vars.contains_key("OTEL_BSP_MAX_QUEUE_SIZE"));
+    }
+
+    #[test]
+    fn child_env_only_repairs_an_explicitly_too_small_otlp_queue() {
+        let mut env = ChildEnv::for_run(&RunContext::new_local_root(), None);
+        env.vars
+            .push(("OTEL_BSP_MAX_QUEUE_SIZE".into(), "32".into()));
+        env.set_otlp_endpoint("127.0.0.1:4317".parse().expect("addr"));
+
+        let queue_values: Vec<_> = env
+            .vars()
+            .iter()
+            .filter(|(key, _)| key == "OTEL_BSP_MAX_QUEUE_SIZE")
+            .map(|(_, value)| value.to_string_lossy())
+            .collect();
+        assert_eq!(queue_values, ["32", "64"]);
     }
 
     #[test]
