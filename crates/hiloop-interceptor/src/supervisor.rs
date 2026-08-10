@@ -874,7 +874,6 @@ where
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let capture_error = format!("failed to spawn child command: {error}");
             let event = spawn_failure_event(options, clock.tick(), &error);
             if let Err(warning) = export_supervisor_record(
                 exporter,
@@ -905,43 +904,37 @@ where
                     ..CaptureEventDelivery::default()
                 },
             };
-            let unavailable = |trust| {
-                CaptureSourceReport::configured_unavailable(
-                    trust,
-                    CaptureSourceDegradation::StartupFailed,
-                )
-            };
-            let report = CaptureCompletionReport {
-                sources: CaptureSourcesReport {
-                    process: CaptureSourceReport::attached_full(
-                        CaptureEvidenceTrust::PlatformObserved,
-                        1,
-                    ),
-                    stdio: CaptureSourceReport::attached_no_data(
-                        CaptureEvidenceTrust::PlatformObserved,
-                    ),
-                    network: if options.network_capture.uses_proxy() {
-                        unavailable(CaptureEvidenceTrust::PlatformObserved)
+            let report = CaptureCompletionReport::new(
+                CaptureSourcesReport::new(
+                    CaptureSourceReport::attached_full(CaptureEvidenceTrust::PlatformObserved, 1),
+                    CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                    if options.network_capture.uses_proxy() {
+                        CaptureSourceReport::attached_no_data(
+                            CaptureEvidenceTrust::PlatformObserved,
+                        )
                     } else {
                         CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved)
                     },
-                    otlp: if options.otlp {
-                        unavailable(CaptureEvidenceTrust::WorkloadReported)
+                    if options.otlp {
+                        CaptureSourceReport::attached_no_data(
+                            CaptureEvidenceTrust::WorkloadReported,
+                        )
                     } else {
                         CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported)
                     },
-                },
+                ),
                 events,
-                blobs: None,
-                auth_refreshes: gateway_credential.map(GatewayCredential::refreshes),
-                error: Some(capture_error),
-            };
+                None,
+                gateway_credential.map(GatewayCredential::refreshes),
+                None,
+            )
+            .expect("spawn-failure completion accounting is valid");
             let context = NormalizationContext::new(options.context.clone())
                 .with_attributes(options.attributes.clone());
-            if let Err(warning) = export_supervisor_record(
+            if let Err(warning) = export_completion_record(
                 exporter,
                 capture_drain_event(&context, clock.tick(), &report),
-                "capture-health",
+                &report,
                 CAPTURE_HEALTH_EXPORT_TIMEOUT,
             )
             .await
@@ -1214,6 +1207,7 @@ where
     let pipeline_failed = pipeline_result.is_err();
     let otlp_failed = otlp_result.is_err();
     let proxy_failed = proxy_result.is_err();
+    let stdio_failed = stdin_result.is_err() || stdout_result.is_err() || stderr_result.is_err();
     let mut terminal_errors = Vec::<String>::new();
     if let Err(error) = &pipeline_result {
         terminal_errors.push(error.to_string());
@@ -1223,6 +1217,11 @@ where
     }
     if let Err(error) = &proxy_result {
         terminal_errors.push(error.to_string());
+    }
+    for result in [&stdin_result, &stdout_result, &stderr_result] {
+        if let Err(error) = result {
+            terminal_errors.push(error.to_string());
+        }
     }
     let pipeline_warning = pipeline_result
         .as_ref()
@@ -1292,6 +1291,7 @@ where
         options,
         pipeline_report: pipeline_report.as_ref(),
         pipeline_failed,
+        stdio_failed,
         otlp_failed,
         proxy_failed,
         blob_outcome: blob_outcome.as_ref(),
@@ -1300,10 +1300,10 @@ where
         error: (!terminal_errors.is_empty()).then(|| terminal_errors.join("; ")),
     });
     let health_event = capture_drain_event(&health_context, clock.tick(), &report);
-    if let Err(warning) = export_supervisor_record(
+    if let Err(warning) = export_completion_record(
         exporter,
         health_event,
-        "capture-health",
+        &report,
         CAPTURE_HEALTH_EXPORT_TIMEOUT,
     )
     .await
@@ -1417,28 +1417,19 @@ fn source_observations(
     trust: CaptureEvidenceTrust,
     report: &PipelineSourceReport,
 ) -> CaptureSourceReport {
-    let observations = report.observations as u64;
-    match (report.full_events, report.metadata_only_events) {
-        (0, 0) => CaptureSourceReport::attached_no_data(trust),
-        (_, 0) => CaptureSourceReport::attached_full(trust, observations),
-        (0, _) => CaptureSourceReport::attached_metadata_only(
-            trust,
-            observations,
-            CaptureSourceDegradation::OpaqueNetworkTraffic,
-        ),
-        (full, metadata_only) => CaptureSourceReport::attached_mixed(
-            trust,
-            full as u64,
-            metadata_only as u64,
-            CaptureSourceDegradation::OpaqueNetworkTraffic,
-        ),
-    }
+    CaptureSourceReport::from_event_counts(
+        trust,
+        report.full_events as u64,
+        report.metadata_only_events as u64,
+        CaptureSourceDegradation::OpaqueNetworkTraffic,
+    )
 }
 
 struct CompletionReportInput<'a> {
     options: &'a RunOptions,
     pipeline_report: Option<&'a PipelineReport>,
     pipeline_failed: bool,
+    stdio_failed: bool,
     otlp_failed: bool,
     proxy_failed: bool,
     blob_outcome: Option<&'a BlobDrainOutcome>,
@@ -1452,6 +1443,7 @@ fn completion_report(input: CompletionReportInput<'_>) -> CaptureCompletionRepor
         options,
         pipeline_report,
         pipeline_failed,
+        stdio_failed,
         otlp_failed,
         proxy_failed,
         blob_outcome,
@@ -1461,7 +1453,11 @@ fn completion_report(input: CompletionReportInput<'_>) -> CaptureCompletionRepor
     } = input;
     let events = match spool_report {
         Some(spool) => CaptureEventDelivery {
-            observed: pipeline_report.map_or(0, |report| report.events as u64),
+            observed: spool
+                .delivered_events
+                .saturating_add(spool.dropped_events)
+                .saturating_add(spool.rejected_events)
+                .saturating_add(spool.pending_events as u64),
             spooled: spool.spooled_events,
             landed: spool.delivered_events,
             dropped: spool.dropped_events,
@@ -1474,39 +1470,39 @@ fn completion_report(input: CompletionReportInput<'_>) -> CaptureCompletionRepor
             ..CaptureEventDelivery::default()
         },
     };
-    CaptureCompletionReport {
-        sources: CaptureSourcesReport {
-            process: source_report(
+    CaptureCompletionReport::new(
+        CaptureSourcesReport::new(
+            source_report(
                 pipeline_report,
                 crate::exec_events::EXEC_SOURCE,
                 CaptureEvidenceTrust::PlatformObserved,
                 true,
                 pipeline_failed,
             ),
-            stdio: source_report(
+            source_report(
                 pipeline_report,
                 "stdio",
                 CaptureEvidenceTrust::PlatformObserved,
                 true,
-                pipeline_failed,
+                pipeline_failed || stdio_failed,
             ),
-            network: source_report(
+            source_report(
                 pipeline_report,
                 "proxy",
                 CaptureEvidenceTrust::PlatformObserved,
                 options.network_capture.uses_proxy(),
                 pipeline_failed || proxy_failed,
             ),
-            otlp: source_report(
+            source_report(
                 pipeline_report,
                 "otlp",
                 CaptureEvidenceTrust::WorkloadReported,
                 options.otlp,
                 pipeline_failed || otlp_failed,
             ),
-        },
+        ),
         events,
-        blobs: blob_outcome.map(|outcome| CaptureBlobDelivery {
+        blob_outcome.map(|outcome| CaptureBlobDelivery {
             found: outcome.report.found as u64,
             landed: outcome.report.landed as u64,
             missing: outcome.report.missing as u64,
@@ -1515,7 +1511,8 @@ fn completion_report(input: CompletionReportInput<'_>) -> CaptureCompletionRepor
         }),
         auth_refreshes,
         error,
-    }
+    )
+    .expect("capture completion accounting is valid")
 }
 
 /// Render event-spool loss/backlog as the run's export warning, or `None` when the
@@ -1595,6 +1592,32 @@ pub(crate) async fn export_supervisor_record<E: Exporter>(
     {
         Ok(result) => result,
         Err(_elapsed) => bail!("{what} export timed out after {}s", deadline.as_secs()),
+    }
+}
+
+async fn export_completion_record<E: Exporter>(
+    exporter: &E,
+    event: Event,
+    report: &CaptureCompletionReport,
+    deadline: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(deadline, async {
+        exporter
+            .export_completion(&event, report)
+            .await
+            .context("failed to export the capture-health event")?;
+        exporter
+            .flush()
+            .await
+            .context("failed to flush the capture-health event")
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => bail!(
+            "capture-health export timed out after {}s",
+            deadline.as_secs()
+        ),
     }
 }
 
@@ -2926,6 +2949,7 @@ mod tests {
             options: &options,
             pipeline_report: None,
             pipeline_failed: false,
+            stdio_failed: false,
             otlp_failed: false,
             proxy_failed: false,
             blob_outcome: Some(&BlobDrainOutcome {
@@ -2980,6 +3004,7 @@ mod tests {
             options: &options,
             pipeline_report: None,
             pipeline_failed: false,
+            stdio_failed: false,
             otlp_failed: false,
             proxy_failed: false,
             blob_outcome: None,
@@ -3031,6 +3056,7 @@ mod tests {
             options: &options,
             pipeline_report: None,
             pipeline_failed: false,
+            stdio_failed: false,
             otlp_failed: false,
             proxy_failed: false,
             blob_outcome: Some(&clean_blobs),
@@ -3065,6 +3091,38 @@ mod tests {
             value["attributes"]["capture.complete"], false,
             "a dropped event makes the capture incomplete even when every blob landed"
         );
+    }
+
+    #[test]
+    fn stdio_pump_failure_marks_the_source_unavailable() {
+        let options = base_options(vec!["true".to_owned()]);
+        let report = completion_report(CompletionReportInput {
+            options: &options,
+            pipeline_report: None,
+            pipeline_failed: false,
+            stdio_failed: true,
+            otlp_failed: false,
+            proxy_failed: false,
+            blob_outcome: None,
+            spool_report: None,
+            auth_refreshes: None,
+            error: Some("stdout capture stopped".to_owned()),
+        });
+        let event = capture_drain_event(
+            &NormalizationContext::new(options.context.clone()),
+            Hlc {
+                wall_ns: 8,
+                logical: 0,
+            },
+            &report,
+        );
+        let value = serde_json::to_value(event).expect("completion json");
+
+        assert_eq!(
+            value["attributes"]["capture.source.stdio.state"],
+            "configured_unavailable"
+        );
+        assert_eq!(value["attributes"]["capture.complete"], false);
     }
 
     #[test]

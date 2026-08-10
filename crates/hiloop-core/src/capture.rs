@@ -65,7 +65,7 @@ macro_rules! string_enum {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
         pub enum $name {
             $($(#[$variant_meta])* $variant),+
         }
@@ -228,8 +228,9 @@ string_enum! {
 
 mod completion;
 pub use completion::{
-    CaptureBlobDelivery, CaptureCompletionReport, CaptureEventDelivery, CaptureEvidenceTrust,
-    CaptureSourceDegradation, CaptureSourceReport, CaptureSourceState, CaptureSourcesReport,
+    CaptureBlobDelivery, CaptureCompletionError, CaptureCompletionReport, CaptureEventDelivery,
+    CaptureEvidenceTrust, CaptureSourceDegradation, CaptureSourceReport, CaptureSourceState,
+    CaptureSourcesReport,
 };
 
 /// Original transport destination recovered before application classification.

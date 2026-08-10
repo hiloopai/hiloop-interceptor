@@ -683,7 +683,7 @@ async fn spawn_failure_is_captured_as_a_process_spawn_failed_event() {
         .iter()
         .find(|event| event["name"] == "capture.drain")
         .expect("capture completion event");
-    assert_eq!(drain["attributes"]["capture.complete"], false);
+    assert_eq!(drain["attributes"]["capture.complete"], true);
     assert_eq!(
         drain["attributes"]["capture.source.process.state"],
         "attached_full"

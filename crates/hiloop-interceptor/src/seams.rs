@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
 use hiloop_core::{
+    capture::CaptureCompletionReport,
     event::{AttributeKey, Attributes, Event, PayloadRef},
     identity::{Hlc, RunContext},
 };
@@ -692,6 +693,15 @@ pub trait Exporter: Send + Sync {
     /// no-ops.
     async fn export(&self, events: &[Event]) -> Result<(), ExportError>;
 
+    /// Export the typed terminal capture report and its canonical Event projection.
+    async fn export_completion(
+        &self,
+        event: &Event,
+        _report: &CaptureCompletionReport,
+    ) -> Result<(), ExportError> {
+        self.export(std::slice::from_ref(event)).await
+    }
+
     /// Flush buffered events before shutdown.
     async fn flush(&self) -> Result<(), ExportError> {
         Ok(())
@@ -708,6 +718,14 @@ impl<T: Exporter + ?Sized> Exporter for std::sync::Arc<T> {
 
     async fn flush(&self) -> Result<(), ExportError> {
         (**self).flush().await
+    }
+
+    async fn export_completion(
+        &self,
+        event: &Event,
+        report: &CaptureCompletionReport,
+    ) -> Result<(), ExportError> {
+        (**self).export_completion(event, report).await
     }
 }
 

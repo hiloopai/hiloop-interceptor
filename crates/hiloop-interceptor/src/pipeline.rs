@@ -135,8 +135,6 @@ pub enum PipelineOptionsError {
 /// Counts emitted by a completed pipeline.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineSourceReport {
-    /// Raw observations accepted from this source.
-    pub observations: usize,
     /// Normalized events with the source's full supported fidelity.
     pub full_events: usize,
     /// Normalized events explicitly marked as metadata-only.
@@ -151,7 +149,7 @@ pub struct PipelineReport {
     pub diagnostics: usize,
     pub raw_observations: usize,
     pub export_batches: usize,
-    /// Per-source observations and fidelity, keyed by the raw source name.
+    /// Per-source normalized event counts and fidelity, with unknown sources aggregated.
     pub sources: BTreeMap<String, PipelineSourceReport>,
 }
 
@@ -353,7 +351,13 @@ where
 
             let source = raw.source.clone();
             let kind = raw.kind.clone();
-            sources.entry(source.clone()).or_default().observations += 1;
+            let source_bucket = match source.as_str() {
+                "exec" => "exec",
+                "stdio" => "stdio",
+                "proxy" => "proxy",
+                "otlp" => "otlp",
+                _ => "other",
+            };
             let mut normalized = Vec::with_capacity(selections.len());
             let mut requested_retention = RawRetentionPolicy::DiscardAfterNormalize;
             let mut retention_requester = "pipeline";
@@ -401,9 +405,7 @@ where
                             raw_observation: raw_observation.as_ref(),
                         },
                     );
-                    let source_report = sources
-                        .get_mut(&source)
-                        .expect("current raw source was registered");
+                    let source_report = sources.entry(source_bucket.to_owned()).or_default();
                     if matches!(
                         event
                             .attributes
@@ -746,7 +748,6 @@ mod tests {
                 sources: BTreeMap::from([(
                     "stdio".to_owned(),
                     PipelineSourceReport {
-                        observations: 1,
                         full_events: 1,
                         metadata_only_events: 0,
                     },

@@ -283,9 +283,14 @@ async fn system_composer_records_the_capture_drain_health_event() {
         .find(|event| event["name"] == "capture.drain")
         .expect("the transparent lane records its capture-health event");
     assert_eq!(drain["attributes"]["capture.auth.refreshes"], 0);
-    // Spooled-but-undelivered (the unreachable gateway) is a backlog, never a loss.
+    // Spooled-but-undelivered is a backlog, but this structural fake never launches the captured
+    // workload helper and therefore cannot fabricate its typed terminal report.
     assert_eq!(drain["attributes"]["capture.events.rejected"], 0);
-    assert_eq!(drain["attributes"]["capture.complete"], true);
+    assert_eq!(drain["attributes"]["capture.complete"], false);
+    assert_eq!(
+        drain["attributes"]["capture.error"],
+        "captured workload produced no completion report"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -329,16 +334,27 @@ async fn system_composer_preserves_close_first_dataplane_failure_order() {
             FakeProvisionerCall::ReapHelpers,
         ]
     );
-    let last: serde_json::Value = serde_json::from_str(
-        std::fs::read_to_string(events)
-            .expect("events")
-            .lines()
-            .last()
-            .expect("fatal event"),
-    )
-    .expect("event JSON");
-    assert_eq!(last["name"], "capture.fatal");
-    assert_eq!(last["attributes"]["reason"], "dataplane_failed");
+    let recorded = std::fs::read_to_string(events).expect("events");
+    let recorded = recorded
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event JSON"))
+        .collect::<Vec<_>>();
+    let fatal = recorded
+        .iter()
+        .find(|event| event["name"] == "capture.fatal")
+        .expect("fatal event");
+    assert_eq!(fatal["attributes"]["reason"], "dataplane_failed");
+    let drain = recorded
+        .iter()
+        .find(|event| event["name"] == "capture.drain")
+        .expect("completion event");
+    assert_eq!(drain["attributes"]["capture.complete"], false);
+    assert!(
+        drain["attributes"]["capture.error"]
+            .as_str()
+            .expect("capture error")
+            .contains("dataplane_failed")
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -412,15 +428,33 @@ async fn real_system_composer_captures_cleartext_http_without_proxy_environment(
     assert_eq!(code, std::process::ExitCode::SUCCESS);
     fixture.await.expect("fixture task");
 
-    let event_names = std::fs::read_to_string(events)
+    let captured = std::fs::read_to_string(events)
         .expect("events")
         .lines()
-        .map(|line| {
-            serde_json::from_str::<serde_json::Value>(line).expect("event JSON")["name"].clone()
-        })
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event JSON"))
+        .collect::<Vec<_>>();
+    let event_names = captured
+        .iter()
+        .map(|event| event["name"].clone())
         .collect::<Vec<_>>();
     assert!(event_names.contains(&serde_json::Value::String("http.request".to_owned())));
     assert!(event_names.contains(&serde_json::Value::String("http.response".to_owned())));
+    let drains = captured
+        .iter()
+        .filter(|event| event["name"] == "capture.drain")
+        .collect::<Vec<_>>();
+    let [drain] = drains.as_slice() else {
+        panic!("expected exactly one capture.drain, got {drains:?}")
+    };
+    assert_eq!(drain["attributes"]["capture.complete"], true);
+    assert_eq!(
+        drain["attributes"]["capture.source.process.state"],
+        "attached_full"
+    );
+    assert_eq!(
+        drain["attributes"]["capture.source.network.state"],
+        "attached_full"
+    );
 }
 
 #[cfg(target_os = "linux")]

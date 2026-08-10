@@ -3,7 +3,10 @@
 use std::{io, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use hiloop_core::event::{AttributeKey, AttributeValue, Event};
+use hiloop_core::{
+    capture::CaptureCompletionReport,
+    event::{AttributeKey, AttributeValue, Event, SignalType},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
@@ -19,7 +22,14 @@ const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Debug, Serialize, Deserialize)]
 enum RelayRequest {
     Export(Vec<Event>),
+    Completion(Box<RelayCompletion>),
     Flush,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RelayCompletion {
+    report: CaptureCompletionReport,
+    event: Event,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +108,18 @@ impl Exporter for EventRelayExporter {
     async fn flush(&self) -> Result<(), ExportError> {
         self.request(&RelayRequest::Flush).await
     }
+
+    async fn export_completion(
+        &self,
+        event: &Event,
+        report: &CaptureCompletionReport,
+    ) -> Result<(), ExportError> {
+        self.request(&RelayRequest::Completion(Box::new(RelayCompletion {
+            report: report.clone(),
+            event: event.clone(),
+        })))
+        .await
+    }
 }
 
 /// Host-side relay listener that serializes namespace event delivery through one exporter.
@@ -113,14 +135,24 @@ pub(super) struct NetworkObservations {
     pub(super) metadata_only: u64,
 }
 
+#[derive(Debug, Default)]
+struct RelayCaptureState {
+    network: NetworkObservations,
+    completion: Option<(CaptureCompletionReport, Event)>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct RelayCaptureReport {
-    network: Arc<Mutex<NetworkObservations>>,
+    state: Arc<Mutex<RelayCaptureState>>,
 }
 
 impl RelayCaptureReport {
     pub(super) async fn network(&self) -> NetworkObservations {
-        *self.network.lock().await
+        self.state.lock().await.network
+    }
+
+    pub(super) async fn take_completion(&self) -> Option<(CaptureCompletionReport, Event)> {
+        self.state.lock().await.completion.take()
     }
 }
 
@@ -184,6 +216,19 @@ async fn serve_connection(
                 record_network_observations(&capture, &events).await;
                 exporter.export(&events).await
             }
+            RelayRequest::Completion(completion) => {
+                let RelayCompletion { report, event } = *completion;
+                let mut state = capture.state.lock().await;
+                if state.completion.is_some() {
+                    Err(ExportError::rejected(
+                        "netns-event-relay",
+                        "capture completion was already reported",
+                    ))
+                } else {
+                    state.completion = Some((report, event));
+                    Ok(())
+                }
+            }
             RelayRequest::Flush => exporter.flush().await,
         };
         let response = match result {
@@ -197,21 +242,22 @@ async fn serve_connection(
 async fn record_network_observations(capture: &RelayCaptureReport, events: &[Event]) {
     let raw_source = AttributeKey::from_static("raw.source");
     let l7_capture = AttributeKey::from_static("l7_capture");
-    let mut report = capture.network.lock().await;
+    let mut state = capture.state.lock().await;
     for event in events {
-        if !matches!(
+        let proxy_source = matches!(
             event.attributes.get(&raw_source),
             Some(AttributeValue::String(source)) if source == "proxy"
-        ) {
+        );
+        if !proxy_source && event.signal != SignalType::Net {
             continue;
         }
         if matches!(
             event.attributes.get(&l7_capture),
             Some(AttributeValue::Bool(false))
         ) {
-            report.metadata_only += 1;
+            state.network.metadata_only += 1;
         } else {
-            report.full += 1;
+            state.network.full += 1;
         }
     }
 }
@@ -258,6 +304,10 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use hiloop_core::{
+        capture::{
+            CaptureCompletionReport, CaptureEventDelivery, CaptureEvidenceTrust,
+            CaptureSourceReport, CaptureSourcesReport,
+        },
         event::{AttributeKey, EventName, SignalType},
         identity::{Hlc, RunContext},
     };
@@ -288,7 +338,6 @@ mod tests {
             SignalType::Net,
             EventName::from_static("fixture.event"),
         )
-        .with_attribute(AttributeKey::from_static("raw.source"), "proxy")
         .with_attribute(AttributeKey::from_static("l7_capture"), false);
 
         relay
@@ -296,6 +345,30 @@ mod tests {
             .await
             .expect("export");
         relay.flush().await.expect("flush");
+        let completion = CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            ),
+            CaptureEventDelivery::default(),
+            None,
+            None,
+            None,
+        )
+        .expect("valid completion");
+        let completion_event = completion.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+        relay
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("completion");
         let events = memory.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name.as_str(), event.name.as_str());
@@ -305,6 +378,13 @@ mod tests {
                 full: 0,
                 metadata_only: 1,
             }
+        );
+        let (relayed_completion, relayed_event) =
+            capture.take_completion().await.expect("typed completion");
+        assert_eq!(relayed_completion, completion);
+        assert_eq!(
+            serde_json::to_value(relayed_event).expect("relayed event json"),
+            serde_json::to_value(completion_event).expect("completion event json")
         );
 
         shutdown_tx.send(()).expect("send shutdown");

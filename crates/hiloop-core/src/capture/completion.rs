@@ -1,11 +1,13 @@
 //! Capture-process completion truth and its canonical Event-v1 projection.
 
-use std::fmt;
+use std::{fmt, num::NonZeroU64};
 
 use crate::{
     event::{AttributeKey, Event, EventName, SignalType},
     identity::{Hlc, RunContext},
 };
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 string_enum! {
     /// Authority class for one source's capture evidence.
@@ -30,7 +32,7 @@ string_enum! {
 }
 
 /// Final state of one configured capture source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CaptureSourceState {
     /// Capture was deliberately disabled by policy/configuration.
     OffByPolicy,
@@ -43,22 +45,22 @@ pub enum CaptureSourceState {
     AttachedNoData,
     /// Every observation carried the source's full supported fidelity.
     AttachedFull {
-        /// Observations accepted from the source.
-        observations: u64,
+        /// Normalized events accepted from the source.
+        events: NonZeroU64,
     },
     /// Every observation was limited to metadata.
     AttachedMetadataOnly {
-        /// Metadata-only observations accepted from the source.
-        observations: u64,
+        /// Metadata-only normalized events accepted from the source.
+        events: NonZeroU64,
         /// Typed reason payload/content capture was unavailable.
         reason: CaptureSourceDegradation,
     },
     /// The source observed both full-fidelity and metadata-only traffic.
     AttachedMixed {
-        /// Full-fidelity observations.
-        full_observations: u64,
-        /// Metadata-only observations.
-        metadata_only_observations: u64,
+        /// Full-fidelity normalized events.
+        full_events: NonZeroU64,
+        /// Metadata-only normalized events.
+        metadata_only_events: NonZeroU64,
         /// Typed reason some observations were metadata-only.
         reason: CaptureSourceDegradation,
     },
@@ -82,7 +84,7 @@ impl CaptureSourceState {
 }
 
 /// Trust and final fidelity for one source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureSourceReport {
     /// Authority class for this source's evidence.
     pub trust: CaptureEvidenceTrust,
@@ -119,60 +121,119 @@ impl CaptureSourceReport {
     }
 
     /// Report an attached source whose observations had full supported fidelity.
-    pub const fn attached_full(trust: CaptureEvidenceTrust, observations: u64) -> Self {
+    pub fn attached_full(trust: CaptureEvidenceTrust, events: u64) -> Self {
+        let Some(events) = NonZeroU64::new(events) else {
+            return Self::attached_no_data(trust);
+        };
         Self {
             trust,
-            state: CaptureSourceState::AttachedFull { observations },
+            state: CaptureSourceState::AttachedFull { events },
         }
     }
 
     /// Report an attached source whose observations were metadata-only.
-    pub const fn attached_metadata_only(
+    pub fn attached_metadata_only(
         trust: CaptureEvidenceTrust,
-        observations: u64,
+        events: u64,
         reason: CaptureSourceDegradation,
     ) -> Self {
+        let Some(events) = NonZeroU64::new(events) else {
+            return Self::attached_no_data(trust);
+        };
         Self {
             trust,
-            state: CaptureSourceState::AttachedMetadataOnly {
-                observations,
+            state: CaptureSourceState::AttachedMetadataOnly { events, reason },
+        }
+    }
+
+    /// Report an attached source with mixed full and metadata-only observations.
+    pub fn attached_mixed(
+        trust: CaptureEvidenceTrust,
+        full_events: u64,
+        metadata_only_events: u64,
+        reason: CaptureSourceDegradation,
+    ) -> Self {
+        let Some(full_events) = NonZeroU64::new(full_events) else {
+            return Self::attached_metadata_only(trust, metadata_only_events, reason);
+        };
+        let Some(metadata_only_events) = NonZeroU64::new(metadata_only_events) else {
+            return Self::attached_full(trust, full_events.get());
+        };
+        Self {
+            trust,
+            state: CaptureSourceState::AttachedMixed {
+                full_events,
+                metadata_only_events,
                 reason,
             },
         }
     }
 
-    /// Report an attached source with mixed full and metadata-only observations.
-    pub const fn attached_mixed(
+    /// Report source fidelity from normalized event counts.
+    pub fn from_event_counts(
         trust: CaptureEvidenceTrust,
-        full_observations: u64,
-        metadata_only_observations: u64,
-        reason: CaptureSourceDegradation,
+        full_events: u64,
+        metadata_only_events: u64,
+        degradation: CaptureSourceDegradation,
     ) -> Self {
-        Self {
-            trust,
-            state: CaptureSourceState::AttachedMixed {
-                full_observations,
-                metadata_only_observations,
-                reason,
-            },
+        match (full_events, metadata_only_events) {
+            (0, 0) => Self::attached_no_data(trust),
+            (full, 0) => Self::attached_full(trust, full),
+            (0, metadata_only) => Self::attached_metadata_only(trust, metadata_only, degradation),
+            (full, metadata_only) => Self::attached_mixed(trust, full, metadata_only, degradation),
         }
     }
 }
 
 /// Fixed source coverage for one capture process session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureSourcesReport {
     /// Process lifecycle source.
-    pub process: CaptureSourceReport,
+    process: CaptureSourceReport,
     /// Standard input/output source.
-    pub stdio: CaptureSourceReport,
+    stdio: CaptureSourceReport,
     /// Network source.
-    pub network: CaptureSourceReport,
+    network: CaptureSourceReport,
     /// Workload OTLP source.
-    pub otlp: CaptureSourceReport,
+    otlp: CaptureSourceReport,
 }
 
 impl CaptureSourcesReport {
+    /// Build the fixed four-source coverage report.
+    pub const fn new(
+        process: CaptureSourceReport,
+        stdio: CaptureSourceReport,
+        network: CaptureSourceReport,
+        otlp: CaptureSourceReport,
+    ) -> Self {
+        Self {
+            process,
+            stdio,
+            network,
+            otlp,
+        }
+    }
+
+    /// Process lifecycle source.
+    pub const fn process(&self) -> &CaptureSourceReport {
+        &self.process
+    }
+
+    /// Standard input/output source.
+    pub const fn stdio(&self) -> &CaptureSourceReport {
+        &self.stdio
+    }
+
+    /// Network source.
+    pub const fn network(&self) -> &CaptureSourceReport {
+        &self.network
+    }
+
+    /// Workload OTLP source.
+    pub const fn otlp(&self) -> &CaptureSourceReport {
+        &self.otlp
+    }
+
     fn has_unavailable_source(&self) -> bool {
         [&self.process, &self.stdio, &self.network, &self.otlp]
             .into_iter()
@@ -181,7 +242,7 @@ impl CaptureSourcesReport {
 }
 
 /// Event delivery accounting at completion-record mint time.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureEventDelivery {
     /// Events normalized by the capture pipeline.
     pub observed: u64,
@@ -198,7 +259,7 @@ pub struct CaptureEventDelivery {
 }
 
 /// Payload-blob delivery accounting at completion-record mint time.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureBlobDelivery {
     /// Finalized blobs found by the capture process.
     pub found: u64,
@@ -213,21 +274,125 @@ pub struct CaptureBlobDelivery {
 }
 
 /// Typed, unconditional completion report shared by local and managed capture.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CaptureCompletionReport {
     /// Final source coverage and fidelity.
-    pub sources: CaptureSourcesReport,
+    sources: CaptureSourcesReport,
     /// Event delivery outcome.
-    pub events: CaptureEventDelivery,
+    events: CaptureEventDelivery,
     /// Blob delivery outcome when capture used an out-of-row blob store.
-    pub blobs: Option<CaptureBlobDelivery>,
+    blobs: Option<CaptureBlobDelivery>,
     /// Mid-session gateway credential refreshes, when applicable.
-    pub auth_refreshes: Option<u64>,
+    auth_refreshes: Option<u64>,
     /// Terminal capture error, if any.
-    pub error: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CaptureCompletionReportWire {
+    sources: CaptureSourcesReport,
+    events: CaptureEventDelivery,
+    blobs: Option<CaptureBlobDelivery>,
+    auth_refreshes: Option<u64>,
+    error: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for CaptureCompletionReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = CaptureCompletionReportWire::deserialize(deserializer)?;
+        Self::new(
+            wire.sources,
+            wire.events,
+            wire.blobs,
+            wire.auth_refreshes,
+            wire.error,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Invalid completion accounting rejected before it can become capture authority.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CaptureCompletionError {
+    /// Event terminal buckets do not account for every observed event.
+    #[error("capture event accounting is inconsistent")]
+    EventAccounting,
+    /// More events entered the spool than were observed.
+    #[error("capture spool accounting is inconsistent")]
+    SpoolAccounting,
+    /// Blob terminal buckets do not account for every found blob.
+    #[error("capture blob accounting is inconsistent")]
+    BlobAccounting,
 }
 
 impl CaptureCompletionReport {
+    /// Build a validated capture completion report.
+    pub fn new(
+        sources: CaptureSourcesReport,
+        events: CaptureEventDelivery,
+        blobs: Option<CaptureBlobDelivery>,
+        auth_refreshes: Option<u64>,
+        error: Option<String>,
+    ) -> Result<Self, CaptureCompletionError> {
+        let accounted_events = events
+            .landed
+            .checked_add(events.dropped)
+            .and_then(|value| value.checked_add(events.rejected))
+            .and_then(|value| value.checked_add(events.pending))
+            .ok_or(CaptureCompletionError::EventAccounting)?;
+        if accounted_events != events.observed {
+            return Err(CaptureCompletionError::EventAccounting);
+        }
+        if events.spooled > events.observed {
+            return Err(CaptureCompletionError::SpoolAccounting);
+        }
+        if let Some(blobs) = blobs {
+            let accounted_blobs = blobs
+                .landed
+                .checked_add(blobs.missing)
+                .and_then(|value| value.checked_add(blobs.oversize))
+                .ok_or(CaptureCompletionError::BlobAccounting)?;
+            if accounted_blobs != blobs.found {
+                return Err(CaptureCompletionError::BlobAccounting);
+            }
+        }
+        Ok(Self {
+            sources,
+            events,
+            blobs,
+            auth_refreshes,
+            error,
+        })
+    }
+
+    /// Final source coverage.
+    pub const fn sources(&self) -> &CaptureSourcesReport {
+        &self.sources
+    }
+
+    /// Event delivery outcome.
+    pub const fn events(&self) -> CaptureEventDelivery {
+        self.events
+    }
+
+    /// Payload delivery outcome.
+    pub const fn blobs(&self) -> Option<CaptureBlobDelivery> {
+        self.blobs
+    }
+
+    /// Mid-session credential refresh count.
+    pub const fn auth_refreshes(&self) -> Option<u64> {
+        self.auth_refreshes
+    }
+
+    /// Terminal capture error.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// True only when every configured source stayed available and no event/blob was lost.
     ///
     /// Pending events do not count as loss for the local ordered-spool projection: this record
@@ -242,6 +407,12 @@ impl CaptureCompletionReport {
             && self
                 .blobs
                 .is_none_or(|blobs| blobs.missing == 0 && blobs.oversize == 0)
+    }
+
+    /// True only when completion is lossless and no event remains pending.
+    #[must_use]
+    pub fn is_settled_complete(&self) -> bool {
+        self.events.pending == 0 && self.is_complete()
     }
 
     /// Build the canonical Event-v1 projection of this report.
@@ -344,31 +515,24 @@ fn with_source_report(
         CaptureSourceState::ConfiguredUnavailable { reason } => {
             event.with_attribute(source_key(source, "degradation"), reason.to_string())
         }
-        CaptureSourceState::AttachedFull { observations } => event.with_attribute(
-            source_key(source, "observations"),
-            event_count(observations),
-        ),
-        CaptureSourceState::AttachedMetadataOnly {
-            observations,
-            reason,
-        } => event
-            .with_attribute(
-                source_key(source, "observations"),
-                event_count(observations),
-            )
+        CaptureSourceState::AttachedFull { events } => {
+            event.with_attribute(source_key(source, "events"), event_count(events.get()))
+        }
+        CaptureSourceState::AttachedMetadataOnly { events, reason } => event
+            .with_attribute(source_key(source, "events"), event_count(events.get()))
             .with_attribute(source_key(source, "degradation"), reason.to_string()),
         CaptureSourceState::AttachedMixed {
-            full_observations,
-            metadata_only_observations,
+            full_events,
+            metadata_only_events,
             reason,
         } => event
             .with_attribute(
-                source_key(source, "full_observations"),
-                event_count(full_observations),
+                source_key(source, "full_events"),
+                event_count(full_events.get()),
             )
             .with_attribute(
-                source_key(source, "metadata_only_observations"),
-                event_count(metadata_only_observations),
+                source_key(source, "metadata_only_events"),
+                event_count(metadata_only_events.get()),
             )
             .with_attribute(source_key(source, "degradation"), reason.to_string()),
     }
@@ -535,5 +699,71 @@ mod tests {
             attr(&event, "capture.auth.refreshes"),
             &AttributeValue::I64(2)
         );
+    }
+
+    #[test]
+    fn completion_validation_rejects_impossible_accounting() {
+        let sources = CaptureSourcesReport::new(
+            CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+            CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+            CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+            CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+        );
+        assert_eq!(
+            CaptureCompletionReport::new(
+                sources.clone(),
+                CaptureEventDelivery {
+                    observed: 1,
+                    landed: 2,
+                    ..CaptureEventDelivery::default()
+                },
+                None,
+                None,
+                None,
+            ),
+            Err(CaptureCompletionError::EventAccounting)
+        );
+        assert_eq!(
+            CaptureCompletionReport::new(
+                sources,
+                CaptureEventDelivery::default(),
+                Some(CaptureBlobDelivery {
+                    found: 1,
+                    landed: 1,
+                    missing: 1,
+                    ..CaptureBlobDelivery::default()
+                }),
+                None,
+                None,
+            ),
+            Err(CaptureCompletionError::BlobAccounting)
+        );
+    }
+
+    #[test]
+    fn managed_completion_requires_a_settled_event_delivery() {
+        let report = CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            ),
+            CaptureEventDelivery {
+                observed: 1,
+                pending: 1,
+                ..CaptureEventDelivery::default()
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("valid ordered local completion");
+
+        assert!(report.is_complete());
+        assert!(!report.is_settled_complete());
+        let mut value = serde_json::to_value(&report).expect("completion json");
+        value["events"]["landed"] = 2.into();
+        assert!(serde_json::from_value::<CaptureCompletionReport>(value).is_err());
     }
 }

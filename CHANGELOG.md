@@ -24,9 +24,11 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
-- A shared typed capture-completion report now produces the sole `capture.drain` Event-v1 shape
-  for local and embedded runtimes. Normal shutdown emits it unconditionally, including zero-event
-  runs and spawn failures; hard process loss remains distinguishable by absence. Fixed process,
+- A shared, validated capture-completion report now produces the sole `capture.drain` Event-v1
+  shape for local and embedded runtimes. Every controlled terminal path attempts it, including
+  zero-event runs and spawn failures; durable presence certifies completion, while absence means no
+  durable producer receipt. Transparent capture relays the workload report as typed state and
+  merges it once with network and gateway delivery truth instead of emitting competing records. Fixed process,
   stdio, network, and OTLP source fields report platform-observed versus workload-reported trust,
   off-by-policy / unavailable / available-no-data / full / metadata-only / mixed fidelity, and
   typed degradation. Event and blob delivery now include observed, spooled, landed, pending,
