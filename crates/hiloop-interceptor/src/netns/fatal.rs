@@ -116,6 +116,17 @@ impl FatalRunError {
         matches!(self.persistence, FatalPersistence::Persisted)
     }
 
+    /// True when direct export accepted the fatal event, before or after the final flush.
+    pub(crate) fn event_exported(&self) -> bool {
+        !matches!(
+            &self.persistence,
+            FatalPersistence::Failed(FatalPersistenceFailure {
+                export: Some(_),
+                ..
+            })
+        )
+    }
+
     /// Underlying worker failure or ordered-cleanup failure, when present.
     pub fn substrate_error(&self) -> Option<&ProvisionError> {
         self.substrate_error.as_ref()
@@ -151,6 +162,13 @@ pub enum SupervisedRunError {
 }
 
 impl SupervisedRunError {
+    pub(crate) fn fatal_event_exported(&self) -> bool {
+        match self {
+            Self::Fatal(error) => error.event_exported(),
+            Self::Provision(_) => false,
+        }
+    }
+
     /// Consume the wrapper error when it represents a typed fatal transition.
     pub fn into_fatal(self) -> Option<FatalRunError> {
         match self {

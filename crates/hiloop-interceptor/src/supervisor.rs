@@ -1209,25 +1209,24 @@ where
     let proxy_failed = proxy_result.is_err();
     let stdio_failed = stdin_result.is_err() || stdout_result.is_err() || stderr_result.is_err();
     let mut terminal_errors = Vec::<String>::new();
-    if let Err(error) = &pipeline_result {
-        terminal_errors.push(error.to_string());
-    }
     if let Err(error) = &otlp_result {
-        terminal_errors.push(error.to_string());
+        terminal_errors.push(format!("{error:#}"));
     }
     if let Err(error) = &proxy_result {
-        terminal_errors.push(error.to_string());
+        terminal_errors.push(format!("{error:#}"));
     }
     for result in [&stdin_result, &stdout_result, &stderr_result] {
         if let Err(error) = result {
-            terminal_errors.push(error.to_string());
+            terminal_errors.push(format!("{error:#}"));
         }
     }
-    let pipeline_warning = pipeline_result
-        .as_ref()
-        .err()
-        .map(|error| anyhow::anyhow!(error.to_string()).context("stdio event pipeline failed"));
-    let pipeline_report = pipeline_result.ok();
+    let (pipeline_report, pipeline_warning) = match pipeline_result {
+        Ok(report) => (Some(report), None),
+        Err(error) => {
+            terminal_errors.push(format!("{error:#}"));
+            (None, Some(error))
+        }
+    };
     let mut drain_warnings: Vec<anyhow::Error> = [
         otlp_result.context("OTLP capture source failed"),
         proxy_result.context("network capture source failed"),
@@ -1285,7 +1284,7 @@ where
         .as_ref()
         .and_then(|outcome| outcome.error.as_ref())
     {
-        terminal_errors.push(error.to_string());
+        terminal_errors.push(format!("{error:#}"));
     }
     let report = completion_report(CompletionReportInput {
         options,
@@ -1481,21 +1480,21 @@ fn completion_report(input: CompletionReportInput<'_>) -> CaptureCompletionRepor
             ),
             source_report(
                 pipeline_report,
-                "stdio",
+                crate::stdio::STDIO_SOURCE,
                 CaptureEvidenceTrust::PlatformObserved,
                 true,
                 pipeline_failed || stdio_failed,
             ),
             source_report(
                 pipeline_report,
-                "proxy",
+                crate::proxy::PROXY_SOURCE,
                 CaptureEvidenceTrust::PlatformObserved,
                 options.network_capture.uses_proxy(),
                 pipeline_failed || proxy_failed,
             ),
             source_report(
                 pipeline_report,
-                "otlp",
+                crate::otlp::OTLP_SOURCE,
                 CaptureEvidenceTrust::WorkloadReported,
                 options.otlp,
                 pipeline_failed || otlp_failed,
@@ -1539,6 +1538,12 @@ fn spool_problem(report: &SpoolReport, last_failure: Option<String>) -> Option<a
             "{} event(s) were dropped after the gateway permanently rejected their batch",
             report.rejected_events
         ));
+    }
+    if report.completion_pending {
+        parts.push("the capture completion record is still pending".to_owned());
+    }
+    if report.completion_rejected {
+        parts.push("the gateway permanently rejected the capture completion record".to_owned());
     }
     let message = parts.join("; ");
     Some(match last_failure {
@@ -3009,6 +3014,7 @@ mod tests {
             proxy_failed: false,
             blob_outcome: None,
             spool_report: Some(SpoolReport {
+                spooled_events: 5,
                 pending_events: 3,
                 pending_bytes: 512,
                 dropped_events: 2,
@@ -3061,6 +3067,7 @@ mod tests {
             proxy_failed: false,
             blob_outcome: Some(&clean_blobs),
             spool_report: Some(SpoolReport {
+                spooled_events: 1,
                 pending_events: 0,
                 pending_bytes: 0,
                 dropped_events: 1,

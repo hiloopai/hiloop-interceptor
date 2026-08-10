@@ -33,7 +33,11 @@ use crate::blob_drain::DrainRetryPolicy;
 use crate::pipeline::DEFAULT_EXPORT_BATCH_SIZE;
 use crate::seams::{ExportError, Exporter};
 use async_trait::async_trait;
-use hiloop_core::event::Event;
+use hiloop_core::{
+    capture::{CaptureCompletionReport, CaptureEventDelivery},
+    event::Event,
+    identity::RunContext,
+};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -91,13 +95,21 @@ pub struct SpoolReport {
     pub dropped_events: u64,
     /// Events dropped because the sink permanently rejected their batch.
     pub rejected_events: u64,
+    /// The terminal completion record still awaits delivery.
+    pub completion_pending: bool,
+    /// The terminal completion record was permanently rejected.
+    pub completion_rejected: bool,
 }
 
 impl SpoolReport {
     /// True when nothing was lost and nothing is still waiting.
     #[must_use]
     pub const fn is_clean(&self) -> bool {
-        self.pending_events == 0 && self.dropped_events == 0 && self.rejected_events == 0
+        self.pending_events == 0
+            && self.dropped_events == 0
+            && self.rejected_events == 0
+            && !self.completion_pending
+            && !self.completion_rejected
     }
 
     /// True when no event was dropped (pending events may still await redelivery).
@@ -140,9 +152,17 @@ struct SpooledEvent {
     bytes: u64,
 }
 
+struct TerminalEvent {
+    event: Event,
+    report: CaptureCompletionReport,
+}
+
 #[derive(Default)]
 struct SpoolState {
     queue: VecDeque<SpooledEvent>,
+    terminal: Option<TerminalEvent>,
+    terminal_seen: bool,
+    terminal_rejected: bool,
     queued_bytes: u64,
     dropped_events: u64,
     rejected_events: u64,
@@ -171,6 +191,8 @@ impl SpoolState {
             pending_bytes: self.queued_bytes,
             dropped_events: self.dropped_events,
             rejected_events: self.rejected_events,
+            completion_pending: self.terminal.is_some(),
+            completion_rejected: self.terminal_rejected,
         }
     }
 
@@ -232,7 +254,7 @@ impl<E: Exporter> SpoolingExporter<E> {
                 backoff = backoff.saturating_mul(2);
             }
             let mut state = self.state.lock().await;
-            if state.queue.is_empty() || self.deliver_queue(&mut state).await.is_ok() {
+            if self.deliver_all(&mut state).await.is_ok() {
                 break;
             }
         }
@@ -257,6 +279,75 @@ impl<E: Exporter> SpoolingExporter<E> {
         match self.attempt(events).await {
             Err(AttemptFailure::Ambiguous(_)) => self.attempt(events).await,
             outcome => outcome,
+        }
+    }
+
+    async fn attempt_completion(&self, terminal: &TerminalEvent) -> Result<(), AttemptFailure> {
+        match tokio::time::timeout(
+            self.policy.attempt_timeout,
+            self.inner
+                .export_completion(&terminal.event, &terminal.report),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(classify(&error)),
+            Err(_elapsed) => Err(AttemptFailure::Transient(format!(
+                "completion export attempt timed out after {:?}",
+                self.policy.attempt_timeout
+            ))),
+        }
+    }
+
+    async fn deliver_terminal(&self, state: &mut SpoolState) -> Result<(), ()> {
+        let Some(mut terminal) = state.terminal.take() else {
+            return Ok(());
+        };
+        let events = CaptureEventDelivery {
+            observed: state
+                .delivered_events
+                .saturating_add(state.dropped_events)
+                .saturating_add(state.rejected_events)
+                .saturating_add(state.queue.len() as u64),
+            spooled: state.spooled_events,
+            landed: state.delivered_events,
+            dropped: state.dropped_events,
+            rejected: state.rejected_events,
+            pending: state.queue.len() as u64,
+        };
+        terminal.report = terminal
+            .report
+            .with_event_delivery(events)
+            .expect("event spool accounting is internally consistent");
+        let context = RunContext::new(terminal.event.run_id, terminal.event.lineage_path.clone())
+            .expect("completion event carries a valid run lineage");
+        let projection = terminal.report.to_event(&context, terminal.event.ts);
+        terminal
+            .event
+            .attributes
+            .retain(|key, _| !key.as_str().starts_with("capture."));
+        terminal.event.attributes.extend(projection.attributes);
+        let outcome = match self.attempt_completion(&terminal).await {
+            Err(AttemptFailure::Ambiguous(_)) => self.attempt_completion(&terminal).await,
+            outcome => outcome,
+        };
+        match outcome {
+            Ok(()) => {
+                state.on_success();
+                Ok(())
+            }
+            Err(AttemptFailure::Permanent(message)) => {
+                state.terminal_rejected = true;
+                eprintln!(
+                    "hiloop-interceptor: warning: the export sink permanently rejected the capture completion record: {message}"
+                );
+                Ok(())
+            }
+            Err(failure) => {
+                state.on_failure(&self.policy, failure.message().to_owned());
+                state.terminal = Some(terminal);
+                Err(())
+            }
         }
     }
 
@@ -290,6 +381,11 @@ impl<E: Exporter> SpoolingExporter<E> {
             }
         }
         Ok(())
+    }
+
+    async fn deliver_all(&self, state: &mut SpoolState) -> Result<(), ()> {
+        self.deliver_queue(state).await?;
+        self.deliver_terminal(state).await
     }
 
     fn pop_front(state: &mut SpoolState, count: usize) {
@@ -364,13 +460,36 @@ impl<E: Exporter> Exporter for SpoolingExporter<E> {
         Ok(())
     }
 
+    async fn export_completion(
+        &self,
+        event: &Event,
+        report: &CaptureCompletionReport,
+    ) -> Result<(), ExportError> {
+        let mut state = self.state.lock().await;
+        if state.terminal_seen {
+            return Err(ExportError::rejected(
+                "event-spool",
+                "capture completion was already queued",
+            ));
+        }
+        state.terminal = Some(TerminalEvent {
+            event: event.clone(),
+            report: report.clone(),
+        });
+        state.terminal_seen = true;
+        if !state.in_backoff() {
+            let _ = self.deliver_all(&mut state).await;
+        }
+        Ok(())
+    }
+
     /// Best-effort: redeliver the backlog when the backoff allows, then flush the
     /// inner exporter. Events still spooled after an outage-time flush stay parked
     /// for the run-end [`drain`](SpoolingExporter::drain).
     async fn flush(&self) -> Result<(), ExportError> {
         let mut state = self.state.lock().await;
-        if !state.queue.is_empty() && !state.in_backoff() {
-            let _ = self.deliver_queue(&mut state).await;
+        if (!state.queue.is_empty() || state.terminal.is_some()) && !state.in_backoff() {
+            let _ = self.deliver_all(&mut state).await;
         }
         drop(state);
         self.inner.flush().await
@@ -392,8 +511,13 @@ fn warn_rejected(count: usize, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hiloop_core::event::{AttributeKey, EventName, SignalType};
     use hiloop_core::identity::{Hlc, RunContext};
+    use hiloop_core::{
+        capture::{
+            CaptureEventDelivery, CaptureEvidenceTrust, CaptureSourceReport, CaptureSourcesReport,
+        },
+        event::{AttributeKey, EventName, SignalType},
+    };
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -507,6 +631,27 @@ mod tests {
             attempts,
             initial_backoff: Duration::from_millis(1),
         }
+    }
+
+    fn completion_for_pending_event() -> CaptureCompletionReport {
+        CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::attached_full(CaptureEvidenceTrust::PlatformObserved, 1),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            ),
+            CaptureEventDelivery {
+                observed: 1,
+                spooled: 1,
+                pending: 1,
+                ..CaptureEventDelivery::default()
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("valid completion")
     }
 
     #[tokio::test]
@@ -632,6 +777,78 @@ mod tests {
         );
         assert_eq!(report.pending_events, 0);
         assert_eq!(report.dropped_events, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_spool_reserves_completion_without_evicting_data() {
+        let sink = FakeSink::scripted([Respond::Unavailable]);
+        let policy = SpoolPolicy {
+            max_events: 1,
+            ..fast_policy()
+        };
+        let spool = SpoolingExporter::new(sink, policy);
+        let data = event("one");
+        spool
+            .export(std::slice::from_ref(&data))
+            .await
+            .expect("spool data");
+        let completion = completion_for_pending_event();
+        let completion_event = completion.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+
+        spool
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("reserve completion");
+        let before = spool.report().await;
+        assert_eq!(before.pending_events, 1);
+        assert_eq!(before.dropped_events, 0);
+
+        let after = spool.drain(&fast_drain(1)).await;
+        assert!(after.is_clean());
+        assert_eq!(
+            spool
+                .inner
+                .delivered_flat()
+                .iter()
+                .map(|event| event.name.as_str())
+                .collect::<Vec<_>>(),
+            ["process.stdout", "capture.drain"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_refreshes_after_a_queued_event_is_rejected() {
+        let sink = FakeSink::scripted([Respond::Unavailable, Respond::Rejected, Respond::Deliver]);
+        let spool = SpoolingExporter::new(sink, fast_policy());
+        spool.export(&[event("one")]).await.expect("spool data");
+        let completion = completion_for_pending_event();
+        let completion_event = completion.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+        spool
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("reserve completion");
+
+        let report = spool.drain(&fast_drain(1)).await;
+        assert_eq!(report.rejected_events, 1);
+        assert!(!report.completion_pending);
+        let delivered = spool.inner.delivered_flat();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].name.as_str(), "capture.drain");
+        let value = serde_json::to_value(&delivered[0]).expect("completion json");
+        assert_eq!(value["attributes"]["capture.events.rejected"], 1);
+        assert_eq!(value["attributes"]["capture.complete"], false);
     }
 
     #[tokio::test(start_paused = true)]

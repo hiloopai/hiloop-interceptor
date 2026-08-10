@@ -73,11 +73,12 @@ const GATEWAY_CONFIG_ENV: &str = "HILOOP_NETNS_GATEWAY_CONFIG";
 const WORKLOAD_CONFIG_ENV: &str = "HILOOP_NETNS_WORKLOAD_CONFIG";
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct GatewayConfig {
     context: RunContext,
     attributes: Attributes,
     event_socket: PathBuf,
+    event_token: String,
     ca_bundle: PathBuf,
     blob_dir: PathBuf,
     max_capture_bytes: Option<u64>,
@@ -86,11 +87,12 @@ pub(super) struct GatewayConfig {
     anomaly: AnomalyConfigWire,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct WorkloadConfig {
     context: RunContext,
     attributes: Attributes,
     event_socket: PathBuf,
+    event_token: String,
     ca_bundle: PathBuf,
     execution_id: Option<String>,
     otlp: bool,
@@ -123,11 +125,13 @@ impl GatewayConfig {
         event_socket: PathBuf,
         ca_bundle: PathBuf,
         blob_dir: PathBuf,
+        event_token: String,
     ) -> Self {
         Self {
             context: options.context().clone(),
             attributes: options.attributes().clone(),
             event_socket,
+            event_token,
             ca_bundle,
             blob_dir,
             max_capture_bytes: options.max_capture_bytes(),
@@ -149,11 +153,13 @@ impl WorkloadConfig {
         options: &RunOptions,
         event_socket: PathBuf,
         ca_bundle: PathBuf,
+        event_token: String,
     ) -> Self {
         Self {
             context: options.context().clone(),
             attributes: options.attributes().clone(),
             event_socket,
+            event_token,
             ca_bundle,
             execution_id: options.execution_id().map(str::to_owned),
             otlp: options.otlp_enabled(),
@@ -258,7 +264,9 @@ pub(super) fn captured_workload_entrypoint() -> io::Result<ExitCode> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let exporter = EventRelayExporter::connect(&config.event_socket).await?;
+        let exporter =
+            EventRelayExporter::connect_for_workload(&config.event_socket, config.event_token)
+                .await?;
         let mut options = RunOptions::new(
             config.context,
             command,
@@ -303,7 +311,9 @@ fn take_workload_config() -> io::Result<WorkloadConfig> {
 
 async fn run_gateway(config: GatewayConfig) -> io::Result<ExitCode> {
     let bootstrap = GatewayWorkerBootstrap::from_inherited_fds()?;
-    let exporter = Arc::new(EventRelayExporter::connect(&config.event_socket).await?);
+    let exporter = Arc::new(
+        EventRelayExporter::connect_gateway(&config.event_socket, config.event_token).await?,
+    );
     let clock = Arc::new(HlcClock::new());
     let ca = Arc::new(ProxyCa::generate().map_err(io::Error::other)?);
     write_ca_bundle(&config.ca_bundle, ca.cert_pem())?;

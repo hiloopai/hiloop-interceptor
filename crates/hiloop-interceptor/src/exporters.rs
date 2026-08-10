@@ -3,7 +3,7 @@
 use crate::jsonl::JsonlWriter;
 use crate::seams::{ExportError, Exporter};
 use async_trait::async_trait;
-use hiloop_core::event::Event;
+use hiloop_core::{capture::CaptureCompletionReport, event::Event};
 use std::{io, path::Path};
 
 /// Writes normalized events as newline-delimited JSON.
@@ -77,6 +77,17 @@ impl Exporter for FanOutExporter {
     async fn flush(&self) -> Result<(), ExportError> {
         for exporter in &self.exporters {
             exporter.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn export_completion(
+        &self,
+        event: &Event,
+        report: &CaptureCompletionReport,
+    ) -> Result<(), ExportError> {
+        for exporter in &self.exporters {
+            exporter.export_completion(event, report).await?;
         }
         Ok(())
     }

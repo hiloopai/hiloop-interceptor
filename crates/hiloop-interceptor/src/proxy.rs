@@ -89,7 +89,7 @@ pub const DEFAULT_MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
 /// while customer traffic continues unchanged.
 pub const DEFAULT_CAPTURE_BUFFER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
-const PROXY_SOURCE: &str = "proxy";
+pub(crate) const PROXY_SOURCE: &str = "proxy";
 const REQUEST_KIND: &str = "http.request";
 const RESPONSE_KIND: &str = "http.response";
 const EGRESS_DENIED_KIND: &str = "egress.denied";

@@ -287,6 +287,8 @@ async fn system_composer_records_the_capture_drain_health_event() {
     // workload helper and therefore cannot fabricate its typed terminal report.
     assert_eq!(drain["attributes"]["capture.events.rejected"], 0);
     assert_eq!(drain["attributes"]["capture.complete"], false);
+    assert_eq!(drain["attributes"]["capture.events.observed"], 1);
+    assert_eq!(drain["attributes"]["capture.events.landed"], 0);
     assert_eq!(
         drain["attributes"]["capture.error"],
         "captured workload produced no completion report"
@@ -349,6 +351,8 @@ async fn system_composer_preserves_close_first_dataplane_failure_order() {
         .find(|event| event["name"] == "capture.drain")
         .expect("completion event");
     assert_eq!(drain["attributes"]["capture.complete"], false);
+    assert_eq!(drain["attributes"]["capture.events.observed"], 2);
+    assert_eq!(drain["attributes"]["capture.events.landed"], 2);
     assert!(
         drain["attributes"]["capture.error"]
             .as_str()

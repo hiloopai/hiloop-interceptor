@@ -1,12 +1,22 @@
 //! Tokio pipeline for source, normalization, and export stages.
 
-use crate::seams::{
-    ExportError, Exporter, NormalizationContext, NormalizeError, Normalizer, NormalizerDescriptor,
-    NormalizerRouter, RawObservationRef, RawRetentionPolicy, RawSignal, RawSignalSink, RawStore,
-    RawStoreError, ShutdownSignal, Source, SourceError, provenance_keys,
+use crate::{
+    exec_events::EXEC_SOURCE,
+    otlp::OTLP_SOURCE,
+    proxy::PROXY_SOURCE,
+    seams::{
+        ExportError, Exporter, NormalizationContext, NormalizeError, Normalizer,
+        NormalizerDescriptor, NormalizerRouter, RawObservationRef, RawRetentionPolicy, RawSignal,
+        RawSignalSink, RawStore, RawStoreError, ShutdownSignal, Source, SourceError,
+        provenance_keys,
+    },
+    stdio::STDIO_SOURCE,
 };
 use futures_util::{FutureExt, StreamExt};
-use hiloop_core::event::{AttributeKey, Event};
+use hiloop_core::{
+    capture::L7_CAPTURE,
+    event::{AttributeKey, Event},
+};
 use std::{collections::BTreeMap, time::Duration};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -351,13 +361,7 @@ where
 
             let source = raw.source.clone();
             let kind = raw.kind.clone();
-            let source_bucket = match source.as_str() {
-                "exec" => "exec",
-                "stdio" => "stdio",
-                "proxy" => "proxy",
-                "otlp" => "otlp",
-                _ => "other",
-            };
+            let source_bucket = source_bucket(&source);
             let mut normalized = Vec::with_capacity(selections.len());
             let mut requested_retention = RawRetentionPolicy::DiscardAfterNormalize;
             let mut retention_requester = "pipeline";
@@ -407,9 +411,7 @@ where
                     );
                     let source_report = sources.entry(source_bucket.to_owned()).or_default();
                     if matches!(
-                        event
-                            .attributes
-                            .get(&AttributeKey::from_static("l7_capture")),
+                        event.attributes.get(&AttributeKey::from_static(L7_CAPTURE)),
                         Some(hiloop_core::event::AttributeValue::Bool(false))
                     ) {
                         source_report.metadata_only_events += 1;
@@ -530,6 +532,16 @@ where
     })
 }
 
+fn source_bucket(source: &str) -> &'static str {
+    match source {
+        EXEC_SOURCE => EXEC_SOURCE,
+        STDIO_SOURCE => STDIO_SOURCE,
+        PROXY_SOURCE => PROXY_SOURCE,
+        OTLP_SOURCE => OTLP_SOURCE,
+        _ => "other",
+    }
+}
+
 struct NormalizationStamp<'a> {
     observation: Option<&'a crate::seams::ObservationContext>,
     descriptor: NormalizerDescriptor,
@@ -580,6 +592,15 @@ fn stamp_normalization_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_source_buckets_match_the_real_producer_names() {
+        assert_eq!(source_bucket(EXEC_SOURCE), EXEC_SOURCE);
+        assert_eq!(source_bucket(STDIO_SOURCE), STDIO_SOURCE);
+        assert_eq!(source_bucket(PROXY_SOURCE), PROXY_SOURCE);
+        assert_eq!(source_bucket(OTLP_SOURCE), OTLP_SOURCE);
+        assert_eq!(source_bucket("customer-defined"), "other");
+    }
     use crate::{
         exporters::testing::sample_log_event,
         seams::{

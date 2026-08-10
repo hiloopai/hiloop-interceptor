@@ -644,7 +644,7 @@ async fn spawn_failure_is_captured_as_a_process_spawn_failed_event() {
         "stderr: {stderr}"
     );
 
-    // Full capture includes the failed attempt plus an explicit incomplete completion receipt.
+    // Full capture includes the failed attempt plus an explicit completion receipt.
     let events = read_jsonl(&events_path);
     assert_eq!(events.len(), 2, "events: {events:?}");
     let event = events

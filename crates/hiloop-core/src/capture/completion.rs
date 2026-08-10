@@ -11,6 +11,8 @@ use thiserror::Error;
 
 string_enum! {
     /// Authority class for one source's capture evidence.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
     pub enum CaptureEvidenceTrust {
         /// The capture runtime observed the source independently of workload instrumentation.
         PlatformObserved => "platform_observed",
@@ -21,6 +23,8 @@ string_enum! {
 
 string_enum! {
     /// Closed degradation reasons carried by the capture-completion summary.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
     pub enum CaptureSourceDegradation {
         /// The source failed while it was being attached.
         StartupFailed => "startup_failed",
@@ -33,6 +37,7 @@ string_enum! {
 
 /// Final state of one configured capture source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CaptureSourceState {
     /// Capture was deliberately disabled by policy/configuration.
     OffByPolicy,
@@ -349,6 +354,13 @@ impl CaptureCompletionReport {
         if events.spooled > events.observed {
             return Err(CaptureCompletionError::SpoolAccounting);
         }
+        let accounted_spooled = events
+            .pending
+            .checked_add(events.dropped)
+            .ok_or(CaptureCompletionError::SpoolAccounting)?;
+        if accounted_spooled > events.spooled {
+            return Err(CaptureCompletionError::SpoolAccounting);
+        }
         if let Some(blobs) = blobs {
             let accounted_blobs = blobs
                 .landed
@@ -356,6 +368,9 @@ impl CaptureCompletionReport {
                 .and_then(|value| value.checked_add(blobs.oversize))
                 .ok_or(CaptureCompletionError::BlobAccounting)?;
             if accounted_blobs != blobs.found {
+                return Err(CaptureCompletionError::BlobAccounting);
+            }
+            if blobs.missing == 0 && blobs.missing_bytes != 0 {
                 return Err(CaptureCompletionError::BlobAccounting);
             }
         }
@@ -391,6 +406,20 @@ impl CaptureCompletionReport {
     /// Terminal capture error.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// Replace event-delivery accounting while retaining source and blob truth.
+    pub fn with_event_delivery(
+        &self,
+        events: CaptureEventDelivery,
+    ) -> Result<Self, CaptureCompletionError> {
+        Self::new(
+            self.sources.clone(),
+            events,
+            self.blobs,
+            self.auth_refreshes,
+            self.error.clone(),
+        )
     }
 
     /// True only when every configured source stayed available and no event/blob was lost.
@@ -738,6 +767,43 @@ mod tests {
             ),
             Err(CaptureCompletionError::BlobAccounting)
         );
+        assert_eq!(
+            CaptureCompletionReport::new(
+                CaptureSourcesReport::new(
+                    CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved,),
+                    CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved,),
+                    CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                    CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+                ),
+                CaptureEventDelivery {
+                    observed: 1,
+                    pending: 1,
+                    ..CaptureEventDelivery::default()
+                },
+                None,
+                None,
+                None,
+            ),
+            Err(CaptureCompletionError::SpoolAccounting)
+        );
+        assert_eq!(
+            CaptureCompletionReport::new(
+                CaptureSourcesReport::new(
+                    CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved,),
+                    CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved,),
+                    CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                    CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+                ),
+                CaptureEventDelivery::default(),
+                Some(CaptureBlobDelivery {
+                    missing_bytes: 1,
+                    ..CaptureBlobDelivery::default()
+                }),
+                None,
+                None,
+            ),
+            Err(CaptureCompletionError::BlobAccounting)
+        );
     }
 
     #[test]
@@ -751,6 +817,7 @@ mod tests {
             ),
             CaptureEventDelivery {
                 observed: 1,
+                spooled: 1,
                 pending: 1,
                 ..CaptureEventDelivery::default()
             },

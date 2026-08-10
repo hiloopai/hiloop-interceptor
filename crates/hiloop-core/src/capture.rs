@@ -29,7 +29,8 @@ pub fn capture_otlp_queue_override(current: Option<&str>) -> Option<usize> {
 
 const CLIENT_HELLO_FINGERPRINT: &str = "client_hello_fingerprint";
 const DOWNSTREAM_BYTES: &str = "downstream_bytes";
-const L7_CAPTURE: &str = "l7_capture";
+/// Event attribute reporting whether application-layer traffic was captured.
+pub const L7_CAPTURE: &str = "l7_capture";
 const ORIGINAL_DESTINATION_IP: &str = "original_destination.ip";
 const ORIGINAL_DESTINATION_PORT: &str = "original_destination.port";
 const REASON: &str = "reason";
@@ -65,7 +66,7 @@ macro_rules! string_enum {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum $name {
             $($(#[$variant_meta])* $variant),+
         }
