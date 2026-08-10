@@ -604,6 +604,16 @@ mod tests {
             RunContext::new_local_root(),
             Arc::<CountingExporter>::clone(&fatal_exporter),
         );
+        let relay_tail = Event::new(
+            &RunContext::new_local_root(),
+            hiloop_core::identity::HlcClock::new().tick(),
+            hiloop_core::event::SignalType::Net,
+            hiloop_core::event::EventName::from_static("fixture.relay-tail"),
+        );
+        fatal_exporter
+            .export(&[relay_tail])
+            .await
+            .expect("a buffered tail event precedes capture health");
         let mut fatal = supervisor
             .finish_wait(Err(ProvisionError::dataplane(
                 "gateway_worker",
@@ -635,7 +645,7 @@ mod tests {
                     .iter()
                     .map(|event| event.name.as_str())
                     .collect::<Vec<_>>(),
-                ["capture.fatal", "capture-health"]
+                ["fixture.relay-tail", "capture.fatal", "capture-health"]
             );
             assert!(matches!(
                 &fatal,
@@ -672,6 +682,15 @@ mod tests {
             .await
             .expect("composer flushes buffered events after fatal export fails");
         assert_eq!(export_failure.flushes.load(Ordering::SeqCst), 1);
+        let error = fatal.expect_err("dataplane failure remains fatal");
+        let fatal = error.into_fatal().expect("typed fatal error");
+        assert!(!fatal.event_persisted());
+        let diagnostic = anyhow::Error::new(fatal);
+        assert!(
+            diagnostic
+                .chain()
+                .any(|cause| cause.to_string().contains("export failed"))
+        );
     }
 
     #[derive(Debug)]

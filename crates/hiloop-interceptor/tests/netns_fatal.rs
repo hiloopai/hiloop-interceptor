@@ -102,6 +102,31 @@ impl Exporter for OrderingExporter {
     }
 }
 
+#[derive(Debug)]
+struct FailingExporter {
+    fail_export: bool,
+    fail_flush: bool,
+    flushes: AtomicUsize,
+}
+
+#[async_trait]
+impl Exporter for FailingExporter {
+    async fn export(&self, _events: &[Event]) -> Result<(), ExportError> {
+        if self.fail_export {
+            return Err(ExportError::unavailable("fixture", "export failed"));
+        }
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), ExportError> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+        if self.fail_flush {
+            return Err(ExportError::unavailable("fixture", "flush failed"));
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn worker_crash_becomes_dataplane_fatal_after_ordered_teardown() {
     let (fake, handle) = FakeNetworkProvisioner::scripted(
@@ -153,6 +178,47 @@ async fn worker_crash_becomes_dataplane_fatal_after_ordered_teardown() {
         Some(&AttributeValue::String("dataplane_failed".to_owned()))
     );
     assert_eq!(exporter.flushes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn standalone_fatal_always_flushes_and_reports_every_persistence_failure() {
+    for (fail_export, fail_flush) in [(true, false), (false, true), (true, true)] {
+        let (fake, _) = FakeNetworkProvisioner::scripted(
+            hiloop_interceptor::netns::PreflightReport::passed(true),
+            info(),
+            FakeSessionOutcome::DataplaneFailure {
+                component: "gateway_worker",
+                diagnostic: "fixture crash".to_owned(),
+            },
+        );
+        let mut session = fake.provision(request()).await.expect("fake provision");
+        let exporter = Arc::new(FailingExporter {
+            fail_export,
+            fail_flush,
+            flushes: AtomicUsize::new(0),
+        });
+        let supervisor = FatalRunSupervisor::new(
+            RunContext::new_local_root(),
+            Arc::<FailingExporter>::clone(&exporter),
+        );
+
+        let fatal = supervisor
+            .wait(session.as_mut())
+            .await
+            .expect_err("worker crash must fail the run")
+            .into_fatal()
+            .expect("typed dataplane fatal");
+
+        assert_eq!(exporter.flushes.load(Ordering::SeqCst), 1);
+        assert!(!fatal.event_persisted());
+        let diagnostic = format!("{:#}", anyhow::Error::new(fatal));
+        if fail_export {
+            assert!(diagnostic.contains("export failed"), "{diagnostic}");
+        }
+        if fail_flush {
+            assert!(diagnostic.contains("flush failed"), "{diagnostic}");
+        }
+    }
 }
 
 #[derive(Debug)]

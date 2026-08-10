@@ -35,19 +35,69 @@ impl FatalRunResult {
 }
 
 /// Completed fatal transition, including any loud teardown or durability failure.
-#[derive(Debug, Error)]
-#[error("transparent capture run failed fatally: {result}")]
+#[derive(Debug)]
 pub struct FatalRunError {
     result: FatalRunResult,
     substrate_error: Option<ProvisionError>,
     persistence: FatalPersistence,
 }
 
+impl std::fmt::Display for FatalRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "transparent capture run failed fatally: {}",
+            self.result
+        )
+    }
+}
+
+impl std::error::Error for FatalRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.persistence_failure()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.substrate_error()
+                    .map(|error| error as &(dyn std::error::Error + 'static))
+            })
+    }
+}
+
 #[derive(Debug)]
 enum FatalPersistence {
     Pending,
     Persisted,
-    Failed(Arc<ExportError>),
+    Failed(FatalPersistenceFailure),
+}
+
+#[derive(Debug, Default)]
+struct FatalPersistenceFailure {
+    export: Option<Arc<ExportError>>,
+    flush: Option<Arc<ExportError>>,
+}
+
+impl std::fmt::Display for FatalPersistenceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.export, &self.flush) {
+            (Some(export), Some(flush)) => {
+                write!(
+                    formatter,
+                    "{export}; final exporter flush also failed: {flush}"
+                )
+            }
+            (Some(error), None) | (None, Some(error)) => error.fmt(formatter),
+            (None, None) => formatter.write_str("fatal event persistence failed"),
+        }
+    }
+}
+
+impl std::error::Error for FatalPersistenceFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.export
+            .as_deref()
+            .or(self.flush.as_deref())
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
 }
 
 impl FatalRunError {
@@ -74,7 +124,16 @@ impl FatalRunError {
     /// Fatal-event export or flush failure, if durability could not be established.
     pub fn persistence_error(&self) -> Option<&ExportError> {
         match &self.persistence {
-            FatalPersistence::Failed(error) => Some(error.as_ref()),
+            FatalPersistence::Failed(failure) => {
+                failure.export.as_deref().or(failure.flush.as_deref())
+            }
+            FatalPersistence::Pending | FatalPersistence::Persisted => None,
+        }
+    }
+
+    fn persistence_failure(&self) -> Option<&FatalPersistenceFailure> {
+        match &self.persistence {
+            FatalPersistence::Failed(failure) => Some(failure),
             FatalPersistence::Pending | FatalPersistence::Persisted => None,
         }
     }
@@ -133,13 +192,7 @@ impl FatalRunSupervisor {
         session: &mut dyn NetworkSession,
     ) -> Result<SubstrateExit, SupervisedRunError> {
         let mut result = self.finish_wait(session.wait().await).await;
-        if matches!(
-            result,
-            Err(SupervisedRunError::Fatal(FatalRunError {
-                persistence: FatalPersistence::Pending,
-                ..
-            }))
-        ) {
+        if matches!(result, Err(SupervisedRunError::Fatal(_))) {
             let _ = Self::record_flush(&mut result, self.exporter.flush().await);
         }
         result
@@ -169,12 +222,28 @@ impl FatalRunSupervisor {
         let Err(SupervisedRunError::Fatal(error)) = result else {
             return flush;
         };
-        if !matches!(error.persistence, FatalPersistence::Pending) {
-            return flush;
-        }
-        error.persistence = match &flush {
-            Ok(()) => FatalPersistence::Persisted,
-            Err(error) => FatalPersistence::Failed(Arc::clone(error)),
+        error.persistence = match (&error.persistence, &flush) {
+            (FatalPersistence::Pending, Ok(())) | (FatalPersistence::Persisted, _) => {
+                FatalPersistence::Persisted
+            }
+            (FatalPersistence::Pending, Err(flush)) => {
+                FatalPersistence::Failed(FatalPersistenceFailure {
+                    export: None,
+                    flush: Some(Arc::clone(flush)),
+                })
+            }
+            (FatalPersistence::Failed(failure), Err(flush)) => {
+                FatalPersistence::Failed(FatalPersistenceFailure {
+                    export: failure.export.clone(),
+                    flush: Some(Arc::clone(flush)),
+                })
+            }
+            (FatalPersistence::Failed(failure), Ok(())) => {
+                FatalPersistence::Failed(FatalPersistenceFailure {
+                    export: failure.export.clone(),
+                    flush: failure.flush.clone(),
+                })
+            }
         };
         flush
     }
@@ -188,7 +257,10 @@ impl FatalRunSupervisor {
         let event = Event::capture_fatal(&self.context, self.clock.tick(), reason);
         let persistence = match self.exporter.export(&[event]).await {
             Ok(()) => FatalPersistence::Pending,
-            Err(error) => FatalPersistence::Failed(Arc::new(error)),
+            Err(error) => FatalPersistence::Failed(FatalPersistenceFailure {
+                export: Some(Arc::new(error)),
+                flush: None,
+            }),
         };
         FatalRunError {
             result,
