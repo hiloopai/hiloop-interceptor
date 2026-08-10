@@ -79,6 +79,10 @@ impl Default for SpoolPolicy {
 /// Backlog and loss accounting of one spool at one instant.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SpoolReport {
+    /// Events that entered the retry spool at least once.
+    pub spooled_events: u64,
+    /// Events confirmed delivered by the inner exporter.
+    pub delivered_events: u64,
     /// Events parked in the spool, awaiting redelivery.
     pub pending_events: usize,
     /// Serialized size of the pending events.
@@ -142,6 +146,8 @@ struct SpoolState {
     queued_bytes: u64,
     dropped_events: u64,
     rejected_events: u64,
+    spooled_events: u64,
+    delivered_events: u64,
     /// Consecutive failed delivery attempts; drives the exponential backoff.
     consecutive_failures: u32,
     /// No delivery attempt before this instant; `None` means deliver immediately.
@@ -159,6 +165,8 @@ impl SpoolState {
 
     fn report(&self) -> SpoolReport {
         SpoolReport {
+            spooled_events: self.spooled_events,
+            delivered_events: self.delivered_events,
             pending_events: self.queue.len(),
             pending_bytes: self.queued_bytes,
             dropped_events: self.dropped_events,
@@ -266,6 +274,7 @@ impl<E: Exporter> SpoolingExporter<E> {
                 .collect();
             match self.deliver(&chunk).await {
                 Ok(()) => {
+                    state.delivered_events += chunk_len as u64;
                     Self::pop_front(state, chunk_len);
                     state.on_success();
                 }
@@ -294,6 +303,7 @@ impl<E: Exporter> SpoolingExporter<E> {
     /// Park `events` at the spool's tail, then enforce both caps by dropping the
     /// oldest events (counted; one loud warning per run when dropping starts).
     fn enqueue(&self, state: &mut SpoolState, events: &[Event]) {
+        state.spooled_events += events.len() as u64;
         for event in events {
             let bytes = approx_event_bytes(event);
             state.queue.push_back(SpooledEvent {
@@ -338,7 +348,10 @@ impl<E: Exporter> Exporter for SpoolingExporter<E> {
             return Ok(());
         }
         match self.deliver(events).await {
-            Ok(()) => state.on_success(),
+            Ok(()) => {
+                state.delivered_events += events.len() as u64;
+                state.on_success();
+            }
             Err(AttemptFailure::Permanent(message)) => {
                 state.rejected_events += events.len() as u64;
                 warn_rejected(events.len(), &message);
@@ -511,7 +524,10 @@ mod tests {
             messages(&spool.inner.delivered_flat()),
             ["one", "two", "three"]
         );
-        assert!(spool.report().await.is_clean());
+        let report = spool.report().await;
+        assert!(report.is_clean());
+        assert_eq!(report.spooled_events, 0);
+        assert_eq!(report.delivered_events, 3);
     }
 
     #[tokio::test]
@@ -546,7 +562,10 @@ mod tests {
             messages(&spool.inner.delivered_flat()),
             ["one", "two", "three", "four"]
         );
-        assert!(spool.report().await.is_clean());
+        let report = spool.report().await;
+        assert!(report.is_clean());
+        assert_eq!(report.spooled_events, 3);
+        assert_eq!(report.delivered_events, 4);
     }
 
     #[tokio::test(start_paused = true)]

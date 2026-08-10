@@ -3,7 +3,7 @@
 use std::{io, path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use hiloop_core::event::Event;
+use hiloop_core::event::{AttributeKey, AttributeValue, Event};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
@@ -104,6 +104,24 @@ impl Exporter for EventRelayExporter {
 pub(super) struct EventRelayServer {
     listener: UnixListener,
     exporter: Arc<dyn Exporter>,
+    capture: RelayCaptureReport,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NetworkObservations {
+    pub(super) full: u64,
+    pub(super) metadata_only: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct RelayCaptureReport {
+    network: Arc<Mutex<NetworkObservations>>,
+}
+
+impl RelayCaptureReport {
+    pub(super) async fn network(&self) -> NetworkObservations {
+        *self.network.lock().await
+    }
 }
 
 impl std::fmt::Debug for EventRelayServer {
@@ -119,7 +137,12 @@ impl EventRelayServer {
         Ok(Self {
             listener: UnixListener::bind(path)?,
             exporter,
+            capture: RelayCaptureReport::default(),
         })
+    }
+
+    pub(super) fn capture_report(&self) -> RelayCaptureReport {
+        self.capture.clone()
     }
 
     pub(super) async fn serve(self, shutdown: impl Future<Output = ()>) -> io::Result<()> {
@@ -132,7 +155,8 @@ impl EventRelayServer {
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted?;
                     let exporter = Arc::clone(&self.exporter);
-                    connections.spawn(async move { serve_connection(stream, exporter).await });
+                    let capture = self.capture.clone();
+                    connections.spawn(async move { serve_connection(stream, exporter, capture).await });
                 }
                 Some(joined) = connections.join_next(), if !connections.is_empty() => {
                     joined.map_err(io::Error::other)??;
@@ -144,7 +168,11 @@ impl EventRelayServer {
     }
 }
 
-async fn serve_connection(mut stream: UnixStream, exporter: Arc<dyn Exporter>) -> io::Result<()> {
+async fn serve_connection(
+    mut stream: UnixStream,
+    exporter: Arc<dyn Exporter>,
+    capture: RelayCaptureReport,
+) -> io::Result<()> {
     loop {
         let request = match read_frame(&mut stream).await {
             Ok(request) => request,
@@ -152,7 +180,10 @@ async fn serve_connection(mut stream: UnixStream, exporter: Arc<dyn Exporter>) -
             Err(error) => return Err(error),
         };
         let result = match request {
-            RelayRequest::Export(events) => exporter.export(&events).await,
+            RelayRequest::Export(events) => {
+                record_network_observations(&capture, &events).await;
+                exporter.export(&events).await
+            }
             RelayRequest::Flush => exporter.flush().await,
         };
         let response = match result {
@@ -160,6 +191,28 @@ async fn serve_connection(mut stream: UnixStream, exporter: Arc<dyn Exporter>) -
             Err(error) => RelayResponse::Error(error.to_string()),
         };
         write_frame(&mut stream, &response).await?;
+    }
+}
+
+async fn record_network_observations(capture: &RelayCaptureReport, events: &[Event]) {
+    let raw_source = AttributeKey::from_static("raw.source");
+    let l7_capture = AttributeKey::from_static("l7_capture");
+    let mut report = capture.network.lock().await;
+    for event in events {
+        if !matches!(
+            event.attributes.get(&raw_source),
+            Some(AttributeValue::String(source)) if source == "proxy"
+        ) {
+            continue;
+        }
+        if matches!(
+            event.attributes.get(&l7_capture),
+            Some(AttributeValue::Bool(false))
+        ) {
+            report.metadata_only += 1;
+        } else {
+            report.full += 1;
+        }
     }
 }
 
@@ -218,6 +271,7 @@ mod tests {
         let path = directory.path().join("events.sock");
         let memory = Arc::new(MemoryExporter::default());
         let server = EventRelayServer::bind(&path, memory.clone()).expect("bind relay");
+        let capture = server.capture_report();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(server.serve(async move {
             let _ = shutdown_rx.await;
@@ -233,7 +287,9 @@ mod tests {
             },
             SignalType::Net,
             EventName::from_static("fixture.event"),
-        );
+        )
+        .with_attribute(AttributeKey::from_static("raw.source"), "proxy")
+        .with_attribute(AttributeKey::from_static("l7_capture"), false);
 
         relay
             .export(std::slice::from_ref(&event))
@@ -243,6 +299,13 @@ mod tests {
         let events = memory.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name.as_str(), event.name.as_str());
+        assert_eq!(
+            capture.network().await,
+            NetworkObservations {
+                full: 0,
+                metadata_only: 1,
+            }
+        );
 
         shutdown_tx.send(()).expect("send shutdown");
         task.await.expect("relay task").expect("relay server");

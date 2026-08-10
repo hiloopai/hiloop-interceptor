@@ -17,7 +17,10 @@ use crate::{
     grpc_export::GrpcIngestExporter,
     netns::NetworkCapture,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
-    pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL, PipelineOptions},
+    pipeline::{
+        DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL, PipelineOptions, PipelineReport,
+        PipelineSourceReport,
+    },
     proxy::{ProxyNormalizer, ProxySource, ProxySourceConfig},
     raw::JsonlRawStore,
     redact::RedactionPolicy,
@@ -32,7 +35,11 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use hiloop_core::{
-    capture::{CAPTURE_OTLP_MAX_EXPORT_BATCH_SIZE, capture_otlp_queue_override},
+    capture::{
+        CAPTURE_OTLP_MAX_EXPORT_BATCH_SIZE, CaptureBlobDelivery, CaptureCompletionReport,
+        CaptureEventDelivery, CaptureEvidenceTrust, CaptureSourceDegradation, CaptureSourceReport,
+        CaptureSourcesReport, capture_otlp_queue_override,
+    },
     event::{AttributeKey, AttributeValue, Attributes, Event, EventName, SignalType},
     identity::{Hlc, RunContext},
 };
@@ -73,24 +80,6 @@ pub(crate) const CAPTURE_HEALTH_EXPORT_TIMEOUT: Duration = Duration::from_secs(1
 /// warm channel are instant — and the child never ran, so trading extra seconds on the failure
 /// path for the record actually landing is the right side of the budget.
 const SPAWN_FAILURE_EXPORT_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// Event name of the run-end capture-health record.
-const CAPTURE_DRAIN_EVENT: &str = "capture.drain";
-
-/// Attribute keys of the `capture.drain` health record.
-mod capture_keys {
-    pub(super) const FOUND: &str = "capture.blobs.found";
-    pub(super) const LANDED: &str = "capture.blobs.landed";
-    pub(super) const MISSING: &str = "capture.blobs.missing";
-    pub(super) const OVERSIZE: &str = "capture.blobs.oversize";
-    pub(super) const MISSING_BYTES: &str = "capture.blobs.missing_bytes";
-    pub(super) const EVENTS_DROPPED: &str = "capture.events.dropped";
-    pub(super) const EVENTS_REJECTED: &str = "capture.events.rejected";
-    pub(super) const EVENTS_PENDING: &str = "capture.events.pending";
-    pub(super) const AUTH_REFRESHES: &str = "capture.auth.refreshes";
-    pub(super) const COMPLETE: &str = "capture.complete";
-    pub(super) const ERROR: &str = "capture.error";
-}
 
 /// Locations of the OS public-root CA bundle, most-common first. The wrapped child
 /// would normally trust these; the interception bundle must *preserve* that trust,
@@ -885,12 +874,75 @@ where
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            let capture_error = format!("failed to spawn child command: {error}");
             let event = spawn_failure_event(options, clock.tick(), &error);
             if let Err(warning) = export_supervisor_record(
                 exporter,
                 event,
                 "spawn-failure",
                 SPAWN_FAILURE_EXPORT_TIMEOUT,
+            )
+            .await
+            {
+                eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
+            }
+            let spool_report = match event_spool {
+                Some(spool) => Some(spool.report().await),
+                None => None,
+            };
+            let events = match spool_report {
+                Some(spool) => CaptureEventDelivery {
+                    observed: 1,
+                    spooled: spool.spooled_events,
+                    landed: spool.delivered_events,
+                    dropped: spool.dropped_events,
+                    rejected: spool.rejected_events,
+                    pending: spool.pending_events as u64,
+                },
+                None => CaptureEventDelivery {
+                    observed: 1,
+                    landed: 1,
+                    ..CaptureEventDelivery::default()
+                },
+            };
+            let unavailable = |trust| {
+                CaptureSourceReport::configured_unavailable(
+                    trust,
+                    CaptureSourceDegradation::StartupFailed,
+                )
+            };
+            let report = CaptureCompletionReport {
+                sources: CaptureSourcesReport {
+                    process: CaptureSourceReport::attached_full(
+                        CaptureEvidenceTrust::PlatformObserved,
+                        1,
+                    ),
+                    stdio: CaptureSourceReport::attached_no_data(
+                        CaptureEvidenceTrust::PlatformObserved,
+                    ),
+                    network: if options.network_capture.uses_proxy() {
+                        unavailable(CaptureEvidenceTrust::PlatformObserved)
+                    } else {
+                        CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved)
+                    },
+                    otlp: if options.otlp {
+                        unavailable(CaptureEvidenceTrust::WorkloadReported)
+                    } else {
+                        CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported)
+                    },
+                },
+                events,
+                blobs: None,
+                auth_refreshes: gateway_credential.map(GatewayCredential::refreshes),
+                error: Some(capture_error),
+            };
+            let context = NormalizationContext::new(options.context.clone())
+                .with_attributes(options.attributes.clone());
+            if let Err(warning) = export_supervisor_record(
+                exporter,
+                capture_drain_event(&context, clock.tick(), &report),
+                "capture-health",
+                CAPTURE_HEALTH_EXPORT_TIMEOUT,
             )
             .await
             {
@@ -1123,40 +1175,63 @@ where
     };
     let otlp_task = async {
         if let Some(server) = otlp_server {
-            let _ = server.await;
+            server.await.map_err(anyhow::Error::new)?;
         }
+        Ok::<(), anyhow::Error>(())
     };
     let proxy_task = async {
-        // Capture is best effort: a proxy failure can be diagnosed with --verbose, but is not fatal
-        // to the child.
-        if let Some(task) = proxy_server
-            && let Err(error) = task.await
-            && options.verbose_diagnostics
-        {
-            eprintln!("hiloop-interceptor: proxy capture failed: {error}");
+        if let Some(task) = proxy_server {
+            task.await.map_err(anyhow::Error::new)?;
         }
+        Ok::<(), anyhow::Error>(())
     };
 
-    let (status_result, stdin_result, stdout_result, stderr_result, (), (), pipeline_result) =
-        Box::pin(async {
-            tokio::join!(
-                child_and_shutdown,
-                stdin_capture,
-                stdout_capture,
-                stderr_capture,
-                otlp_task,
-                proxy_task,
-                async { pipeline.await.context("stdio event pipeline failed") },
-            )
-        })
-        .await;
+    let (
+        status_result,
+        stdin_result,
+        stdout_result,
+        stderr_result,
+        otlp_result,
+        proxy_result,
+        pipeline_result,
+    ) = Box::pin(async {
+        tokio::join!(
+            child_and_shutdown,
+            stdin_capture,
+            stdout_capture,
+            stderr_capture,
+            otlp_task,
+            proxy_task,
+            async { pipeline.await.context("stdio event pipeline failed") },
+        )
+    })
+    .await;
 
     let status = status_result?;
 
     // The child has exited: capture/export is best effort from here, so drain failures
     // become warnings instead of clobbering the child's exit code (exit-code transparency).
+    let pipeline_failed = pipeline_result.is_err();
+    let otlp_failed = otlp_result.is_err();
+    let proxy_failed = proxy_result.is_err();
+    let mut terminal_errors = Vec::<String>::new();
+    if let Err(error) = &pipeline_result {
+        terminal_errors.push(error.to_string());
+    }
+    if let Err(error) = &otlp_result {
+        terminal_errors.push(error.to_string());
+    }
+    if let Err(error) = &proxy_result {
+        terminal_errors.push(error.to_string());
+    }
+    let pipeline_warning = pipeline_result
+        .as_ref()
+        .err()
+        .map(|error| anyhow::anyhow!(error.to_string()).context("stdio event pipeline failed"));
+    let pipeline_report = pipeline_result.ok();
     let mut drain_warnings: Vec<anyhow::Error> = [
-        pipeline_result.map(|_| ()),
+        otlp_result.context("OTLP capture source failed"),
+        proxy_result.context("network capture source failed"),
         stdin_result.context("failed to capture child stdin"),
         stdout_result.context("failed to capture child stdout"),
         stderr_result.context("failed to capture child stderr"),
@@ -1164,6 +1239,7 @@ where
     .into_iter()
     .filter_map(Result::err)
     .collect();
+    drain_warnings.extend(pipeline_warning);
 
     // Run-end blob drain, best-effort like the rest of the drain. The authoritative
     // final pass re-probes every digest against the gateway and retries with bounded
@@ -1171,7 +1247,6 @@ where
     // incomplete drain keeps the scratch store: deleting it would destroy the only
     // bytes behind already-exported payload_ref digests.
     let mut blob_outcome: Option<BlobDrainOutcome> = None;
-    let mut blob_drain_failed = false;
     if let Some(task) = drain_task {
         match task.await {
             Ok(drainer) => {
@@ -1190,7 +1265,7 @@ where
                 blob_outcome = Some(outcome);
             }
             Err(join_error) => {
-                blob_drain_failed = true;
+                terminal_errors.push(join_error.to_string());
                 drain_warnings
                     .push(anyhow::Error::new(join_error).context("blob drain task failed"));
             }
@@ -1203,28 +1278,37 @@ where
     // It ships BEFORE the final event-spool drain on purpose: spool redelivery is
     // strictly in arrival order, so a `capture.drain` event that reaches the gateway
     // certifies that everything spooled before it landed too.
-    if !blob_drain_failed && (blob_outcome.is_some() || event_spool.is_some()) {
-        let spool_report = match event_spool {
-            Some(spool) => Some(spool.report().await),
-            None => None,
-        };
-        let health_event = capture_drain_event(
-            &health_context,
-            clock.tick(),
-            blob_outcome.as_ref(),
-            spool_report,
-            gateway_credential.map(GatewayCredential::refreshes),
-        );
-        if let Err(warning) = export_supervisor_record(
-            exporter,
-            health_event,
-            "capture-health",
-            CAPTURE_HEALTH_EXPORT_TIMEOUT,
-        )
-        .await
-        {
-            drain_warnings.push(warning);
-        }
+    let spool_report = match event_spool {
+        Some(spool) => Some(spool.report().await),
+        None => None,
+    };
+    if let Some(error) = blob_outcome
+        .as_ref()
+        .and_then(|outcome| outcome.error.as_ref())
+    {
+        terminal_errors.push(error.to_string());
+    }
+    let report = completion_report(CompletionReportInput {
+        options,
+        pipeline_report: pipeline_report.as_ref(),
+        pipeline_failed,
+        otlp_failed,
+        proxy_failed,
+        blob_outcome: blob_outcome.as_ref(),
+        spool_report,
+        auth_refreshes: gateway_credential.map(GatewayCredential::refreshes),
+        error: (!terminal_errors.is_empty()).then(|| terminal_errors.join("; ")),
+    });
+    let health_event = capture_drain_event(&health_context, clock.tick(), &report);
+    if let Err(warning) = export_supervisor_record(
+        exporter,
+        health_event,
+        "capture-health",
+        CAPTURE_HEALTH_EXPORT_TIMEOUT,
+    )
+    .await
+    {
+        drain_warnings.push(warning);
     }
 
     if let Some(outcome) = blob_outcome
@@ -1298,95 +1382,140 @@ fn drain_problem(outcome: BlobDrainOutcome) -> Option<anyhow::Error> {
     None
 }
 
-/// Build the run-end capture-health event: one `log`-signal record per captured run
-/// stating whether everything captured landed on the gateway — payload blobs (when a
-/// blob drain ran) and exported events (when a gRPC export spool ran) — stamped
-/// through the same provenance seam as the run's captured events (run identity,
-/// static attributes, wrapper and process identity). `capture.complete` is the
-/// conjunction: every uploadable blob landed AND no exported event was dropped. The
-/// event-spool counters are loss counters — events still awaiting redelivery do not
-/// count against completeness, because redelivery is strictly in order: this record
-/// reaching the gateway certifies everything spooled before it landed too.
-/// `capture.auth.refreshes` (when a gateway credential exists) counts mid-run
-/// credential rotations, so an access token that expired during the run is queryable
-/// from the trace instead of living only in stderr.
+/// Stamp the shared capture-completion Event-v1 projection with this process's provenance.
 pub(crate) fn capture_drain_event(
     context: &NormalizationContext,
     ts: Hlc,
-    blob_outcome: Option<&BlobDrainOutcome>,
-    spool_report: Option<SpoolReport>,
-    auth_refreshes: Option<u64>,
+    report: &CaptureCompletionReport,
 ) -> Event {
-    let event = Event::new(
-        context.run_context(),
-        ts,
-        SignalType::Log,
-        EventName::from_static(CAPTURE_DRAIN_EVENT),
-    );
-    let mut event = context.stamp_provenance(event);
-    let mut complete = true;
-    if let Some(outcome) = blob_outcome {
-        let report = outcome.report;
-        complete &= outcome.is_complete();
-        event = event
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::FOUND),
-                count_attr(report.found),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::LANDED),
-                count_attr(report.landed),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::MISSING),
-                count_attr(report.missing),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::OVERSIZE),
-                count_attr(report.oversize_skipped),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::MISSING_BYTES),
-                i64::try_from(report.missing_bytes).unwrap_or(i64::MAX),
-            );
-        if let Some(error) = &outcome.error {
-            event = event.with_attribute(
-                AttributeKey::from_static(capture_keys::ERROR),
-                error.to_string(),
-            );
-        }
-    }
-    if let Some(report) = spool_report {
-        complete &= report.is_lossless_so_far();
-        event = event
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::EVENTS_DROPPED),
-                i64::try_from(report.dropped_events).unwrap_or(i64::MAX),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::EVENTS_REJECTED),
-                i64::try_from(report.rejected_events).unwrap_or(i64::MAX),
-            )
-            // The backlog at mint time, mainly for the local (JSONL) copy of this
-            // record: on the gateway copy a non-zero value documents late delivery,
-            // never loss — the record queues behind its backlog, so it can only
-            // arrive after everything it counted.
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::EVENTS_PENDING),
-                count_attr(report.pending_events),
-            );
-    }
-    if let Some(refreshes) = auth_refreshes {
-        event = event.with_attribute(
-            AttributeKey::from_static(capture_keys::AUTH_REFRESHES),
-            i64::try_from(refreshes).unwrap_or(i64::MAX),
-        );
-    }
-    event.with_attribute(AttributeKey::from_static(capture_keys::COMPLETE), complete)
+    context.stamp_provenance(report.to_event(context.run_context(), ts))
 }
 
-fn count_attr(value: usize) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
+fn source_report(
+    report: Option<&PipelineReport>,
+    source: &str,
+    trust: CaptureEvidenceTrust,
+    configured: bool,
+    failed: bool,
+) -> CaptureSourceReport {
+    if !configured {
+        return CaptureSourceReport::off_by_policy(trust);
+    }
+    if failed {
+        return CaptureSourceReport::configured_unavailable(
+            trust,
+            CaptureSourceDegradation::RuntimeFailed,
+        );
+    }
+    let Some(source) = report.and_then(|report| report.sources.get(source)) else {
+        return CaptureSourceReport::attached_no_data(trust);
+    };
+    source_observations(trust, source)
+}
+
+fn source_observations(
+    trust: CaptureEvidenceTrust,
+    report: &PipelineSourceReport,
+) -> CaptureSourceReport {
+    let observations = report.observations as u64;
+    match (report.full_events, report.metadata_only_events) {
+        (0, 0) => CaptureSourceReport::attached_no_data(trust),
+        (_, 0) => CaptureSourceReport::attached_full(trust, observations),
+        (0, _) => CaptureSourceReport::attached_metadata_only(
+            trust,
+            observations,
+            CaptureSourceDegradation::OpaqueNetworkTraffic,
+        ),
+        (full, metadata_only) => CaptureSourceReport::attached_mixed(
+            trust,
+            full as u64,
+            metadata_only as u64,
+            CaptureSourceDegradation::OpaqueNetworkTraffic,
+        ),
+    }
+}
+
+struct CompletionReportInput<'a> {
+    options: &'a RunOptions,
+    pipeline_report: Option<&'a PipelineReport>,
+    pipeline_failed: bool,
+    otlp_failed: bool,
+    proxy_failed: bool,
+    blob_outcome: Option<&'a BlobDrainOutcome>,
+    spool_report: Option<SpoolReport>,
+    auth_refreshes: Option<u64>,
+    error: Option<String>,
+}
+
+fn completion_report(input: CompletionReportInput<'_>) -> CaptureCompletionReport {
+    let CompletionReportInput {
+        options,
+        pipeline_report,
+        pipeline_failed,
+        otlp_failed,
+        proxy_failed,
+        blob_outcome,
+        spool_report,
+        auth_refreshes,
+        error,
+    } = input;
+    let events = match spool_report {
+        Some(spool) => CaptureEventDelivery {
+            observed: pipeline_report.map_or(0, |report| report.events as u64),
+            spooled: spool.spooled_events,
+            landed: spool.delivered_events,
+            dropped: spool.dropped_events,
+            rejected: spool.rejected_events,
+            pending: spool.pending_events as u64,
+        },
+        None => CaptureEventDelivery {
+            observed: pipeline_report.map_or(0, |report| report.events as u64),
+            landed: pipeline_report.map_or(0, |report| report.events as u64),
+            ..CaptureEventDelivery::default()
+        },
+    };
+    CaptureCompletionReport {
+        sources: CaptureSourcesReport {
+            process: source_report(
+                pipeline_report,
+                crate::exec_events::EXEC_SOURCE,
+                CaptureEvidenceTrust::PlatformObserved,
+                true,
+                pipeline_failed,
+            ),
+            stdio: source_report(
+                pipeline_report,
+                "stdio",
+                CaptureEvidenceTrust::PlatformObserved,
+                true,
+                pipeline_failed,
+            ),
+            network: source_report(
+                pipeline_report,
+                "proxy",
+                CaptureEvidenceTrust::PlatformObserved,
+                options.network_capture.uses_proxy(),
+                pipeline_failed || proxy_failed,
+            ),
+            otlp: source_report(
+                pipeline_report,
+                "otlp",
+                CaptureEvidenceTrust::WorkloadReported,
+                options.otlp,
+                pipeline_failed || otlp_failed,
+            ),
+        },
+        events,
+        blobs: blob_outcome.map(|outcome| CaptureBlobDelivery {
+            found: outcome.report.found as u64,
+            landed: outcome.report.landed as u64,
+            missing: outcome.report.missing as u64,
+            oversize: outcome.report.oversize_skipped as u64,
+            missing_bytes: outcome.report.missing_bytes,
+        }),
+        auth_refreshes,
+        error,
+    }
 }
 
 /// Render event-spool loss/backlog as the run's export warning, or `None` when the
@@ -2793,18 +2922,27 @@ mod tests {
             .with_attributes(options.attributes.clone())
             .with_process(child_process_context(&options, Some(1234)));
 
+        let report = completion_report(CompletionReportInput {
+            options: &options,
+            pipeline_report: None,
+            pipeline_failed: false,
+            otlp_failed: false,
+            proxy_failed: false,
+            blob_outcome: Some(&BlobDrainOutcome {
+                report: crate::blob_drain::BlobDrainReport::default(),
+                error: None,
+            }),
+            spool_report: Some(SpoolReport::default()),
+            auth_refreshes: Some(0),
+            error: None,
+        });
         let event = capture_drain_event(
             &context,
             Hlc {
                 wall_ns: 7,
                 logical: 0,
             },
-            Some(&BlobDrainOutcome {
-                report: crate::blob_drain::BlobDrainReport::default(),
-                error: None,
-            }),
-            Some(SpoolReport::default()),
-            Some(0),
+            &report,
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
@@ -2838,20 +2976,30 @@ mod tests {
         let context = NormalizationContext::new(options.context.clone())
             .with_attributes(options.attributes.clone());
 
+        let report = completion_report(CompletionReportInput {
+            options: &options,
+            pipeline_report: None,
+            pipeline_failed: false,
+            otlp_failed: false,
+            proxy_failed: false,
+            blob_outcome: None,
+            spool_report: Some(SpoolReport {
+                pending_events: 3,
+                pending_bytes: 512,
+                dropped_events: 2,
+                rejected_events: 1,
+                ..SpoolReport::default()
+            }),
+            auth_refreshes: Some(1),
+            error: None,
+        });
         let event = capture_drain_event(
             &context,
             Hlc {
                 wall_ns: 7,
                 logical: 0,
             },
-            None,
-            Some(SpoolReport {
-                pending_events: 3,
-                pending_bytes: 512,
-                dropped_events: 2,
-                rejected_events: 1,
-            }),
-            Some(1),
+            &report,
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
@@ -2879,20 +3027,30 @@ mod tests {
             error: None,
         };
 
+        let report = completion_report(CompletionReportInput {
+            options: &options,
+            pipeline_report: None,
+            pipeline_failed: false,
+            otlp_failed: false,
+            proxy_failed: false,
+            blob_outcome: Some(&clean_blobs),
+            spool_report: Some(SpoolReport {
+                pending_events: 0,
+                pending_bytes: 0,
+                dropped_events: 1,
+                rejected_events: 0,
+                ..SpoolReport::default()
+            }),
+            auth_refreshes: None,
+            error: None,
+        });
         let event = capture_drain_event(
             &context,
             Hlc {
                 wall_ns: 7,
                 logical: 0,
             },
-            Some(&clean_blobs),
-            Some(SpoolReport {
-                pending_events: 0,
-                pending_bytes: 0,
-                dropped_events: 1,
-                rejected_events: 0,
-            }),
-            None,
+            &report,
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
@@ -2921,6 +3079,7 @@ mod tests {
             pending_bytes: 2048,
             dropped_events: 3,
             rejected_events: 2,
+            ..SpoolReport::default()
         };
 
         let warning =

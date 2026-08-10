@@ -4,7 +4,11 @@ use std::{fmt, path::PathBuf, process::ExitCode, sync::Arc};
 
 use async_trait::async_trait;
 use hiloop_core::{
-    capture::{CapturePolicy, CapturePreflight, NetCaptureMode, SelectedNetCaptureMode},
+    capture::{
+        CaptureBlobDelivery, CaptureCompletionReport, CaptureEventDelivery, CaptureEvidenceTrust,
+        CapturePolicy, CapturePreflight, CaptureSourceDegradation, CaptureSourceReport,
+        CaptureSourcesReport, NetCaptureMode, SelectedNetCaptureMode,
+    },
     event::Event,
     identity::{Hlc, RunContext},
 };
@@ -314,6 +318,7 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
     let (exporter, spool) = build_exporter(options, gateway_credential.as_ref()).await?;
     let relay = EventRelayServer::bind(&event_socket, Arc::clone(&exporter))
         .context("bind transparent-run event relay")?;
+    let relay_capture = relay.capture_report();
     let (relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::oneshot::channel();
     let relay_task = tokio::spawn(relay.serve(async move {
         let _ = relay_shutdown_rx.await;
@@ -352,6 +357,7 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         Ok(result) => result.context("serve transparent-run event relay"),
         Err(error) => Err(error).context("join transparent-run event relay"),
     };
+    let network_observations = relay_capture.network().await;
     let mut result = supervisor.finish_wait(wait_result).await;
     let blob_outcome = drain_blobs(options, &blob_dir, gateway_credential.as_ref()).await;
     let blobs_complete = blob_outcome
@@ -372,15 +378,74 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
             Some(spool) => Some(spool.report().await),
             None => None,
         };
+        let network = match (
+            network_observations.full,
+            network_observations.metadata_only,
+        ) {
+            (0, 0) => CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+            (full, 0) => {
+                CaptureSourceReport::attached_full(CaptureEvidenceTrust::PlatformObserved, full)
+            }
+            (0, metadata_only) => CaptureSourceReport::attached_metadata_only(
+                CaptureEvidenceTrust::PlatformObserved,
+                metadata_only,
+                CaptureSourceDegradation::OpaqueNetworkTraffic,
+            ),
+            (full, metadata_only) => CaptureSourceReport::attached_mixed(
+                CaptureEvidenceTrust::PlatformObserved,
+                full,
+                metadata_only,
+                CaptureSourceDegradation::OpaqueNetworkTraffic,
+            ),
+        };
+        let events = match spool_report {
+            Some(spool) => CaptureEventDelivery {
+                observed: spool
+                    .delivered_events
+                    .saturating_add(spool.pending_events as u64)
+                    .saturating_add(spool.dropped_events)
+                    .saturating_add(spool.rejected_events),
+                spooled: spool.spooled_events,
+                landed: spool.delivered_events,
+                dropped: spool.dropped_events,
+                rejected: spool.rejected_events,
+                pending: spool.pending_events as u64,
+            },
+            None => CaptureEventDelivery {
+                observed: network_observations
+                    .full
+                    .saturating_add(network_observations.metadata_only),
+                landed: network_observations
+                    .full
+                    .saturating_add(network_observations.metadata_only),
+                ..CaptureEventDelivery::default()
+            },
+        };
+        let report = CaptureCompletionReport {
+            sources: CaptureSourcesReport {
+                process: CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                stdio: CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                network,
+                otlp: CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            },
+            events,
+            blobs: blob_outcome.as_ref().map(|outcome| CaptureBlobDelivery {
+                found: outcome.report.found as u64,
+                landed: outcome.report.landed as u64,
+                missing: outcome.report.missing as u64,
+                oversize: outcome.report.oversize_skipped as u64,
+                missing_bytes: outcome.report.missing_bytes,
+            }),
+            auth_refreshes: gateway_credential
+                .as_ref()
+                .map(GatewayCredential::refreshes),
+            error: relay_result.as_ref().err().map(ToString::to_string),
+        };
         let health_event = capture_drain_event(
             &NormalizationContext::new(options.context().clone())
                 .with_attributes(options.attributes().clone()),
             hiloop_core::identity::HlcClock::new().tick(),
-            blob_outcome.as_ref(),
-            spool_report,
-            gateway_credential
-                .as_ref()
-                .map(GatewayCredential::refreshes),
+            &report,
         );
         if let Err(warning) = export_run_health(exporter.as_ref(), health_event).await {
             eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");

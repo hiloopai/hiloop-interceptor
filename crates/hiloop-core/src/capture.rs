@@ -226,6 +226,12 @@ string_enum! {
     }
 }
 
+mod completion;
+pub use completion::{
+    CaptureBlobDelivery, CaptureCompletionReport, CaptureEventDelivery, CaptureEvidenceTrust,
+    CaptureSourceDegradation, CaptureSourceReport, CaptureSourceState, CaptureSourcesReport,
+};
+
 /// Original transport destination recovered before application classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OriginalDestination {
@@ -349,6 +355,7 @@ impl Event {
                 EventName::from_static("tls.interception_failed"),
             )
             .with_attribute(AttributeKey::from_static(REASON), reason.to_string())
+            .with_attribute(AttributeKey::from_static(L7_CAPTURE), false)
             .with_attribute(AttributeKey::from_static("retry_required"), retry_required),
             flow,
         )

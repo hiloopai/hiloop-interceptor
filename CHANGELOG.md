@@ -24,6 +24,14 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- A shared typed capture-completion report now produces the sole `capture.drain` Event-v1 shape
+  for local and embedded runtimes. Normal shutdown emits it unconditionally, including zero-event
+  runs and spawn failures; hard process loss remains distinguishable by absence. Fixed process,
+  stdio, network, and OTLP source fields report platform-observed versus workload-reported trust,
+  off-by-policy / unavailable / available-no-data / full / metadata-only / mixed fidelity, and
+  typed degradation. Event and blob delivery now include observed, spooled, landed, pending,
+  dropped, rejected, missing, and oversize counts. An oversize payload makes
+  `capture.complete=false` because its bytes did not land.
 - An `UNAUTHENTICATED` gateway rejection of a refreshable credential is now retryable-after-refresh
   instead of a permanent drop. The gateway credential is a shared, rotatable handle
   (`GatewayCredential`, one per run, presented by both the event exporter and the blob uploader),

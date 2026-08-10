@@ -7,7 +7,7 @@ use crate::seams::{
 };
 use futures_util::{FutureExt, StreamExt};
 use hiloop_core::event::{AttributeKey, Event};
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -133,13 +133,26 @@ pub enum PipelineOptionsError {
 }
 
 /// Counts emitted by a completed pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineSourceReport {
+    /// Raw observations accepted from this source.
+    pub observations: usize,
+    /// Normalized events with the source's full supported fidelity.
+    pub full_events: usize,
+    /// Normalized events explicitly marked as metadata-only.
+    pub metadata_only_events: usize,
+}
+
+/// Counts emitted by a completed pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineReport {
     pub raw_signals: usize,
     pub events: usize,
     pub diagnostics: usize,
     pub raw_observations: usize,
     pub export_batches: usize,
+    /// Per-source observations and fidelity, keyed by the raw source name.
+    pub sources: BTreeMap<String, PipelineSourceReport>,
 }
 
 /// Pipeline failure with the stage that produced it.
@@ -327,6 +340,7 @@ where
         let mut events = 0;
         let mut diagnostics = 0;
         let mut raw_observations = 0;
+        let mut sources = BTreeMap::<String, PipelineSourceReport>::new();
         while let Some(raw) = raw_rx.recv().await {
             let selections = router.select_all(&raw);
             if selections.is_empty() {
@@ -339,6 +353,7 @@ where
 
             let source = raw.source.clone();
             let kind = raw.kind.clone();
+            sources.entry(source.clone()).or_default().observations += 1;
             let mut normalized = Vec::with_capacity(selections.len());
             let mut requested_retention = RawRetentionPolicy::DiscardAfterNormalize;
             let mut retention_requester = "pipeline";
@@ -386,6 +401,19 @@ where
                             raw_observation: raw_observation.as_ref(),
                         },
                     );
+                    let source_report = sources
+                        .get_mut(&source)
+                        .expect("current raw source was registered");
+                    if matches!(
+                        event
+                            .attributes
+                            .get(&AttributeKey::from_static("l7_capture")),
+                        Some(hiloop_core::event::AttributeValue::Bool(false))
+                    ) {
+                        source_report.metadata_only_events += 1;
+                    } else {
+                        source_report.full_events += 1;
+                    }
                     event_tx
                         .send(event)
                         .await
@@ -394,7 +422,7 @@ where
                 }
             }
         }
-        Ok::<_, PipelineError>((events, diagnostics, raw_observations))
+        Ok::<_, PipelineError>((events, diagnostics, raw_observations, sources))
     };
 
     let export_stage = async {
@@ -487,7 +515,7 @@ where
     if let Some(raw_store) = raw_store {
         raw_store.flush().await?;
     }
-    let (events, diagnostics, raw_observations) =
+    let (events, diagnostics, raw_observations, sources) =
         normalize_report.expect("normalize stage completed");
 
     Ok(PipelineReport {
@@ -496,6 +524,7 @@ where
         diagnostics,
         raw_observations,
         export_batches: export_batches.expect("export stage completed"),
+        sources,
     })
 }
 
@@ -714,6 +743,14 @@ mod tests {
                 diagnostics: 0,
                 raw_observations: 0,
                 export_batches: 1,
+                sources: BTreeMap::from([(
+                    "stdio".to_owned(),
+                    PipelineSourceReport {
+                        observations: 1,
+                        full_events: 1,
+                        metadata_only_events: 0,
+                    },
+                )]),
             }
         );
         let events = exporter.events();
@@ -1180,6 +1217,7 @@ mod tests {
                 diagnostics: 0,
                 raw_observations: 0,
                 export_batches: 0,
+                sources: BTreeMap::new(),
             }
         );
         assert!(exporter.flushed());
