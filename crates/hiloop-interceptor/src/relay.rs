@@ -9,11 +9,16 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
+use futures_util::StreamExt as _;
+use http_body_util::{BodyStream, StreamBody};
 use hudsucker::{
+    Body,
     hyper::{
         Request, Uri,
+        body::Frame,
         header::{AUTHORIZATION, CONNECTION, HOST, HeaderValue, UPGRADE},
     },
     hyper_util::client::legacy::connect::HttpConnector,
@@ -35,6 +40,7 @@ const HILOOP_PRIVATE_HEADER_PREFIX: &str = "x-hiloop-";
 const SEC_WEBSOCKET_KEY_HEADER: &str = "sec-websocket-key";
 const SEC_WEBSOCKET_VERSION_HEADER: &str = "sec-websocket-version";
 const MAX_PROOF_BYTES: usize = 16 * 1024;
+pub(crate) const RELAY_CONNECT_TLS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// An exact DNS destination whose HTTPS port is always 443.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -264,18 +270,34 @@ impl FixedTlsRelayConfig {
             .read_proof()
             .await
             .map_err(|_| SecretEgressDenial::ProofUnavailable)?;
-        request.headers_mut().remove(AUTHORIZATION);
-        let private_headers = request
-            .headers()
-            .keys()
-            .filter(|name| name.as_str().starts_with(HILOOP_PRIVATE_HEADER_PREFIX))
-            .cloned()
-            .collect::<Vec<_>>();
-        for name in private_headers {
-            request.headers_mut().remove(name);
-        }
+        scrub_private_headers(request.headers_mut());
         request.headers_mut().insert(SECRET_PROOF_HEADER, proof);
         Ok(())
+    }
+}
+
+pub(crate) fn scrub_private_trailers(body: Body) -> Body {
+    let frames = BodyStream::new(body).map(|result| {
+        result.map(|frame| match frame.into_trailers() {
+            Ok(mut trailers) => {
+                scrub_private_headers(&mut trailers);
+                Frame::trailers(trailers)
+            }
+            Err(frame) => frame,
+        })
+    });
+    Body::from(StreamBody::new(frames))
+}
+
+fn scrub_private_headers(headers: &mut hudsucker::hyper::HeaderMap) {
+    headers.remove(AUTHORIZATION);
+    let private_headers = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with(HILOOP_PRIVATE_HEADER_PREFIX))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in private_headers {
+        headers.remove(name);
     }
 }
 
@@ -343,7 +365,14 @@ impl Service<Uri> for RelayRoutingConnector {
                         Err(io::Error::other("fixed relay configuration disappeared").into())
                     });
                 };
-                relay.connector.call(relay.transport_uri.clone())
+                let connect = relay.connector.call(relay.transport_uri.clone());
+                Box::pin(async move {
+                    tokio::time::timeout(RELAY_CONNECT_TLS_TIMEOUT, connect)
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::TimedOut, "fixed relay connect timed out")
+                        })?
+                })
             }
             Some(RelayRoute::Denied) => Box::pin(async {
                 Err(io::Error::new(

@@ -67,12 +67,13 @@ use thiserror::Error;
 
 use crate::anomaly::{AnomalyConfig, AnomalyFlag, BodyScan};
 use crate::blob::BlobStore;
+use crate::bound_connect::BoundConnectTransport;
 use crate::capture_policy::{CaptureDisposition, SensitiveExchange, capture_disposition};
 use crate::egress::{CanonicalHost, Destination, EgressPolicy, canonicalize_host};
 use crate::redact::RedactionPolicy;
 use crate::relay::{
     FixedTlsRelayConfig, RelayConfigError, RelayRoute, RelayRoutingConnector, SecretEgressDenial,
-    connect_has_ambiguous_authority, is_ca_certificate,
+    connect_has_ambiguous_authority, is_ca_certificate, scrub_private_trailers,
 };
 use crate::seams::{
     NormalizationContext, NormalizationOutcome, NormalizeError, Normalizer, NormalizerDescriptor,
@@ -167,7 +168,7 @@ pub enum ProxyError {
 /// The CA private key stays in memory inside the proxy authority; only the
 /// public cert PEM is exposed, to be written to a child-scoped trust bundle.
 pub struct ProxyCa {
-    authority: ProxyAuthority,
+    authority: Arc<ProxyAuthority>,
     cert_pem: String,
 }
 
@@ -195,7 +196,7 @@ impl ProxyCa {
         let issuer = Issuer::from_ca_cert_pem(&cert_pem, issuer_key)
             .map_err(|error| ProxyError::Ca(error.to_string()))?;
 
-        let authority = ProxyAuthority::new(issuer, aws_lc_rs::default_provider());
+        let authority = Arc::new(ProxyAuthority::new(issuer, aws_lc_rs::default_provider()));
         Ok(Self {
             authority,
             cert_pem,
@@ -217,12 +218,15 @@ impl ProxyCa {
     }
 }
 
-struct ProxyAuthority {
+pub(crate) struct ProxyAuthority {
     issuer: Issuer<'static, KeyPair>,
     private_key: PrivateKeyDer<'static>,
     cache: Mutex<HashMap<Authority, Arc<ServerConfig>>>,
     provider: Arc<CryptoProvider>,
 }
+
+#[derive(Clone)]
+struct SharedProxyAuthority(Arc<ProxyAuthority>);
 
 impl ProxyAuthority {
     fn new(issuer: Issuer<'static, KeyPair>, provider: CryptoProvider) -> Self {
@@ -301,6 +305,12 @@ impl CertificateAuthority for ProxyAuthority {
         }
         cache.insert(authority.clone(), Arc::clone(&server_cfg));
         server_cfg
+    }
+}
+
+impl CertificateAuthority for SharedProxyAuthority {
+    async fn gen_server_config(&self, authority: &Authority) -> Arc<ServerConfig> {
+        self.0.gen_server_config(authority).await
     }
 }
 
@@ -409,11 +419,18 @@ impl ProxyServer {
         // except the root store is [`upstream_root_store`] instead of webpki-only.
         let tls_config = upstream_client_config(&config.upstream_extra_trust_anchors)?;
         let https_connector =
-            RelayRoutingConnector::new(tls_config.clone(), config.bound_https_relay)
+            RelayRoutingConnector::new(tls_config.clone(), config.bound_https_relay.clone())
                 .map_err(|error| ProxyError::Server(error.to_string()))?;
+        let bound_connect = config.bound_https_relay.as_ref().map(|_| {
+            Arc::new(BoundConnectTransport::new(
+                Arc::clone(&ca.authority),
+                https_connector.clone(),
+            ))
+        });
+        let handler = handler.with_bound_connect(bound_connect);
         let proxy = Proxy::builder()
             .with_listener(self.listener)
-            .with_ca(ca.authority)
+            .with_ca(SharedProxyAuthority(ca.authority))
             .with_http_connector(https_connector)
             .with_websocket_connector(Connector::Rustls(Arc::new(tls_config)))
             .with_http_handler(handler)
@@ -605,6 +622,7 @@ pub(crate) struct CaptureHandler {
     /// truncated/redacted captured copy). Disabled by default (a no-op).
     anomaly: Arc<AnomalyConfig>,
     bound_https_relay: Option<FixedTlsRelayConfig>,
+    bound_connect: Option<Arc<BoundConnectTransport>>,
     /// The canonicalized host from this clone's CONNECT (the SNI host), stashed so the
     /// decrypted request can reject a `Host`/`:authority` that disagrees with it.
     connect_host: Option<CanonicalHost>,
@@ -648,6 +666,7 @@ impl CaptureHandler {
             egress,
             anomaly,
             bound_https_relay: None,
+            bound_connect: None,
             connect_host: None,
             connect_destination: None,
             exchange_id: None,
@@ -666,6 +685,11 @@ impl CaptureHandler {
 
     fn with_bound_https_relay(mut self, relay: Option<FixedTlsRelayConfig>) -> Self {
         self.bound_https_relay = relay;
+        self
+    }
+
+    fn with_bound_connect(mut self, transport: Option<Arc<BoundConnectTransport>>) -> Self {
+        self.bound_connect = transport;
         self
     }
 
@@ -811,6 +835,8 @@ impl CaptureHandler {
                 forbidden().into()
             };
         }
+        let (parts, body) = request.into_parts();
+        let request = Request::from_parts(parts, scrub_private_trailers(body));
         self.exchange_disposition =
             CaptureDisposition::MetadataOnly(SensitiveExchange::BoundSecret);
         self.capture_request(request).await
@@ -1100,7 +1126,7 @@ impl CaptureHandler {
     /// hudsucker calls `handle_error` instead of `handle_response` there, so
     /// without this the request event would dangle with no terminal record.
     /// Inherent (not the trait method) to stay testable without an `HttpContext`.
-    async fn on_upstream_error(&mut self, reason: &'static str, detail: String) {
+    pub(crate) async fn on_upstream_error(&mut self, reason: &'static str, detail: String) {
         if let Some(raw) = self.take_abort_signal(reason, Some(detail)) {
             let _ = self.sink.send(raw).await;
         }
@@ -1767,7 +1793,30 @@ impl HttpHandler for CaptureHandler {
         _ctx: &HttpContext,
         request: Request<Body>,
     ) -> RequestOrResponse {
-        self.on_request(request).await
+        let selected_connect = request.method() == Method::CONNECT
+            && canonical_authority(&request).is_some_and(|destination| {
+                self.bound_https_relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.route_connect(&destination) == RelayRoute::Bound)
+            });
+        if !selected_connect {
+            return self.on_request(request).await;
+        }
+
+        match self.on_request(request).await {
+            RequestOrResponse::Response(response) => response.into(),
+            RequestOrResponse::Request(mut connect) => {
+                let Some(authority) = connect.uri().authority().cloned() else {
+                    return forbidden().into();
+                };
+                let Some(transport) = self.bound_connect.clone() else {
+                    return bad_gateway().into();
+                };
+                let upgrade = hudsucker::hyper::upgrade::on(&mut connect);
+                transport.spawn(upgrade, authority, self.clone());
+                Response::new(Body::empty()).into()
+            }
+        }
     }
 
     async fn handle_response(

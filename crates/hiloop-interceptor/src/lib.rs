@@ -4,6 +4,7 @@ pub mod anomaly;
 pub mod blob;
 pub mod blob_drain;
 pub mod blob_upload;
+mod bound_connect;
 mod capture_policy;
 pub mod egress;
 pub mod exec_events;
