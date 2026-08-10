@@ -75,7 +75,7 @@ const I64_KEYS: [&str; 2] = [keys::PROCESS_EXIT_CODE, keys::PROCESS_DURATION_MS]
 
 /// Resolve the captured `(name, value)` pairs for the allowlisted environment
 /// variables, scrubbing each value through the run's capture-side redaction —
-/// the same pattern pass applied to captured bodies — before it can land in an
+/// the same credential detector pass applied to captured bodies — before it can land in an
 /// attribute. An unset variable yields no pair (its
 /// name still appears in `process.env_allowlist`); a non-UTF-8 value is
 /// captured lossily rather than dropped.
@@ -485,9 +485,9 @@ mod tests {
     }
 
     #[test]
-    fn captured_values_run_through_pattern_redaction() {
+    fn captured_values_run_through_credential_redaction() {
         let allowlist = ["ACCIDENTAL_KEY".to_owned()];
-        let lookup = fake_env(&[("ACCIDENTAL_KEY", "sk-live-abc123")]);
+        let lookup = fake_env(&[("ACCIDENTAL_KEY", "sk-live-abc1234567890xyzABCDEF")]);
 
         let values = captured_env_values(&allowlist, lookup, RedactionPolicy::enabled());
 

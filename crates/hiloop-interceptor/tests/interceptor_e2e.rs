@@ -505,7 +505,7 @@ async fn process_start_captures_allowlisted_env_values_redacted() {
         .arg("--env-allowlist")
         .arg("HILOOP_E2E_RATE,HILOOP_E2E_KEY,HILOOP_E2E_UNSET")
         .env("HILOOP_E2E_RATE", "0.001")
-        .env("HILOOP_E2E_KEY", "sk-e2e-secret-123")
+        .env("HILOOP_E2E_KEY", "sk-e2e-secret-1234567890ABCDEF")
         .env("HILOOP_E2E_OFFLIST", "must-not-appear")
         .env_remove("HILOOP_E2E_UNSET");
     append_mock_harness(&mut command, "mixed", &[]);
@@ -544,7 +544,7 @@ async fn process_start_captures_allowlisted_env_values_redacted() {
         .arg("--no-redact")
         .arg("--env-allowlist")
         .arg("HILOOP_E2E_KEY")
-        .env("HILOOP_E2E_KEY", "sk-e2e-secret-123");
+        .env("HILOOP_E2E_KEY", "sk-e2e-secret-1234567890ABCDEF");
     append_mock_harness(&mut verbatim, "mixed", &[]);
     assert!(run(verbatim).await.status.success());
     let verbatim_start = read_jsonl(&verbatim_events_path)
@@ -553,7 +553,7 @@ async fn process_start_captures_allowlisted_env_values_redacted() {
         .expect("process.start event");
     assert_eq!(
         verbatim_start["attributes"]["process.env.HILOOP_E2E_KEY"],
-        "sk-e2e-secret-123"
+        "sk-e2e-secret-1234567890ABCDEF"
     );
 }
 
