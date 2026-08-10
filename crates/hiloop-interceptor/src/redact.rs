@@ -64,13 +64,21 @@ static BODY_REDACTOR: LazyLock<Redactor> = LazyLock::new(|| {
 fn detect_bearer_tokens(input: &str, matches: &mut Vec<Match>) {
     let bytes = input.as_bytes();
     let mut cursor = 0;
-    while cursor + 7 <= bytes.len() {
-        let Some(start) = (cursor..=bytes.len() - 7)
-            .find(|start| bytes[*start..*start + 7].eq_ignore_ascii_case(b"bearer "))
+    while cursor + 6 <= bytes.len() {
+        let Some(start) = (cursor..=bytes.len() - 6)
+            .find(|start| bytes[*start..*start + 6].eq_ignore_ascii_case(b"bearer"))
         else {
             break;
         };
-        let token_start = start + 7;
+        let separator_start = start + 6;
+        let mut token_start = separator_start;
+        while token_start < bytes.len() && bytes[token_start].is_ascii_whitespace() {
+            token_start += 1;
+        }
+        if token_start == separator_start {
+            cursor = separator_start;
+            continue;
+        }
         let mut end = token_start;
         while end < bytes.len()
             && (bytes[end].is_ascii_alphanumeric()
@@ -248,6 +256,16 @@ mod tests {
     #[test]
     fn bearer_is_case_insensitive() {
         assert_eq!(redact("bearer abc1234567890xyz"), "[REDACTED]");
+    }
+
+    #[test]
+    fn bearer_accepts_ascii_whitespace_separator() {
+        for separator in ["  ", "\t", "\n"] {
+            assert_eq!(
+                redact(&format!("Bearer{separator}abc1234567890xyz")),
+                "[REDACTED]"
+            );
+        }
     }
 
     #[test]
