@@ -424,13 +424,9 @@ async fn flush_after_supervision(
     result: &mut Result<SubstrateExit, SupervisedRunError>,
     exporter: &dyn Exporter,
 ) -> anyhow::Result<()> {
-    let flush = exporter.flush().await;
-    let failure = flush.as_ref().err().map(ToString::to_string);
-    FatalRunSupervisor::record_flush(result, flush);
-    match failure {
-        Some(error) => Err(anyhow::anyhow!(error)).context("flush transparent-run events"),
-        None => Ok(()),
-    }
+    FatalRunSupervisor::record_flush(result, exporter.flush().await)
+        .map_err(anyhow::Error::new)
+        .context("flush transparent-run events")
 }
 
 #[cfg(target_os = "linux")]
@@ -561,53 +557,25 @@ use anyhow::Context as _;
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::{
-        net::Ipv6Addr,
-        num::NonZeroU16,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use async_trait::async_trait;
     use hiloop_core::{event::Event, identity::RunContext};
 
-    use super::flush_after_supervision;
+    use super::{export_run_health, flush_after_supervision};
     use crate::{
-        netns::{
-            FatalRunSupervisor, FragmentedUdpBehavior, NetworkSession, ProvisionError,
-            SubstrateExit, SubstrateInfo, SupervisedRunError,
-        },
+        netns::{FatalRunSupervisor, ProvisionError, SubstrateExit, SupervisedRunError},
         seams::{ExportError, Exporter},
     };
-
-    #[derive(Debug)]
-    struct CrashingSession {
-        info: SubstrateInfo,
-    }
-
-    #[async_trait]
-    impl NetworkSession for CrashingSession {
-        fn info(&self) -> &SubstrateInfo {
-            &self.info
-        }
-
-        async fn wait(&mut self) -> Result<SubstrateExit, ProvisionError> {
-            Err(ProvisionError::dataplane("gateway_worker", "fixture crash"))
-        }
-
-        async fn shutdown(&mut self) -> Result<(), ProvisionError> {
-            Ok(())
-        }
-    }
 
     #[derive(Debug, Default)]
     struct CountingExporter {
         events: Mutex<Vec<Event>>,
         flushes: AtomicUsize,
         fail_export: bool,
-        flush_failures_remaining: AtomicUsize,
     }
 
     #[async_trait]
@@ -625,34 +593,8 @@ mod tests {
 
         async fn flush(&self) -> Result<(), ExportError> {
             self.flushes.fetch_add(1, Ordering::SeqCst);
-            if self
-                .flush_failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return Err(ExportError::unavailable("fixture", "flush failed"));
-            }
             Ok(())
         }
-    }
-
-    fn substrate_info() -> SubstrateInfo {
-        SubstrateInfo::new(
-            NonZeroU16::new(15_001).expect("test port"),
-            1_500,
-            "169.254.254.1".parse().expect("test IPv4"),
-            "fd00:6869:6c6f:6f70::1"
-                .parse::<Ipv6Addr>()
-                .expect("test IPv6"),
-            "169.254.2.2".parse().expect("test host IPv4"),
-            "fd00:6869:6c6f:6f71::2"
-                .parse::<Ipv6Addr>()
-                .expect("test host IPv6"),
-            FragmentedUdpBehavior::Drop,
-        )
-        .expect("valid substrate info")
     }
 
     #[tokio::test]
@@ -662,30 +604,21 @@ mod tests {
             RunContext::new_local_root(),
             Arc::<CountingExporter>::clone(&fatal_exporter),
         );
-        let mut session = CrashingSession {
-            info: substrate_info(),
-        };
-        let wait_result = session.wait().await;
-        let relay_tail = Event::capture_fatal(
-            &RunContext::new_local_root(),
-            hiloop_core::identity::HlcClock::new().tick(),
-            hiloop_core::capture::CaptureFatalReason::DataplaneFailed,
-        );
-        fatal_exporter
-            .export(&[relay_tail])
-            .await
-            .expect("relay tail reaches the exporter before supervision completes");
-        let mut fatal = supervisor.finish_wait(wait_result).await;
+        let mut fatal = supervisor
+            .finish_wait(Err(ProvisionError::dataplane(
+                "gateway_worker",
+                "fixture crash",
+            )))
+            .await;
         let health = Event::new(
             &RunContext::new_local_root(),
             hiloop_core::identity::HlcClock::new().tick(),
             hiloop_core::event::SignalType::Net,
             hiloop_core::event::EventName::from_static("capture-health"),
         );
-        fatal_exporter
-            .export(&[health])
+        export_run_health(fatal_exporter.as_ref(), health)
             .await
-            .expect("capture health reaches the exporter before supervision completes");
+            .expect("capture health exports without flushing");
 
         flush_after_supervision(&mut fatal, fatal_exporter.as_ref())
             .await
@@ -702,7 +635,7 @@ mod tests {
                     .iter()
                     .map(|event| event.name.as_str())
                     .collect::<Vec<_>>(),
-                ["capture.fatal", "capture.fatal", "capture-health"]
+                ["capture.fatal", "capture-health"]
             );
             assert!(matches!(
                 &fatal,
@@ -728,14 +661,44 @@ mod tests {
             RunContext::new_local_root(),
             Arc::<CountingExporter>::clone(&export_failure),
         );
-        let mut session = CrashingSession {
-            info: substrate_info(),
-        };
-        let mut fatal = supervisor.finish_wait(session.wait().await).await;
+        let mut fatal = supervisor
+            .finish_wait(Err(ProvisionError::dataplane(
+                "gateway_worker",
+                "fixture crash",
+            )))
+            .await;
 
         flush_after_supervision(&mut fatal, export_failure.as_ref())
             .await
             .expect("composer flushes buffered events after fatal export fails");
         assert_eq!(export_failure.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Debug)]
+    struct SourceFlushFailure;
+
+    #[async_trait]
+    impl Exporter for SourceFlushFailure {
+        async fn export(&self, _events: &[Event]) -> Result<(), ExportError> {
+            Ok(())
+        }
+
+        async fn flush(&self) -> Result<(), ExportError> {
+            Err(ExportError::with_source(
+                "fixture",
+                "flush failed",
+                std::io::Error::other("disk full"),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn composer_flush_preserves_the_export_error_source() {
+        let mut normal = Ok::<SubstrateExit, SupervisedRunError>(SubstrateExit::Code(0));
+        let error = flush_after_supervision(&mut normal, &SourceFlushFailure)
+            .await
+            .expect_err("fixture flush fails");
+
+        assert!(error.chain().any(|cause| cause.to_string() == "disk full"));
     }
 }

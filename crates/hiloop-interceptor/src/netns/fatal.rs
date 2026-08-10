@@ -47,7 +47,7 @@ pub struct FatalRunError {
 enum FatalPersistence {
     Pending,
     Persisted,
-    Failed(ExportError),
+    Failed(Arc<ExportError>),
 }
 
 impl FatalRunError {
@@ -74,7 +74,7 @@ impl FatalRunError {
     /// Fatal-event export or flush failure, if durability could not be established.
     pub fn persistence_error(&self) -> Option<&ExportError> {
         match &self.persistence {
-            FatalPersistence::Failed(error) => Some(error),
+            FatalPersistence::Failed(error) => Some(error.as_ref()),
             FatalPersistence::Pending | FatalPersistence::Persisted => None,
         }
     }
@@ -140,7 +140,7 @@ impl FatalRunSupervisor {
                 ..
             }))
         ) {
-            Self::record_flush(&mut result, self.exporter.flush().await);
+            let _ = Self::record_flush(&mut result, self.exporter.flush().await);
         }
         result
     }
@@ -164,17 +164,19 @@ impl FatalRunSupervisor {
     pub(crate) fn record_flush(
         result: &mut Result<SubstrateExit, SupervisedRunError>,
         flush: Result<(), ExportError>,
-    ) {
+    ) -> Result<(), Arc<ExportError>> {
+        let flush = flush.map_err(Arc::new);
         let Err(SupervisedRunError::Fatal(error)) = result else {
-            return;
+            return flush;
         };
         if !matches!(error.persistence, FatalPersistence::Pending) {
-            return;
+            return flush;
         }
-        error.persistence = match flush {
+        error.persistence = match &flush {
             Ok(()) => FatalPersistence::Persisted,
-            Err(error) => FatalPersistence::Failed(error),
+            Err(error) => FatalPersistence::Failed(Arc::clone(error)),
         };
+        flush
     }
 
     async fn persist(
@@ -186,7 +188,7 @@ impl FatalRunSupervisor {
         let event = Event::capture_fatal(&self.context, self.clock.tick(), reason);
         let persistence = match self.exporter.export(&[event]).await {
             Ok(()) => FatalPersistence::Pending,
-            Err(error) => FatalPersistence::Failed(error),
+            Err(error) => FatalPersistence::Failed(Arc::new(error)),
         };
         FatalRunError {
             result,
