@@ -26,8 +26,9 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 - A shared, validated capture-completion report now produces the sole `capture.drain` Event-v1
   shape for local and embedded runtimes. Every controlled terminal path attempts it, including
-  zero-event runs and spawn failures; durable presence certifies completion, while absence means no
-  durable producer receipt. Transparent capture relays the workload report as typed state and
+  zero-event runs and spawn failures; durable presence certifies a terminal producer receipt, and
+  only `capture.complete=true` certifies complete settled capture. Absence means no durable producer
+  receipt. Transparent capture relays the workload report as typed state and
   merges it once with network and gateway delivery truth instead of emitting competing records.
   Fixed process, stdio, network, and OTLP source fields report platform-observed versus
   workload-reported trust, off-by-policy / unavailable / attached-no-data / full /
@@ -72,7 +73,7 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   (redelivering a judged batch cannot succeed); anything else gets one inline retry, then spools.
   An outage no longer aborts the capture pipeline, so local sinks (`--events-jsonl`) keep
   capturing through it, and the child is never blocked on a sink known to be down. At run end the
-  spool drains best-effort within the same bounded budget as the payload-blob drain; anything
+  spool drains best-effort within one bounded run-end budget; anything
   still undelivered is reported on stderr with counts instead of being dropped silently. The
   `capture.drain` health record is now emitted for every gRPC-exported run (previously only
   proxy-capturing runs) and gains `capture.events.dropped`, `capture.events.rejected`, and

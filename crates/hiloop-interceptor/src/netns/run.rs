@@ -399,39 +399,12 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
             CaptureSourceDegradation::OpaqueNetworkTraffic,
         )
     };
-    let events = if let Some(spool) = spool_report {
-        CaptureEventDelivery {
-            observed: spool
-                .delivered_events
-                .saturating_add(spool.pending_events as u64)
-                .saturating_add(spool.dropped_events)
-                .saturating_add(spool.rejected_events),
-            spooled: spool.spooled_events,
-            landed: spool.delivered_events,
-            dropped: spool.dropped_events,
-            rejected: spool.rejected_events,
-            pending: spool.pending_events as u64,
-        }
-    } else {
-        let fatal = result
-            .as_ref()
-            .err()
-            .map(SupervisedRunError::fatal_event_delivery)
-            .unwrap_or_default();
-        CaptureEventDelivery {
-            observed: relay_events
-                .observed
-                .saturating_add(fatal.observed)
-                .saturating_add(1),
-            landed: relay_events
-                .landed
-                .saturating_add(fatal.landed)
-                .saturating_add(1),
-            dropped: relay_events.dropped.saturating_add(fatal.dropped),
-            rejected: relay_events.rejected.saturating_add(fatal.rejected),
-            ..CaptureEventDelivery::default()
-        }
-    };
+    let fatal_events = result
+        .as_ref()
+        .err()
+        .map(SupervisedRunError::fatal_event_delivery)
+        .unwrap_or_default();
+    let events = transparent_event_delivery(spool_report, relay_events, fatal_events);
     let missing_inner = CaptureSourceReport::configured_unavailable(
         CaptureEvidenceTrust::PlatformObserved,
         CaptureSourceDegradation::RuntimeFailed,
@@ -542,6 +515,43 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
                 SubstrateExit::Signal(signal) => Ok(ExitCode::from(exit_byte(128 + signal.get()))),
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn transparent_event_delivery(
+    spool: Option<crate::spool::SpoolReport>,
+    relay: crate::netns::event_relay::RelayEventDelivery,
+    fatal: CaptureEventDelivery,
+) -> CaptureEventDelivery {
+    let producer_observed = relay
+        .observed
+        .saturating_add(fatal.observed)
+        .saturating_add(1); // capture.transport is exported directly by the host.
+    match spool {
+        Some(spool) => {
+            let spool_observed = spool
+                .delivered_events
+                .saturating_add(spool.pending_events as u64)
+                .saturating_add(spool.dropped_events)
+                .saturating_add(spool.rejected_events);
+            let pre_spool_dropped = producer_observed.saturating_sub(spool_observed);
+            CaptureEventDelivery {
+                observed: spool_observed.saturating_add(pre_spool_dropped),
+                spooled: spool.spooled_events,
+                landed: spool.delivered_events,
+                dropped: spool.dropped_events.saturating_add(pre_spool_dropped),
+                rejected: spool.rejected_events,
+                pending: spool.pending_events as u64,
+            }
+        }
+        None => CaptureEventDelivery {
+            observed: producer_observed,
+            landed: relay.landed.saturating_add(fatal.landed).saturating_add(1),
+            dropped: relay.dropped.saturating_add(fatal.dropped),
+            rejected: relay.rejected.saturating_add(fatal.rejected),
+            ..CaptureEventDelivery::default()
+        },
     }
 }
 
@@ -702,10 +712,14 @@ mod tests {
         identity::RunContext,
     };
 
-    use super::{export_run_completion, flush_after_supervision};
+    use super::{export_run_completion, flush_after_supervision, transparent_event_delivery};
     use crate::{
-        netns::{FatalRunSupervisor, ProvisionError, SubstrateExit, SupervisedRunError},
+        netns::{
+            FatalRunSupervisor, ProvisionError, SubstrateExit, SupervisedRunError,
+            event_relay::RelayEventDelivery,
+        },
         seams::{ExportError, Exporter},
+        spool::SpoolReport,
     };
 
     #[derive(Debug, Default)]
@@ -814,6 +828,45 @@ mod tests {
             .await
             .expect("normal completion flushes at the composer boundary");
         assert_eq!(normal_exporter.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn spooled_completion_counts_canceled_pre_admission_events_as_dropped() {
+        let events = transparent_event_delivery(
+            Some(SpoolReport {
+                delivered_events: 1,
+                ..SpoolReport::default()
+            }),
+            RelayEventDelivery {
+                observed: 1,
+                dropped: 1,
+                ..RelayEventDelivery::default()
+            },
+            CaptureEventDelivery::default(),
+        );
+
+        assert_eq!(
+            events,
+            CaptureEventDelivery {
+                observed: 2,
+                landed: 1,
+                dropped: 1,
+                ..CaptureEventDelivery::default()
+            }
+        );
+        CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            ),
+            events,
+            None,
+            None,
+            Some("fixture cancellation".to_owned()),
+        )
+        .expect("balanced spooled completion accounting");
     }
 
     #[tokio::test]

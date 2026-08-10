@@ -465,19 +465,16 @@ impl<E: Exporter> Exporter for SpoolingExporter<E> {
             report: report.clone(),
         });
         state.terminal_seen = true;
-        if !state.in_backoff() {
-            let _ = self.deliver_all(&mut state).await;
-        }
         Ok(())
     }
 
-    /// Best-effort: redeliver the backlog when the backoff allows, then flush the
-    /// inner exporter. Events still spooled after an outage-time flush stay parked
-    /// for the run-end [`drain`](SpoolingExporter::drain).
+    /// Best-effort: redeliver the ordinary backlog when the backoff allows, then flush the inner
+    /// exporter. The terminal lane is attempted only by the one final run-end
+    /// [`drain`](SpoolingExporter::drain), which owns its bounded retry budget.
     async fn flush(&self) -> Result<(), ExportError> {
         let mut state = self.state.lock().await;
-        if (!state.queue.is_empty() || state.terminal.is_some()) && !state.in_backoff() {
-            let _ = self.deliver_all(&mut state).await;
+        if !state.queue.is_empty() && !state.in_backoff() {
+            let _ = self.deliver_queue(&mut state).await;
         }
         drop(state);
         self.inner.flush().await
@@ -809,7 +806,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn canceled_completion_delivery_remains_pending_for_final_drain() {
+    async fn completion_admission_defers_delivery_to_the_final_drain() {
         let sink = FakeSink::scripted([Respond::Hang, Respond::Deliver]);
         let spool = SpoolingExporter::new(sink, fast_policy());
         let completion = completion_with_delivery(CaptureEventDelivery::default());
@@ -821,15 +818,18 @@ mod tests {
             },
         );
 
-        let canceled = tokio::time::timeout(
-            Duration::from_secs(1),
-            spool.export_completion(&completion_event, &completion),
-        )
-        .await;
-        assert!(canceled.is_err(), "outer deadline cancels the hung attempt");
+        spool
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("admit completion");
         assert!(spool.report().await.completion_pending);
+        assert_eq!(
+            spool.inner.calls(),
+            0,
+            "admission does not spend retry budget"
+        );
 
-        let report = spool.drain(&fast_drain(1)).await;
+        let report = spool.drain(&fast_drain(2)).await;
         assert!(report.is_clean());
         assert_eq!(
             spool.inner.delivered_flat()[0].name.as_str(),
@@ -858,6 +858,8 @@ mod tests {
             .await
             .expect_err("post-terminal data is rejected");
         assert!(matches!(error, ExportError::Rejected { .. }));
+        assert!(spool.inner.delivered_flat().is_empty());
+        assert!(spool.drain(&fast_drain(1)).await.is_clean());
         assert_eq!(spool.inner.delivered_flat().len(), 1);
     }
 

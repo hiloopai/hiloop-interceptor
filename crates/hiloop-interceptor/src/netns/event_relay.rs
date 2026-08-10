@@ -379,7 +379,9 @@ async fn record_relay_attempt(capture: &RelayCaptureReport, events: &[Event]) {
     let raw_source = AttributeKey::from_static(provenance_keys::RAW_SOURCE);
     let l7_capture = AttributeKey::from_static(L7_CAPTURE);
     let mut state = capture.state.lock().await;
-    state.events.observed = state.events.observed.saturating_add(events.len() as u64);
+    let count = events.len() as u64;
+    state.events.observed = state.events.observed.saturating_add(count);
+    state.events.dropped = state.events.dropped.saturating_add(count);
     for event in events {
         let proxy_source = matches!(
             event.attributes.get(&raw_source),
@@ -407,11 +409,15 @@ async fn record_relay_outcome(
     let mut state = capture.state.lock().await;
     let count = count as u64;
     match result {
-        Ok(()) => state.events.landed = state.events.landed.saturating_add(count),
+        Ok(()) => {
+            state.events.dropped = state.events.dropped.saturating_sub(count);
+            state.events.landed = state.events.landed.saturating_add(count);
+        }
         Err(ExportError::Rejected { .. }) => {
+            state.events.dropped = state.events.dropped.saturating_sub(count);
             state.events.rejected = state.events.rejected.saturating_add(count);
         }
-        Err(_) => state.events.dropped = state.events.dropped.saturating_add(count),
+        Err(_) => {}
     }
 }
 
@@ -468,13 +474,26 @@ mod tests {
 
     use super::*;
     use crate::seams::testing::MemoryExporter;
+    use tokio::sync::Notify;
 
     struct FailingExporter;
+
+    struct HangingExporter {
+        entered: Arc<Notify>,
+    }
 
     #[async_trait]
     impl Exporter for FailingExporter {
         async fn export(&self, _events: &[Event]) -> Result<(), ExportError> {
             Err(ExportError::unavailable("fixture", "write failed"))
+        }
+    }
+
+    #[async_trait]
+    impl Exporter for HangingExporter {
+        async fn export(&self, _events: &[Event]) -> Result<(), ExportError> {
+            self.entered.notify_one();
+            std::future::pending().await
         }
     }
 
@@ -694,6 +713,66 @@ mod tests {
 
         shutdown_tx.send(()).expect("send shutdown");
         task.await.expect("relay task").expect("relay server");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_an_inflight_export_as_a_conservative_drop() {
+        let directory = tempfile::tempdir().expect("relay directory");
+        let path = directory.path().join("events.sock");
+        let entered = Arc::new(Notify::new());
+        let server = EventRelayServer::bind(
+            &path,
+            Arc::new(HangingExporter {
+                entered: Arc::clone(&entered),
+            }),
+            "gateway-token".to_owned(),
+            "workload-token".to_owned(),
+        )
+        .expect("bind relay");
+        let capture = server.capture_report();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(server.serve(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let relay = EventRelayExporter::connect_gateway(&path, "gateway-token".to_owned())
+            .await
+            .expect("connect relay");
+        let export_task = tokio::spawn(async move {
+            relay
+                .export(&[Event::new(
+                    &RunContext::new_local_root(),
+                    Hlc {
+                        wall_ns: 1,
+                        logical: 0,
+                    },
+                    SignalType::Net,
+                    EventName::from_static("fixture.hanging"),
+                )])
+                .await
+        });
+
+        entered.notified().await;
+        shutdown_tx.send(()).expect("send shutdown");
+        server_task
+            .await
+            .expect("relay task")
+            .expect("relay server");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), export_task)
+                .await
+                .expect("client observes relay shutdown")
+                .expect("join export")
+                .is_err()
+        );
+        assert_eq!(
+            capture.events().await,
+            RelayEventDelivery {
+                observed: 1,
+                landed: 0,
+                dropped: 1,
+                rejected: 0,
+            }
+        );
     }
 
     #[tokio::test]

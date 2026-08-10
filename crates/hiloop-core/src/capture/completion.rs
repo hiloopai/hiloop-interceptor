@@ -255,7 +255,8 @@ pub struct CaptureEventDelivery {
     pub spooled: u64,
     /// Events confirmed durable or ordered ahead of this durable completion record.
     pub landed: u64,
-    /// Events evicted when the bounded spool filled.
+    /// Events not confirmed by the authoritative sink, including pre-spool delivery failures
+    /// and events evicted when bounded retry storage filled.
     pub dropped: u64,
     /// Events permanently rejected by the sink.
     pub rejected: u64,
@@ -354,11 +355,7 @@ impl CaptureCompletionReport {
         if events.spooled > events.observed {
             return Err(CaptureCompletionError::SpoolAccounting);
         }
-        let accounted_spooled = events
-            .pending
-            .checked_add(events.dropped)
-            .ok_or(CaptureCompletionError::SpoolAccounting)?;
-        if accounted_spooled > events.spooled {
+        if events.pending > events.spooled {
             return Err(CaptureCompletionError::SpoolAccounting);
         }
         if let Some(blobs) = blobs {
@@ -782,6 +779,29 @@ mod tests {
             ),
             Err(CaptureCompletionError::BlobAccounting)
         );
+    }
+
+    #[test]
+    fn completion_validation_accepts_a_pre_spool_drop() {
+        let report = CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            ),
+            CaptureEventDelivery {
+                observed: 1,
+                dropped: 1,
+                ..CaptureEventDelivery::default()
+            },
+            None,
+            None,
+            Some("delivery canceled before spool admission".to_owned()),
+        )
+        .expect("pre-spool loss is valid terminal accounting");
+
+        assert!(!report.is_complete());
     }
 
     #[test]
