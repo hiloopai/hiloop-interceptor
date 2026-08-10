@@ -671,8 +671,13 @@ impl CaptureHandler {
         if request.method() == Method::CONNECT {
             if self.connect_destination.is_some()
                 && self.bound_https_relay.as_ref().is_some_and(|relay| {
-                    canonical_authority(&request)
-                        .is_some_and(|destination| relay.contains_host(destination.host()))
+                    self.connect_destination
+                        .as_ref()
+                        .is_some_and(|destination| {
+                            relay.route_connect(destination) == RelayRoute::Bound
+                        })
+                        || canonical_authority(&request)
+                            .is_some_and(|destination| relay.contains_host(destination.host()))
                         || relay.request_mentions_bound_host(&request)
                 })
             {
@@ -714,11 +719,15 @@ impl CaptureHandler {
         // (missing, or crafted to defeat the parser) must be DENIED, never forwarded —
         // otherwise an unparseable host would skip the deny-by-default policy entirely.
         let Some(destination) = destination else {
-            if self
-                .bound_https_relay
-                .as_ref()
-                .is_some_and(|relay| relay.request_mentions_bound_host(&request))
-            {
+            if self.bound_https_relay.as_ref().is_some_and(|relay| {
+                relay.request_mentions_bound_host(&request)
+                    || self
+                        .connect_destination
+                        .as_ref()
+                        .is_some_and(|destination| {
+                            relay.route_connect(destination) == RelayRoute::Bound
+                        })
+            }) {
                 self.emit_secret_egress_denied_without_host("ambiguous_authority");
                 return forbidden().into();
             }

@@ -180,6 +180,18 @@ async fn malformed_websocket_alternate_port_and_missing_proof_fail_closed() {
     let (connected, _rx, _store) = connected_handler(&proof_file).await;
     let requests = [
         Request::builder()
+            .method(Method::CONNECT)
+            .uri("other.example.com:443")
+            .header(HOST, "other.example.com:443")
+            .body(Body::empty())
+            .expect("nested CONNECT"),
+        Request::builder()
+            .method("GET")
+            .uri("/")
+            .header(HOST, "api.example.com malformed")
+            .body(Body::empty())
+            .expect("malformed selected authority"),
+        Request::builder()
             .method("GET")
             .uri("https://api.example.com:444/path")
             .header(HOST, "api.example.com:444")
@@ -226,6 +238,47 @@ async fn malformed_websocket_alternate_port_and_missing_proof_fail_closed() {
             .await,
     );
     assert_eq!(denied.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn bound_upstream_abort_omits_target_and_error_detail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_file = dir.path().join("proof");
+    tokio::fs::write(&proof_file, b"proof")
+        .await
+        .expect("proof");
+    let (mut handler, mut rx, _store) = connected_handler(&proof_file).await;
+    let forwarded = expect_forwarded(
+        handler
+            .on_request(
+                Request::builder()
+                    .method("GET")
+                    .uri("https://api.example.com/private?credential=CANARY")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await,
+    );
+    let _ = forwarded
+        .into_body()
+        .collect()
+        .await
+        .expect("drain request");
+    let _request = rx.recv().await.expect("request signal").expect("raw");
+
+    handler
+        .on_upstream_error("upstream_error", "relay leaked CANARY".to_owned())
+        .await;
+    let abort = rx.recv().await.expect("abort signal").expect("raw");
+    assert_eq!(abort.kind, ABORT_KIND);
+    assert!(!abort.attributes.contains_key("http.target"));
+    assert!(!abort.attributes.contains_key(ABORT_DETAIL_ATTR));
+    assert!(
+        abort
+            .attributes
+            .values()
+            .all(|value| !value.contains("CANARY"))
+    );
 }
 
 #[derive(Debug)]
