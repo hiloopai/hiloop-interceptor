@@ -12,7 +12,7 @@ repository = "https://github.com/hiloopai/hiloop-interceptor"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 blake3 = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -20,7 +20,7 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 futures-core = "0.3"
 futures-util = "0.3"
 hiloop-core = { version = "0.1.0", path = "crates/hiloop-core" }
-hudsucker = { version = "0.24", features = ["http2"] }
+hudsucker = { version = "0.25", features = ["http2"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 # `client-legacy` powers the proxy and transparent gateway upstream clients.
@@ -60,7 +60,7 @@ tower-service = "0.3"
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots", "tls-webpki-roots"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
-ulid = { version = "1", features = ["serde"] }
+ulid = { version = "3", features = ["serde"] }
 x509-parser = "0.18"
 
 [workspace.lints.rust]
