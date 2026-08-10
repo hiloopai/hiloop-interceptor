@@ -203,18 +203,22 @@ streams a frame at a time.
 
 **Sensitive auth omission and capture-side redaction (shipped).** Exact supported Claude and Codex
 OAuth token exchanges are classified from method, canonical host, and path before any body DATA is
-captured. Their request and response bytes still stream unchanged, but telemetry stores only the
-method, query-free target, status, content metadata, wire-byte counts, exchange id, and
+captured. Their request and response bytes forward unchanged (unless an explicit block-on-match
+anomaly policy rejects the request before origin contact), but telemetry stores only the method,
+query-free target, status, content metadata, wire-byte counts, exchange id, and
 `http.capture.body_omitted=oauth_token_exchange`; it never creates a body blob or inline fallback.
 This omission remains active with `--no-redact` because opaque refresh tokens cannot be reliably
-recognized from their bytes.
+recognized from their bytes. Audit-only anomaly inspection remains incremental; block-on-match mode
+temporarily buffers the request for its pre-forward decision without capturing or storing it.
 
 All other captured bodies are redacted on by default using `leakguard`'s credential detectors plus
 Hiloop's own token format. The enabled set covers provider/platform keys, JWTs, URL credentials,
 private keys, and common service tokens; broad PII and generic-entropy detectors stay disabled to
 preserve useful telemetry. Matches become `[REDACTED]` only in the captured copy, never in bytes
 forwarded to the origin. This pass is best-effort: unrecognized opaque values and bytes beyond the
-capture cap are not scrubbed. Disable it per run with `--no-redact`.
+capture cap are not scrubbed. Binary bytes are preserved while adjacent valid UTF-8 runs are still
+scanned, so one framing byte cannot disable credential scrubbing for the rest of a body. Disable it
+per run with `--no-redact`.
 
 **Request/response correlation (shipped).** Each non-`CONNECT` exchange gets a minted ULID
 `http.exchange_id` stamped on both its request and response events. (It was originally a

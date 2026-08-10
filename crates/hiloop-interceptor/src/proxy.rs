@@ -723,10 +723,11 @@ impl CaptureHandler {
     ///
     /// - a body that has already ended (`is_end_stream`): collecting it cannot block,
     ///   and the forwarded body keeps its exact wire shape;
-    /// - a full-capture body under block-on-match anomaly mode: rejecting a request
+    /// - any body under block-on-match anomaly mode: rejecting a request
     ///   *before* the origin sees it requires inspecting the whole body pre-forward —
     ///   store-and-forward is that contract, a tee streaming prefixes upstream would
-    ///   defeat the block. Metadata-only exchanges skip body inspection and keep streaming.
+    ///   defeat the block. Metadata-only exchanges still omit storage; audit-only
+    ///   anomaly inspection stays streaming.
     async fn capture_request(&mut self, request: Request<Body>) -> RequestOrResponse {
         use hudsucker::hyper::body::Body as _;
 
@@ -763,8 +764,7 @@ impl CaptureHandler {
             attributes.push(("http.request.content_type", content_type.clone()));
         }
 
-        let buffers_for_anomaly =
-            matches!(disposition, CaptureDisposition::Full) && self.anomaly.blocks_on_match();
+        let buffers_for_anomaly = self.anomaly.blocks_on_match();
         if buffers_for_anomaly || body.is_end_stream() {
             return self
                 .capture_request_buffered(parts, body, attributes, content_type)
@@ -773,13 +773,11 @@ impl CaptureHandler {
 
         // The scan observes every forwarded byte — past the capture cap — so a capped
         // capture cannot hide a large upload from (audit-mode) anomaly evaluation.
-        let inspection = matches!(disposition, CaptureDisposition::Full)
-            .then(|| RequestBodyInspection {
-                config: Arc::clone(&self.anomaly),
-                method,
-                scan: BodyScan::default(),
-            })
-            .filter(|_| self.anomaly.is_enabled());
+        let inspection = self.anomaly.is_enabled().then(|| RequestBodyInspection {
+            config: Arc::clone(&self.anomaly),
+            method,
+            scan: BodyScan::default(),
+        });
         let teed = self.tee_body(REQUEST_TEE, attributes, content_type, inspection, body);
         Request::from_parts(parts, teed).into()
     }
@@ -804,6 +802,16 @@ impl CaptureHandler {
         let (bytes, mut truncated) = collect_body(body).await;
 
         if let CaptureDisposition::MetadataOnly(sensitive) = self.exchange_disposition {
+            let flags =
+                self.anomaly
+                    .inspect(parts.method.as_str(), content_type.as_deref(), &bytes);
+            let blocked = !flags.is_empty() && self.anomaly.blocks_on_match();
+            if !flags.is_empty() {
+                attributes.push((FLAGGED_ATTR, join_flag_names(&flags)));
+            }
+            if blocked {
+                attributes.push((BLOCKED_ATTR, "true".to_owned()));
+            }
             let raw = metadata_only_signal(
                 &self.clock,
                 REQUEST_TEE,
@@ -813,6 +821,10 @@ impl CaptureHandler {
                 truncated,
             );
             let _ = self.sink.send(raw).await;
+            if blocked {
+                self.abort_reason = Some("blocked");
+                return forbidden().into();
+            }
             return Request::from_parts(parts, Body::from(bytes)).into();
         }
 
@@ -1195,11 +1207,11 @@ impl TeeState {
         // bounded, the true transfer size is not. The anomaly scan likewise observes
         // every byte, so the cap cannot hide a large upload from detection.
         self.wire_bytes = self.wire_bytes.saturating_add(data.len() as u64);
-        if matches!(self.disposition, CaptureDisposition::MetadataOnly(_)) {
-            return;
-        }
         if let Some(inspection) = &mut self.inspection {
             inspection.scan.observe(data);
+        }
+        if matches!(self.disposition, CaptureDisposition::MetadataOnly(_)) {
+            return;
         }
         if self.capped {
             return;
@@ -1345,6 +1357,12 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         wire_bytes,
     } = args;
 
+    if let Some(flag) =
+        inspection.and_then(|inspection| inspection.flag_attribute(media_type.as_deref()))
+    {
+        attributes.push(flag);
+    }
+
     if let CaptureDisposition::MetadataOnly(sensitive) = disposition {
         return metadata_only_signal(
             clock,
@@ -1368,11 +1386,6 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         &stored,
         channel.direction,
     );
-    if let Some(flag) =
-        inspection.and_then(|inspection| inspection.flag_attribute(media_type.as_deref()))
-    {
-        attributes.push(flag);
-    }
     let size = stored.len() as u64;
     let payload_ref = match offload_bytes(blob_store, &stored, media_type.as_deref()).await {
         Ok(payload_ref) => Some(payload_ref),
@@ -3442,7 +3455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_omission_precedes_capture_caps_redaction_and_anomaly_inspection() {
+    async fn oauth_omission_preserves_anomaly_blocking_without_storing_the_body() {
         let anomaly = Arc::new(
             AnomalyConfig::enabled()
                 .with_max_upload_bytes(1)
@@ -3461,6 +3474,42 @@ mod tests {
             .body(Body::from(body.clone()))
             .expect("request");
 
+        let response = expect_response(handler.on_request(request).await);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let signal = rx.recv().await.expect("request signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get(BODY_OMITTED_ATTR).map(String::as_str),
+            Some("oauth_token_exchange")
+        );
+        assert_eq!(
+            signal.attributes.get(FLAGGED_ATTR).map(String::as_str),
+            Some("upload_shaped_request")
+        );
+        assert_eq!(
+            signal.attributes.get(BLOCKED_ATTR).map(String::as_str),
+            Some("true")
+        );
+        assert!(!signal.attributes.contains_key(TRUNCATED_ATTR));
+        assert!(signal.payload_ref().is_none());
+        assert!(store.blobs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn oauth_omission_preserves_streaming_anomaly_audit_without_storing_the_body() {
+        let anomaly = Arc::new(AnomalyConfig::enabled().with_max_upload_bytes(1));
+        let (mut handler, mut rx, store) = handler_with_anomaly(
+            Some(0),
+            RedactionPolicy::disabled(),
+            Arc::new(EgressPolicy::default()),
+            anomaly,
+        );
+        let body = Bytes::from_static(b"synthetic-refresh-token");
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://auth.openai.com/oauth/token")
+            .body(Body::from(body.clone()))
+            .expect("request");
+
         let forwarded = expect_forwarded(handler.on_request(request).await);
         assert_eq!(drain_body(forwarded.into_body()).await.concat(), body);
         let signal = rx.recv().await.expect("request signal").expect("raw");
@@ -3468,9 +3517,11 @@ mod tests {
             signal.attributes.get(BODY_OMITTED_ATTR).map(String::as_str),
             Some("oauth_token_exchange")
         );
-        assert!(!signal.attributes.contains_key(FLAGGED_ATTR));
+        assert_eq!(
+            signal.attributes.get(FLAGGED_ATTR).map(String::as_str),
+            Some("upload_shaped_request")
+        );
         assert!(!signal.attributes.contains_key(BLOCKED_ATTR));
-        assert!(!signal.attributes.contains_key(TRUNCATED_ATTR));
         assert!(signal.payload_ref().is_none());
         assert!(store.blobs().is_empty());
     }
@@ -3947,38 +3998,6 @@ mod tests {
         )
         .await
         .expect("on_request must not wait for request-body EOF (streaming deadlock)");
-        let _forwarded = expect_forwarded(outcome);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn oauth_request_streams_even_when_anomaly_blocking_is_enabled() {
-        let anomaly = Arc::new(
-            AnomalyConfig::enabled()
-                .with_max_upload_bytes(1)
-                .with_block_on_match(true),
-        );
-        let (mut handler, _rx, _store) = handler_with_anomaly(
-            None,
-            RedactionPolicy::enabled(),
-            Arc::new(EgressPolicy::default()),
-            anomaly,
-        );
-        let (frame_tx, body) = channel_body();
-        let request = Request::builder()
-            .method("POST")
-            .uri("https://auth.openai.com/oauth/token")
-            .body(body)
-            .expect("request");
-        frame_tx
-            .try_send(Bytes::from_static(b"refresh_token=synthetic"))
-            .expect("send first frame");
-
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            handler.on_request(request),
-        )
-        .await
-        .expect("metadata-only OAuth must bypass store-and-forward anomaly inspection");
         let _forwarded = expect_forwarded(outcome);
     }
 

@@ -13,6 +13,8 @@
 //! Scope and limits — this is best-effort, not a proof of absence:
 //! - only recognized credential shapes are matched; secrets in an unrecognized format
 //!   pass through;
+//! - binary bytes are preserved, while recognized credentials in adjacent valid UTF-8
+//!   text runs are still scrubbed;
 //! - bytes beyond the proxy's capture cap (a finite default, configurable, bounding
 //!   interceptor memory) are never captured, so they are neither persisted nor scanned;
 //! - bodies are telemetry-only (never forwarded), so a rare false positive corrupts a
@@ -146,14 +148,12 @@ impl RedactionPolicy {
 }
 
 /// Scrub every credential match from `body`, replacing each with
-/// [`REDACTION_PLACEHOLDER`]. Returns the input untouched when nothing matches or
-/// when the body is not UTF-8 text.
+/// [`REDACTION_PLACEHOLDER`]. Binary bytes are preserved; every valid UTF-8 run is
+/// scanned independently so binary framing cannot disable scrubbing for the rest of
+/// the captured body. Returns the input untouched when nothing matches.
 #[must_use]
 pub fn redact_body(body: Bytes) -> Bytes {
-    let Ok(input) = std::str::from_utf8(&body) else {
-        return body;
-    };
-    let matches = BODY_REDACTOR.find(input);
+    let matches = body_matches(&body);
     if matches.is_empty() {
         return body;
     }
@@ -173,6 +173,33 @@ pub fn redact_body(body: Bytes) -> Bytes {
     }
     scrubbed.extend_from_slice(&body[cursor..]);
     Bytes::from(scrubbed)
+}
+
+fn body_matches(body: &[u8]) -> Vec<Match> {
+    let mut matches = Vec::new();
+    let mut cursor = 0;
+    while cursor < body.len() {
+        let (valid, invalid_len) = match std::str::from_utf8(&body[cursor..]) {
+            Ok(valid) => (valid, 0),
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                let valid = std::str::from_utf8(&body[cursor..cursor + valid_len])
+                    .expect("Utf8Error::valid_up_to identifies valid UTF-8");
+                let invalid_len = error.error_len().unwrap_or(body.len() - cursor - valid_len);
+                (valid, invalid_len)
+            }
+        };
+        matches.extend(
+            BODY_REDACTOR.find(valid).into_iter().map(|matched| {
+                Match::new(matched.kind, cursor + matched.start, cursor + matched.end)
+            }),
+        );
+        cursor += valid.len() + invalid_len;
+        if invalid_len == 0 {
+            break;
+        }
+    }
+    matches
 }
 
 #[cfg(test)]
@@ -315,8 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_is_preserved() {
-        let body = Bytes::from_static(b"sk-abc1234567890xyz\xff");
-        assert_eq!(redact_body(body.clone()), body);
+    fn invalid_utf8_does_not_hide_credentials_in_valid_text_runs() {
+        let body = Bytes::from_static(b"\xffsk-abc1234567890xyzABCDEF\xfe");
+        assert_eq!(redact_body(body), Bytes::from_static(b"\xff[REDACTED]\xfe"));
     }
 }
