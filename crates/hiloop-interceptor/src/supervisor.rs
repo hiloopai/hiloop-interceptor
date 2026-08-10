@@ -51,7 +51,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::{ExitCode, ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::Poll,
     time::{Duration, Instant},
 };
@@ -740,6 +740,71 @@ struct CapturedRun {
     drain_warnings: Vec<anyhow::Error>,
 }
 
+struct DeliveryAccountingExporter<'a, E: ?Sized> {
+    inner: &'a E,
+    events: Mutex<CaptureEventDelivery>,
+}
+
+impl<'a, E: ?Sized> DeliveryAccountingExporter<'a, E> {
+    fn new(inner: &'a E) -> Self {
+        Self {
+            inner,
+            events: Mutex::new(CaptureEventDelivery::default()),
+        }
+    }
+
+    fn events(&self) -> CaptureEventDelivery {
+        *self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl<E: Exporter + ?Sized> Exporter for DeliveryAccountingExporter<'_, E> {
+    async fn export(&self, events: &[Event]) -> Result<(), crate::seams::ExportError> {
+        let count = events.len() as u64;
+        {
+            let mut delivery = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            delivery.observed = delivery.observed.saturating_add(count);
+            delivery.dropped = delivery.dropped.saturating_add(count);
+        }
+        let result = self.inner.export(events).await;
+        let mut delivery = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &result {
+            Ok(()) => {
+                delivery.dropped = delivery.dropped.saturating_sub(count);
+                delivery.landed = delivery.landed.saturating_add(count);
+            }
+            Err(crate::seams::ExportError::Rejected { .. }) => {
+                delivery.dropped = delivery.dropped.saturating_sub(count);
+                delivery.rejected = delivery.rejected.saturating_add(count);
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    async fn flush(&self) -> Result<(), crate::seams::ExportError> {
+        self.inner.flush().await
+    }
+
+    async fn export_completion(
+        &self,
+        event: &Event,
+        report: &CaptureCompletionReport,
+    ) -> Result<(), crate::seams::ExportError> {
+        self.inner.export_completion(event, report).await
+    }
+}
+
 impl CapturedRun {
     /// Report drain warnings on stderr and yield the child's exit code.
     fn into_exit_code(self) -> ExitCode {
@@ -760,6 +825,8 @@ async fn run_captured<E>(
 where
     E: Exporter,
 {
+    let delivery_accounting = DeliveryAccountingExporter::new(exporter);
+    let exporter = &delivery_accounting;
     let clock = Arc::new(hiloop_core::identity::HlcClock::new());
 
     // Bind capture servers before spawning so the child env can point at them.
@@ -875,35 +942,22 @@ where
         Ok(child) => child,
         Err(error) => {
             let event = spawn_failure_event(options, clock.tick(), &error);
-            if let Err(warning) = export_supervisor_record(
+            let spawn_delivery_error = export_supervisor_record(
                 exporter,
                 event,
                 "spawn-failure",
                 SPAWN_FAILURE_EXPORT_TIMEOUT,
             )
             .await
-            {
+            .err();
+            if let Some(warning) = &spawn_delivery_error {
                 eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
             }
             let spool_report = match event_spool {
                 Some(spool) => Some(spool.drain(&options.blob_drain_retry).await),
                 None => None,
             };
-            let events = match spool_report {
-                Some(spool) => CaptureEventDelivery {
-                    observed: 1,
-                    spooled: spool.spooled_events,
-                    landed: spool.delivered_events,
-                    dropped: spool.dropped_events,
-                    rejected: spool.rejected_events,
-                    pending: spool.pending_events as u64,
-                },
-                None => CaptureEventDelivery {
-                    observed: 1,
-                    landed: 1,
-                    ..CaptureEventDelivery::default()
-                },
-            };
+            let events = completion_event_delivery(spool_report, delivery_accounting.events());
             let report = CaptureCompletionReport::new(
                 CaptureSourcesReport::new(
                     CaptureSourceReport::attached_full(CaptureEvidenceTrust::PlatformObserved, 1),
@@ -926,7 +980,7 @@ where
                 events,
                 None,
                 gateway_credential.map(GatewayCredential::refreshes),
-                None,
+                spawn_delivery_error.map(|error| format!("{error:#}")),
             )
             .expect("spawn-failure completion accounting is valid");
             let context = NormalizationContext::new(options.context.clone())
@@ -1292,6 +1346,7 @@ where
         proxy_failed,
         blob_outcome: blob_outcome.as_ref(),
         spool_report,
+        direct_delivery: delivery_accounting.events(),
         auth_refreshes: gateway_credential.map(GatewayCredential::refreshes),
         error: (!terminal_errors.is_empty()).then(|| terminal_errors.join("; ")),
     });
@@ -1429,6 +1484,7 @@ struct CompletionReportInput<'a> {
     proxy_failed: bool,
     blob_outcome: Option<&'a BlobDrainOutcome>,
     spool_report: Option<SpoolReport>,
+    direct_delivery: CaptureEventDelivery,
     auth_refreshes: Option<u64>,
     error: Option<String>,
 }
@@ -1443,28 +1499,11 @@ fn completion_report(input: CompletionReportInput<'_>) -> CaptureCompletionRepor
         proxy_failed,
         blob_outcome,
         spool_report,
+        direct_delivery,
         auth_refreshes,
         error,
     } = input;
-    let events = match spool_report {
-        Some(spool) => CaptureEventDelivery {
-            observed: spool
-                .delivered_events
-                .saturating_add(spool.dropped_events)
-                .saturating_add(spool.rejected_events)
-                .saturating_add(spool.pending_events as u64),
-            spooled: spool.spooled_events,
-            landed: spool.delivered_events,
-            dropped: spool.dropped_events,
-            rejected: spool.rejected_events,
-            pending: spool.pending_events as u64,
-        },
-        None => CaptureEventDelivery {
-            observed: pipeline_report.map_or(0, |report| report.events as u64),
-            landed: pipeline_report.map_or(0, |report| report.events as u64),
-            ..CaptureEventDelivery::default()
-        },
-    };
+    let events = completion_event_delivery(spool_report, direct_delivery);
     CaptureCompletionReport::new(
         CaptureSourcesReport::new(
             source_report(
@@ -1508,6 +1547,29 @@ fn completion_report(input: CompletionReportInput<'_>) -> CaptureCompletionRepor
         error,
     )
     .expect("capture completion accounting is valid")
+}
+
+fn completion_event_delivery(
+    spool: Option<SpoolReport>,
+    direct: CaptureEventDelivery,
+) -> CaptureEventDelivery {
+    let Some(spool) = spool else {
+        return direct;
+    };
+    let spool_observed = spool
+        .delivered_events
+        .saturating_add(spool.dropped_events)
+        .saturating_add(spool.rejected_events)
+        .saturating_add(spool.pending_events as u64);
+    let pre_spool_dropped = direct.observed.saturating_sub(spool_observed);
+    CaptureEventDelivery {
+        observed: spool_observed.saturating_add(pre_spool_dropped),
+        spooled: spool.spooled_events,
+        landed: spool.delivered_events,
+        dropped: spool.dropped_events.saturating_add(pre_spool_dropped),
+        rejected: spool.rejected_events,
+        pending: spool.pending_events as u64,
+    }
 }
 
 /// Render event-spool loss/backlog as the run's export warning, or `None` when the
@@ -2544,6 +2606,12 @@ mod tests {
     #[derive(Debug)]
     struct FailingExporter;
 
+    #[derive(Debug, Default)]
+    struct FailFirstExporter {
+        exports: std::sync::atomic::AtomicUsize,
+        completions: Mutex<Vec<Event>>,
+    }
+
     #[async_trait]
     impl Exporter for FailingExporter {
         async fn export(
@@ -2554,6 +2622,38 @@ mod tests {
                 "failing",
                 "intentional test failure",
             ))
+        }
+    }
+
+    #[async_trait]
+    impl Exporter for FailFirstExporter {
+        async fn export(
+            &self,
+            _events: &[Event],
+        ) -> std::result::Result<(), crate::seams::ExportError> {
+            if self
+                .exports
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return Err(crate::seams::ExportError::unavailable(
+                    "fixture",
+                    "first export failed",
+                ));
+            }
+            Ok(())
+        }
+
+        async fn export_completion(
+            &self,
+            event: &Event,
+            _report: &CaptureCompletionReport,
+        ) -> std::result::Result<(), crate::seams::ExportError> {
+            self.completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event.clone());
+            Ok(())
         }
     }
 
@@ -2958,6 +3058,7 @@ mod tests {
                 error: None,
             }),
             spool_report: Some(SpoolReport::default()),
+            direct_delivery: CaptureEventDelivery::default(),
             auth_refreshes: Some(0),
             error: None,
         });
@@ -3017,6 +3118,7 @@ mod tests {
                 rejected_events: 1,
                 ..SpoolReport::default()
             }),
+            direct_delivery: CaptureEventDelivery::default(),
             auth_refreshes: Some(1),
             error: None,
         });
@@ -3070,6 +3172,7 @@ mod tests {
                 rejected_events: 0,
                 ..SpoolReport::default()
             }),
+            direct_delivery: CaptureEventDelivery::default(),
             auth_refreshes: None,
             error: None,
         });
@@ -3108,6 +3211,7 @@ mod tests {
             proxy_failed: false,
             blob_outcome: None,
             spool_report: None,
+            direct_delivery: CaptureEventDelivery::default(),
             auth_refreshes: None,
             error: Some("stdout capture stopped".to_owned()),
         });
@@ -3224,6 +3328,68 @@ mod tests {
                 .is_none(),
             "a child that never spawned has no pid"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_export_failure_is_reported_as_dropped_in_the_completion_receipt() {
+        let options = base_options(vec![
+            "/definitely/not/a/hiloop-test-command".to_owned(),
+            "arg".to_owned(),
+        ]);
+        let exporter = FailFirstExporter::default();
+
+        let result = Box::pin(run_captured(&options, &exporter, None, None, None)).await;
+        assert!(
+            result.is_err(),
+            "missing command fails after capture completion"
+        );
+
+        let completions = exporter
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(completions.len(), 1);
+        let value = serde_json::to_value(&completions[0]).expect("completion event json");
+        assert_eq!(value["attributes"]["capture.events.observed"], 1);
+        assert_eq!(value["attributes"]["capture.events.landed"], 0);
+        assert_eq!(value["attributes"]["capture.events.dropped"], 1);
+        assert_eq!(value["attributes"]["capture.complete"], false);
+        assert!(
+            value["attributes"]["capture.error"]
+                .as_str()
+                .is_some_and(|error| error.contains("first export failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_export_failure_preserves_partial_delivery_accounting() {
+        let options = base_options(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf 'captured output\\n'".to_owned(),
+        ]);
+        let exporter = FailFirstExporter::default();
+
+        Box::pin(run_captured(&options, &exporter, None, None, None))
+            .await
+            .expect("telemetry failure does not clobber child success");
+
+        let completions = exporter
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(completions.len(), 1);
+        let value = serde_json::to_value(&completions[0]).expect("completion event json");
+        let observed = value["attributes"]["capture.events.observed"]
+            .as_u64()
+            .expect("observed count");
+        assert!(observed > 0);
+        assert_eq!(value["attributes"]["capture.events.landed"], 0);
+        assert_eq!(
+            value["attributes"]["capture.events.dropped"],
+            serde_json::Value::from(observed)
+        );
+        assert_eq!(value["attributes"]["capture.complete"], false);
     }
 
     #[test]

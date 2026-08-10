@@ -473,7 +473,7 @@ impl<E: Exporter> Exporter for SpoolingExporter<E> {
     /// [`drain`](SpoolingExporter::drain), which owns its bounded retry budget.
     async fn flush(&self) -> Result<(), ExportError> {
         let mut state = self.state.lock().await;
-        if !state.queue.is_empty() && !state.in_backoff() {
+        if !state.terminal_seen && !state.queue.is_empty() && !state.in_backoff() {
             let _ = self.deliver_queue(&mut state).await;
         }
         drop(state);
@@ -861,6 +861,38 @@ mod tests {
         assert!(spool.inner.delivered_flat().is_empty());
         assert!(spool.drain(&fast_drain(1)).await.is_clean());
         assert_eq!(spool.inner.delivered_flat().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_cannot_mutate_the_prefix_after_completion_admission() {
+        let sink = FakeSink::scripted([Respond::Unavailable, Respond::Deliver]);
+        let spool = SpoolingExporter::new(sink, fast_policy());
+        spool.export(&[event("pending")]).await.expect("export");
+        let completion = completion_for_pending_event();
+        let completion_event = completion.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+        spool
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("admit completion");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        spool.flush().await.expect("flush inner sink");
+
+        let report = spool.report().await;
+        assert_eq!(report.pending_events, 1);
+        assert_eq!(report.delivered_events, 0);
+        assert!(report.completion_pending);
+        assert_eq!(
+            spool.inner.calls(),
+            1,
+            "no post-completion delivery attempt"
+        );
     }
 
     #[tokio::test(start_paused = true)]
