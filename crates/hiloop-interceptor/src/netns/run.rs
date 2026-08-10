@@ -28,7 +28,7 @@ use crate::{
 
 #[cfg(target_os = "linux")]
 use super::{
-    FatalRunSupervisor, NetworkProvisioner, ProvisionRequest, SubstrateExit,
+    FatalRunSupervisor, NetworkProvisioner, ProvisionRequest, SubstrateExit, SupervisedRunError,
     SystemNetworkProvisioner,
     event_relay::EventRelayServer,
     gateway::{GatewayConfig, WorkloadConfig},
@@ -352,10 +352,7 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         Ok(result) => result.context("serve transparent-run event relay"),
         Err(error) => Err(error).context("join transparent-run event relay"),
     };
-    let flush_result = exporter
-        .flush()
-        .await
-        .context("flush transparent-run events");
+    let flush_result = flush_after_supervision(&result, exporter.as_ref()).await;
 
     let blob_outcome = drain_blobs(options, &blob_dir, gateway_credential.as_ref()).await;
     let blobs_complete = blob_outcome
@@ -426,6 +423,23 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn flush_after_supervision(
+    result: &Result<SubstrateExit, SupervisedRunError>,
+    exporter: &dyn Exporter,
+) -> anyhow::Result<()> {
+    if matches!(
+        result,
+        Err(SupervisedRunError::Fatal(error)) if error.event_persisted()
+    ) {
+        return Ok(());
+    }
+    exporter
+        .flush()
+        .await
+        .context("flush transparent-run events")
 }
 
 #[cfg(target_os = "linux")]
@@ -537,3 +551,175 @@ fn exit_byte(code: i32) -> u8 {
 
 #[cfg(target_os = "linux")]
 use anyhow::Context as _;
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::{
+        net::Ipv6Addr,
+        num::NonZeroU16,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use async_trait::async_trait;
+    use hiloop_core::{event::Event, identity::RunContext};
+
+    use super::flush_after_supervision;
+    use crate::{
+        netns::{
+            FatalRunSupervisor, FragmentedUdpBehavior, NetworkSession, ProvisionError,
+            SubstrateExit, SubstrateInfo, SupervisedRunError,
+        },
+        seams::{ExportError, Exporter},
+    };
+
+    #[derive(Debug)]
+    struct CrashingSession {
+        info: SubstrateInfo,
+    }
+
+    #[async_trait]
+    impl NetworkSession for CrashingSession {
+        fn info(&self) -> &SubstrateInfo {
+            &self.info
+        }
+
+        async fn wait(&mut self) -> Result<SubstrateExit, ProvisionError> {
+            Err(ProvisionError::dataplane("gateway_worker", "fixture crash"))
+        }
+
+        async fn shutdown(&mut self) -> Result<(), ProvisionError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingExporter {
+        events: Mutex<Vec<Event>>,
+        flushes: AtomicUsize,
+        fail_export: bool,
+        flush_failures_remaining: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Exporter for CountingExporter {
+        async fn export(&self, events: &[Event]) -> Result<(), ExportError> {
+            if self.fail_export {
+                return Err(ExportError::unavailable("fixture", "export failed"));
+            }
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(events);
+            Ok(())
+        }
+
+        async fn flush(&self) -> Result<(), ExportError> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            if self
+                .flush_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ExportError::unavailable("fixture", "flush failed"));
+            }
+            Ok(())
+        }
+    }
+
+    fn substrate_info() -> SubstrateInfo {
+        SubstrateInfo::new(
+            NonZeroU16::new(15_001).expect("test port"),
+            1_500,
+            "169.254.254.1".parse().expect("test IPv4"),
+            "fd00:6869:6c6f:6f70::1"
+                .parse::<Ipv6Addr>()
+                .expect("test IPv6"),
+            "169.254.2.2".parse().expect("test host IPv4"),
+            "fd00:6869:6c6f:6f71::2"
+                .parse::<Ipv6Addr>()
+                .expect("test host IPv6"),
+            FragmentedUdpBehavior::Drop,
+        )
+        .expect("valid substrate info")
+    }
+
+    #[tokio::test]
+    async fn composer_flushes_once_for_fatal_and_normal_results() {
+        let fatal_exporter = Arc::new(CountingExporter::default());
+        let supervisor = FatalRunSupervisor::new(
+            RunContext::new_local_root(),
+            Arc::<CountingExporter>::clone(&fatal_exporter),
+        );
+        let mut session = CrashingSession {
+            info: substrate_info(),
+        };
+        let fatal = supervisor.wait(&mut session).await;
+
+        flush_after_supervision(&fatal, fatal_exporter.as_ref())
+            .await
+            .expect("fatal flush is already owned by the supervisor");
+        assert!(matches!(fatal, Err(SupervisedRunError::Fatal(_))));
+        assert_eq!(fatal_exporter.flushes.load(Ordering::SeqCst), 1);
+        {
+            let events = fatal_exporter
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].name.as_str(), "capture.fatal");
+        }
+
+        let normal_exporter = CountingExporter::default();
+        flush_after_supervision(
+            &Ok::<SubstrateExit, SupervisedRunError>(SubstrateExit::Code(0)),
+            &normal_exporter,
+        )
+        .await
+        .expect("normal completion flushes at the composer boundary");
+        assert_eq!(normal_exporter.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn composer_flushes_after_failed_fatal_persistence() {
+        let export_failure = Arc::new(CountingExporter {
+            fail_export: true,
+            ..CountingExporter::default()
+        });
+        let supervisor = FatalRunSupervisor::new(
+            RunContext::new_local_root(),
+            Arc::<CountingExporter>::clone(&export_failure),
+        );
+        let mut session = CrashingSession {
+            info: substrate_info(),
+        };
+        let fatal = supervisor.wait(&mut session).await;
+
+        flush_after_supervision(&fatal, export_failure.as_ref())
+            .await
+            .expect("composer flushes buffered events after fatal export fails");
+        assert_eq!(export_failure.flushes.load(Ordering::SeqCst), 1);
+
+        let flush_failure = Arc::new(CountingExporter {
+            flush_failures_remaining: AtomicUsize::new(1),
+            ..CountingExporter::default()
+        });
+        let supervisor = FatalRunSupervisor::new(
+            RunContext::new_local_root(),
+            Arc::<CountingExporter>::clone(&flush_failure),
+        );
+        let mut session = CrashingSession {
+            info: substrate_info(),
+        };
+        let fatal = supervisor.wait(&mut session).await;
+
+        flush_after_supervision(&fatal, flush_failure.as_ref())
+            .await
+            .expect("composer retries after the fatal flush fails");
+        assert_eq!(flush_failure.flushes.load(Ordering::SeqCst), 2);
+    }
+}
