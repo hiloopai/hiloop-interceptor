@@ -45,6 +45,7 @@ async fn bound_exchange_overwrites_private_headers_and_captures_only_safe_metada
         .uri("https://api.example.com:443/v1/items?query=CANARY")
         .header(HOST, "api.example.com:443")
         .header(AUTHORIZATION, "Bearer workload-forgery")
+        .header(AUTHORIZATION, "Bearer appended-forgery")
         .header(SECRET_PROOF_HEADER, "forged-proof")
         .header("x-hiloop-private", "forged-private")
         .body(streaming_body(&[b"stream-1", b"stream-2"]))
@@ -75,8 +76,14 @@ async fn bound_exchange_overwrites_private_headers_and_captures_only_safe_metada
         Response::builder()
             .status(StatusCode::OK)
             .header(AUTHORIZATION, "Bearer reflected-secret")
+            .header("location", "https://api.example.com/redirect/CANARY")
             .body(streaming_body(&[b"origin reflected CANARY"]))
             .expect("response"),
+    );
+    assert_eq!(response.headers()[AUTHORIZATION], "Bearer reflected-secret");
+    assert_eq!(
+        response.headers()["location"],
+        "https://api.example.com/redirect/CANARY"
     );
     let _ = drain_body(response.into_body()).await;
     let response_signal = rx.recv().await.expect("response signal").expect("raw");
@@ -99,6 +106,32 @@ async fn bound_exchange_overwrites_private_headers_and_captures_only_safe_metada
             );
         }
     }
+    let mut request_keys = request_signal.attributes.keys().collect::<Vec<_>>();
+    request_keys.sort_unstable();
+    assert_eq!(
+        request_keys,
+        [
+            EXCHANGE_ID_ATTR,
+            "http.host",
+            "http.method",
+            "secret.egress.class",
+        ]
+    );
+    let mut response_keys = response_signal.attributes.keys().collect::<Vec<_>>();
+    response_keys.sort_unstable();
+    assert_eq!(
+        response_keys,
+        [
+            EXCHANGE_ID_ATTR,
+            "http.host",
+            "http.status_class",
+            "secret.egress.class",
+        ]
+    );
+    assert_eq!(
+        request_signal.attributes[EXCHANGE_ID_ATTR],
+        response_signal.attributes[EXCHANGE_ID_ATTR]
+    );
     assert_eq!(response_signal.attributes["http.status_class"], "2xx");
     assert!(!response_signal.attributes.contains_key("http.status_code"));
 }

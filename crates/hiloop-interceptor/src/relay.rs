@@ -25,6 +25,7 @@ use hudsucker::{
 };
 use hyper_rustls::{FixedServerNameResolver, HttpsConnectorBuilder};
 use thiserror::Error;
+use tokio::io::AsyncReadExt as _;
 use tower_service::Service;
 
 use crate::egress::{CanonicalHost, Destination, canonicalize_host};
@@ -193,7 +194,12 @@ impl FixedTlsRelayConfig {
     }
 
     pub(crate) async fn read_proof(&self) -> Result<HeaderValue, RelayProofError> {
-        let mut bytes = tokio::fs::read(&self.proof_file)
+        let file = tokio::fs::File::open(&self.proof_file)
+            .await
+            .map_err(|_| RelayProofError::Unavailable)?;
+        let mut bytes = Vec::with_capacity(MAX_PROOF_BYTES + 1);
+        file.take((MAX_PROOF_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
             .await
             .map_err(|_| RelayProofError::Unavailable)?;
         while matches!(bytes.last(), Some(b'\r' | b'\n')) {
@@ -511,6 +517,74 @@ mod tests {
             relay.route_uri(&"https://other.example.com/v1".parse().expect("URI")),
             RelayRoute::Direct
         );
+    }
+
+    #[test]
+    fn relay_config_rejects_ambiguous_or_open_capabilities() {
+        let selector = BoundHttpsSelector::new("api.example.com").expect("selector");
+        let endpoint = "127.0.0.1:8443".parse().expect("endpoint");
+        let proof = PathBuf::from("/proof");
+
+        assert!(matches!(
+            FixedTlsRelayConfig::new(
+                "127.0.0.1:0".parse().expect("zero-port endpoint"),
+                "secret-egress.test",
+                vec![ca()],
+                proof.clone(),
+                [selector.clone()],
+            ),
+            Err(RelayConfigError::Endpoint)
+        ));
+        assert!(matches!(
+            FixedTlsRelayConfig::new(
+                endpoint,
+                "invalid server name",
+                vec![ca()],
+                proof.clone(),
+                [selector.clone()],
+            ),
+            Err(RelayConfigError::ServerName { .. })
+        ));
+        assert!(matches!(
+            FixedTlsRelayConfig::new(
+                endpoint,
+                "secret-egress.test",
+                Vec::new(),
+                proof.clone(),
+                [selector.clone()],
+            ),
+            Err(RelayConfigError::TrustAnchors)
+        ));
+        assert!(matches!(
+            FixedTlsRelayConfig::new(
+                endpoint,
+                "secret-egress.test",
+                vec![ca()],
+                PathBuf::from("relative-proof"),
+                [selector.clone()],
+            ),
+            Err(RelayConfigError::ProofPath)
+        ));
+        assert!(matches!(
+            FixedTlsRelayConfig::new(
+                endpoint,
+                "secret-egress.test",
+                vec![ca()],
+                proof.clone(),
+                [],
+            ),
+            Err(RelayConfigError::EmptySelectors)
+        ));
+        assert!(matches!(
+            FixedTlsRelayConfig::new(
+                endpoint,
+                "secret-egress.test",
+                vec![ca()],
+                proof,
+                [selector.clone(), selector],
+            ),
+            Err(RelayConfigError::DuplicateSelector { .. })
+        ));
     }
 
     #[tokio::test]
