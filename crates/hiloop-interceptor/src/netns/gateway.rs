@@ -64,6 +64,7 @@ use super::{
     classify_client_handshake_error, connect_authorized,
     event_relay::EventRelayExporter,
     routing::{GATEWAY_IPV4, GATEWAY_IPV6},
+    security::deny_process_inspection,
 };
 
 pub(super) const GATEWAY_WORKER_ROLE: &str = "__hiloop-netns-gateway-worker";
@@ -259,6 +260,7 @@ pub(super) fn gateway_worker_entrypoint() -> io::Result<ExitCode> {
 
 pub(super) fn captured_workload_entrypoint() -> io::Result<ExitCode> {
     let config: WorkloadConfig = take_bootstrap_config(WORKLOAD_CONFIG_ENV)?;
+    deny_process_inspection()?;
     let command = std::env::args().skip(2).collect::<Vec<_>>();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

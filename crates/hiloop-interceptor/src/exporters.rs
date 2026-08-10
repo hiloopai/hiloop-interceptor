@@ -121,7 +121,40 @@ pub(crate) mod testing {
 mod tests {
     use super::{testing::sample_log_event, *};
     use crate::seams::{Exporter, testing::MemoryExporter};
+    use crate::spool::{SpoolPolicy, SpoolingExporter};
+    use hiloop_core::{
+        capture::{
+            CaptureCompletionReport, CaptureEventDelivery, CaptureEvidenceTrust,
+            CaptureSourceReport, CaptureSourcesReport,
+        },
+        identity::{Hlc, RunContext},
+    };
     use serde_json::Value;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct CompletionRecorder {
+        records: Mutex<Vec<(Value, Value)>>,
+    }
+
+    #[async_trait]
+    impl Exporter for CompletionRecorder {
+        async fn export(&self, _events: &[Event]) -> Result<(), ExportError> {
+            Ok(())
+        }
+
+        async fn export_completion(
+            &self,
+            event: &Event,
+            report: &CaptureCompletionReport,
+        ) -> Result<(), ExportError> {
+            self.records.lock().expect("records").push((
+                serde_json::to_value(event).expect("event json"),
+                serde_json::to_value(report).expect("report json"),
+            ));
+            Ok(())
+        }
+    }
 
     async fn assert_exporter_accepts_empty_batch_and_flushes<E>(exporter: &E)
     where
@@ -191,5 +224,54 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         let contents = tokio::fs::read_to_string(path).await.expect("read file");
         assert_eq!(contents, "existing");
+    }
+
+    #[tokio::test]
+    async fn fanout_delivers_one_canonical_completion_projection_to_every_sink() {
+        let direct = Arc::new(CompletionRecorder::default());
+        let spooled = Arc::new(CompletionRecorder::default());
+        let fanout = FanOutExporter::new(vec![
+            Box::new(Arc::clone(&direct)),
+            Box::new(SpoolingExporter::new(
+                Arc::clone(&spooled),
+                SpoolPolicy::default(),
+            )),
+        ]);
+        let report = CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            ),
+            CaptureEventDelivery {
+                observed: 2,
+                spooled: 1,
+                landed: 1,
+                rejected: 1,
+                ..CaptureEventDelivery::default()
+            },
+            None,
+            None,
+            Some("fixture rejection".to_owned()),
+        )
+        .expect("completion");
+        let event = report.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+
+        fanout
+            .export_completion(&event, &report)
+            .await
+            .expect("fanout completion");
+
+        assert_eq!(
+            *direct.records.lock().expect("direct records"),
+            *spooled.records.lock().expect("spooled records")
+        );
     }
 }

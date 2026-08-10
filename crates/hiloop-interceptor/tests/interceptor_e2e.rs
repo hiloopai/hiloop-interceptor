@@ -1529,8 +1529,8 @@ async fn gateway_outage_keeps_local_capture_complete_and_reports_undelivered_cou
     );
     assert_process_lifecycle(&events, 0);
 
-    // The capture-health record is minted and captured locally; it accounts for the
-    // backlog without claiming loss (the spool drops nothing under its caps here).
+    // The local completion record accounts for the unsettled remote backlog and does
+    // not certify complete capture while those events remain undelivered.
     let drain = events
         .iter()
         .find(|event| event["name"] == "capture.drain")
@@ -1545,8 +1545,8 @@ async fn gateway_outage_keeps_local_capture_complete_and_reports_undelivered_cou
         "the backlog at mint time is recorded: {drain}"
     );
     assert_eq!(
-        drain["attributes"]["capture.complete"], true,
-        "spooled-but-undelivered is a backlog, not a loss: {drain}"
+        drain["attributes"]["capture.complete"], false,
+        "an unsettled remote backlog is incomplete: {drain}"
     );
 }
 

@@ -28,12 +28,12 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   shape for local and embedded runtimes. Every controlled terminal path attempts it, including
   zero-event runs and spawn failures; durable presence certifies completion, while absence means no
   durable producer receipt. Transparent capture relays the workload report as typed state and
-  merges it once with network and gateway delivery truth instead of emitting competing records. Fixed process,
-  stdio, network, and OTLP source fields report platform-observed versus workload-reported trust,
-  off-by-policy / unavailable / available-no-data / full / metadata-only / mixed fidelity, and
-  typed degradation. Event and blob delivery now include observed, spooled, landed, pending,
-  dropped, rejected, missing, and oversize counts. An oversize payload makes
-  `capture.complete=false` because its bytes did not land.
+  merges it once with network and gateway delivery truth instead of emitting competing records.
+  Fixed process, stdio, network, and OTLP source fields report platform-observed versus
+  workload-reported trust, off-by-policy / unavailable / attached-no-data / full /
+  metadata-only / mixed fidelity, and typed degradation. Event and blob delivery now include
+  observed, spooled, landed, pending, dropped, rejected, missing, and oversize counts. An
+  oversize payload or unsettled event backlog makes `capture.complete=false`.
 - An `UNAUTHENTICATED` gateway rejection of a refreshable credential is now retryable-after-refresh
   instead of a permanent drop. The gateway credential is a shared, rotatable handle
   (`GatewayCredential`, one per run, presented by both the event exporter and the blob uploader),
@@ -77,8 +77,8 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   `capture.drain` health record is now emitted for every gRPC-exported run (previously only
   proxy-capturing runs) and gains `capture.events.dropped`, `capture.events.rejected`, and
   `capture.events.pending` attributes; `capture.complete` now also requires that no exported
-  event was lost. `ExportError` gains `Unavailable` and `Rejected` variants carrying these retry
-  semantics at the exporter seam.
+  event was lost or remained pending. `ExportError` gains `Unavailable` and `Rejected` variants
+  carrying these retry semantics at the exporter seam.
 
 - Every event the wrapper emits now carries `wrapper.invocation_id`: a ULID minted once per wrap
   invocation (at `RunOptions` construction) that identifies which invocation produced the event —

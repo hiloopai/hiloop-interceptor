@@ -2,7 +2,7 @@ use std::{num::NonZeroU8, sync::Arc};
 
 use crate::seams::{ExportError, Exporter};
 use hiloop_core::{
-    capture::CaptureFatalReason,
+    capture::{CaptureEventDelivery, CaptureFatalReason},
     event::Event,
     identity::{HlcClock, RunContext},
 };
@@ -116,15 +116,29 @@ impl FatalRunError {
         matches!(self.persistence, FatalPersistence::Persisted)
     }
 
-    /// True when direct export accepted the fatal event, before or after the final flush.
-    pub(crate) fn event_exported(&self) -> bool {
-        !matches!(
-            &self.persistence,
+    fn event_delivery(&self) -> CaptureEventDelivery {
+        let mut delivery = CaptureEventDelivery {
+            observed: 1,
+            ..CaptureEventDelivery::default()
+        };
+        match &self.persistence {
+            FatalPersistence::Pending | FatalPersistence::Persisted => delivery.landed = 1,
             FatalPersistence::Failed(FatalPersistenceFailure {
-                export: Some(_),
+                export: Some(error),
                 ..
-            })
-        )
+            }) if matches!(error.as_ref(), ExportError::Rejected { .. }) => {
+                delivery.rejected = 1;
+            }
+            FatalPersistence::Failed(FatalPersistenceFailure {
+                export: Some(_), ..
+            }) => {
+                delivery.dropped = 1;
+            }
+            FatalPersistence::Failed(FatalPersistenceFailure { export: None, .. }) => {
+                delivery.landed = 1;
+            }
+        }
+        delivery
     }
 
     /// Underlying worker failure or ordered-cleanup failure, when present.
@@ -162,10 +176,10 @@ pub enum SupervisedRunError {
 }
 
 impl SupervisedRunError {
-    pub(crate) fn fatal_event_exported(&self) -> bool {
+    pub(crate) fn fatal_event_delivery(&self) -> CaptureEventDelivery {
         match self {
-            Self::Fatal(error) => error.event_exported(),
-            Self::Provision(_) => false,
+            Self::Fatal(error) => error.event_delivery(),
+            Self::Provision(_) => CaptureEventDelivery::default(),
         }
     }
 
@@ -285,5 +299,44 @@ impl FatalRunSupervisor {
             substrate_error,
             persistence,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed_fatal_delivery(error: ExportError) -> CaptureEventDelivery {
+        FatalRunError {
+            result: FatalRunResult {
+                reason: CaptureFatalReason::DataplaneFailed,
+            },
+            substrate_error: None,
+            persistence: FatalPersistence::Failed(FatalPersistenceFailure {
+                export: Some(Arc::new(error)),
+                flush: None,
+            }),
+        }
+        .event_delivery()
+    }
+
+    #[test]
+    fn generated_fatal_events_remain_observed_when_delivery_fails() {
+        assert_eq!(
+            failed_fatal_delivery(ExportError::unavailable("fixture", "down")),
+            CaptureEventDelivery {
+                observed: 1,
+                dropped: 1,
+                ..CaptureEventDelivery::default()
+            }
+        );
+        assert_eq!(
+            failed_fatal_delivery(ExportError::rejected("fixture", "invalid")),
+            CaptureEventDelivery {
+                observed: 1,
+                rejected: 1,
+                ..CaptureEventDelivery::default()
+            }
+        );
     }
 }

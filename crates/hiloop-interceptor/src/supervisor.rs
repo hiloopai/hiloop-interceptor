@@ -886,7 +886,7 @@ where
                 eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
             }
             let spool_report = match event_spool {
-                Some(spool) => Some(spool.report().await),
+                Some(spool) => Some(spool.drain(&options.blob_drain_retry).await),
                 None => None,
             };
             let events = match spool_report {
@@ -1270,14 +1270,11 @@ where
         }
     }
 
-    // The capture-health record ships once per drained run so a run whose payload
-    // bodies or events never landed is *queryably* incomplete — and a captured run
-    // with no `capture.drain` event at all is one whose wrapper died before draining.
-    // It ships BEFORE the final event-spool drain on purpose: spool redelivery is
-    // strictly in arrival order, so a `capture.drain` event that reaches the gateway
-    // certifies that everything spooled before it landed too.
+    // Settle the ordinary spool before projecting one canonical completion record to
+    // every sink. The terminal lane closes the event prefix, so later retries cannot
+    // change the accounting carried by this event.
     let spool_report = match event_spool {
-        Some(spool) => Some(spool.report().await),
+        Some(spool) => Some(spool.drain(&options.blob_drain_retry).await),
         None => None,
     };
     if let Some(error) = blob_outcome
@@ -1325,9 +1322,8 @@ where
         drain_warnings.push(warning);
     }
 
-    // Run-end event drain: the spooled backlog gets its final chance within the same
-    // bounded budget as the blob drain; whatever remains undelivered is reported with
-    // counts instead of being dropped silently.
+    // The data prefix is frozen once completion is admitted. This final pass retries
+    // only the terminal record when the ordinary prefix settled cleanly.
     if let Some(spool) = event_spool {
         let report = spool.drain(&options.blob_drain_retry).await;
         if let Some(warning) = spool_problem(&report, spool.last_failure().await) {

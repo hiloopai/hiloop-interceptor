@@ -366,7 +366,7 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         Err(error) => Err(error).context("join transparent-run event relay"),
     };
     let network_observations = relay_capture.network().await;
-    let relayed_events = relay_capture.relayed_events().await;
+    let relay_events = relay_capture.events().await;
     let inner_completion = relay_capture.take_completion().await;
     let mut result = supervisor.finish_wait(wait_result).await;
     let blob_outcome = drain_blobs(options, &blob_dir, gateway_credential.as_ref()).await;
@@ -380,11 +380,10 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         );
     }
 
-    // The capture-health record ships BEFORE the final event-spool drain on purpose: spool
-    // redelivery is strictly in arrival order, so this record reaching the gateway certifies
-    // that everything spooled before it landed too (the supervisor lane's ordering contract).
+    // Settle the ordinary spool before projecting one canonical completion record to every
+    // sink. Completion closes that data prefix; only its dedicated terminal lane may retry.
     let spool_report = match &spool {
-        Some(spool) => Some(spool.report().await),
+        Some(spool) => Some(spool.drain(options.blob_drain_retry()).await),
         None => None,
     };
     let network = if relay_result.is_err() || result.is_err() {
@@ -414,17 +413,22 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
             pending: spool.pending_events as u64,
         }
     } else {
-        let observed = relayed_events
-            .saturating_add(u64::from(
-                result
-                    .as_ref()
-                    .err()
-                    .is_some_and(SupervisedRunError::fatal_event_exported),
-            ))
-            .saturating_add(1);
+        let fatal = result
+            .as_ref()
+            .err()
+            .map(SupervisedRunError::fatal_event_delivery)
+            .unwrap_or_default();
         CaptureEventDelivery {
-            observed,
-            landed: observed,
+            observed: relay_events
+                .observed
+                .saturating_add(fatal.observed)
+                .saturating_add(1),
+            landed: relay_events
+                .landed
+                .saturating_add(fatal.landed)
+                .saturating_add(1),
+            dropped: relay_events.dropped.saturating_add(fatal.dropped),
+            rejected: relay_events.rejected.saturating_add(fatal.rejected),
             ..CaptureEventDelivery::default()
         }
     };

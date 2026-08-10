@@ -624,6 +624,40 @@ fn raw_prctl4(
 mod tests {
     use super::*;
 
+    const PROCESS_INSPECTION_CHILD: &str = "HILOOP_TEST_PROCESS_INSPECTION_CHILD";
+
+    #[test]
+    fn non_dumpable_helper_blocks_customer_child_environment_inspection() {
+        use std::process::Command;
+
+        if std::env::var_os(PROCESS_INSPECTION_CHILD).is_some() {
+            deny_process_inspection().expect("disable process inspection");
+            let status = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "cat /proc/$PPID/environ >/dev/null 2>&1; test $? -ne 0",
+                ])
+                .status()
+                .expect("run customer child probe");
+            assert!(
+                status.success(),
+                "customer child inspected its protected parent"
+            );
+            return;
+        }
+
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "netns::security::tests::non_dumpable_helper_blocks_customer_child_environment_inspection",
+                "--nocapture",
+            ])
+            .env(PROCESS_INSPECTION_CHILD, "1")
+            .status()
+            .expect("run isolated process-inspection test");
+        assert!(status.success());
+    }
+
     #[test]
     fn close_ranges_preserve_stdio_and_sparse_allowlist() {
         assert_eq!(

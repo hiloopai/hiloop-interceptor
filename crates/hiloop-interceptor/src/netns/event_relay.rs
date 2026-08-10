@@ -161,9 +161,13 @@ pub(super) struct EventRelayServer {
     listener: UnixListener,
     exporter: Arc<dyn Exporter>,
     capture: RelayCaptureReport,
-    gateway_token: String,
-    workload_token: String,
+    credentials: Arc<Mutex<RelayCredentials>>,
     connections: Arc<Semaphore>,
+}
+
+struct RelayCredentials {
+    gateway_token: Option<String>,
+    workload_token: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -175,8 +179,16 @@ pub(super) struct NetworkObservations {
 #[derive(Debug, Default)]
 struct RelayCaptureState {
     network: NetworkObservations,
-    relayed_events: u64,
+    events: RelayEventDelivery,
     completion: Option<(CaptureCompletionReport, Event)>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RelayEventDelivery {
+    pub(super) observed: u64,
+    pub(super) landed: u64,
+    pub(super) dropped: u64,
+    pub(super) rejected: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -193,8 +205,8 @@ impl RelayCaptureReport {
         self.state.lock().await.completion.take()
     }
 
-    pub(super) async fn relayed_events(&self) -> u64 {
-        self.state.lock().await.relayed_events
+    pub(super) async fn events(&self) -> RelayEventDelivery {
+        self.state.lock().await.events
     }
 }
 
@@ -217,8 +229,10 @@ impl EventRelayServer {
             listener: UnixListener::bind(path)?,
             exporter,
             capture: RelayCaptureReport::default(),
-            gateway_token,
-            workload_token,
+            credentials: Arc::new(Mutex::new(RelayCredentials {
+                gateway_token: Some(gateway_token),
+                workload_token: Some(workload_token),
+            })),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         })
     }
@@ -241,18 +255,10 @@ impl EventRelayServer {
                     };
                     let exporter = Arc::clone(&self.exporter);
                     let capture = self.capture.clone();
-                    let gateway_token = self.gateway_token.clone();
-                    let workload_token = self.workload_token.clone();
+                    let credentials = Arc::clone(&self.credentials);
                     connections.spawn(async move {
                         let _permit = permit;
-                        serve_connection(
-                            stream,
-                            exporter,
-                            capture,
-                            gateway_token,
-                            workload_token,
-                        )
-                        .await
+                        serve_connection(stream, exporter, capture, credentials).await
                     });
                 }
                 Some(joined) = connections.join_next(), if !connections.is_empty() => {
@@ -277,8 +283,7 @@ async fn serve_connection(
     mut stream: UnixStream,
     exporter: Arc<dyn Exporter>,
     capture: RelayCaptureReport,
-    gateway_token: String,
-    workload_token: String,
+    credentials: Arc<Mutex<RelayCredentials>>,
 ) -> io::Result<()> {
     let request = tokio::time::timeout(AUTH_TIMEOUT, read_frame(&mut stream))
         .await
@@ -288,25 +293,33 @@ async fn serve_connection(
                 "event-relay authentication timed out",
             )
         })??;
-    let role = match request {
-        RelayRequest::Authenticate(token) if token == workload_token => RelayRole::Workload,
-        RelayRequest::Authenticate(token) if token == gateway_token => RelayRole::Gateway,
-        RelayRequest::Authenticate(_) => {
-            write_frame(
-                &mut stream,
-                &RelayResponse::Error("event-relay authentication failed".to_owned()),
-            )
-            .await?;
-            return Ok(());
+    let RelayRequest::Authenticate(token) = request else {
+        write_frame(
+            &mut stream,
+            &RelayResponse::Error("event-relay authentication is required".to_owned()),
+        )
+        .await?;
+        return Ok(());
+    };
+    let role = {
+        let mut credentials = credentials.lock().await;
+        if credentials.workload_token.as_deref() == Some(token.as_str()) {
+            credentials.workload_token = None;
+            Some(RelayRole::Workload)
+        } else if credentials.gateway_token.as_deref() == Some(token.as_str()) {
+            credentials.gateway_token = None;
+            Some(RelayRole::Gateway)
+        } else {
+            None
         }
-        _ => {
-            write_frame(
-                &mut stream,
-                &RelayResponse::Error("event-relay authentication is required".to_owned()),
-            )
-            .await?;
-            return Ok(());
-        }
+    };
+    let Some(role) = role else {
+        write_frame(
+            &mut stream,
+            &RelayResponse::Error("event-relay authentication failed".to_owned()),
+        )
+        .await?;
+        return Ok(());
     };
     write_frame(&mut stream, &RelayResponse::Ok).await?;
     loop {
@@ -321,8 +334,10 @@ async fn serve_connection(
                 "event-relay connection is already authenticated",
             )),
             RelayRequest::Export(events) => {
-                record_network_observations(&capture, &events).await;
-                exporter.export(&events).await
+                record_relay_attempt(&capture, &events).await;
+                let result = exporter.export(&events).await;
+                record_relay_outcome(&capture, events.len(), &result).await;
+                result
             }
             RelayRequest::Completion(completion) => {
                 if role == RelayRole::Workload {
@@ -360,11 +375,11 @@ enum RelayRole {
     Workload,
 }
 
-async fn record_network_observations(capture: &RelayCaptureReport, events: &[Event]) {
+async fn record_relay_attempt(capture: &RelayCaptureReport, events: &[Event]) {
     let raw_source = AttributeKey::from_static(provenance_keys::RAW_SOURCE);
     let l7_capture = AttributeKey::from_static(L7_CAPTURE);
     let mut state = capture.state.lock().await;
-    state.relayed_events = state.relayed_events.saturating_add(events.len() as u64);
+    state.events.observed = state.events.observed.saturating_add(events.len() as u64);
     for event in events {
         let proxy_source = matches!(
             event.attributes.get(&raw_source),
@@ -381,6 +396,22 @@ async fn record_network_observations(capture: &RelayCaptureReport, events: &[Eve
         } else {
             state.network.full += 1;
         }
+    }
+}
+
+async fn record_relay_outcome(
+    capture: &RelayCaptureReport,
+    count: usize,
+    result: &Result<(), ExportError>,
+) {
+    let mut state = capture.state.lock().await;
+    let count = count as u64;
+    match result {
+        Ok(()) => state.events.landed = state.events.landed.saturating_add(count),
+        Err(ExportError::Rejected { .. }) => {
+            state.events.rejected = state.events.rejected.saturating_add(count);
+        }
+        Err(_) => state.events.dropped = state.events.dropped.saturating_add(count),
     }
 }
 
@@ -425,6 +456,7 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use hiloop_core::{
         capture::{
             CaptureCompletionReport, CaptureEventDelivery, CaptureEvidenceTrust,
@@ -436,6 +468,15 @@ mod tests {
 
     use super::*;
     use crate::seams::testing::MemoryExporter;
+
+    struct FailingExporter;
+
+    #[async_trait]
+    impl Exporter for FailingExporter {
+        async fn export(&self, _events: &[Event]) -> Result<(), ExportError> {
+            Err(ExportError::unavailable("fixture", "write failed"))
+        }
+    }
 
     #[tokio::test]
     async fn relays_event_batches_and_flushes_over_the_private_socket() {
@@ -500,7 +541,15 @@ mod tests {
         let events = memory.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name.as_str(), event.name.as_str());
-        assert_eq!(capture.relayed_events().await, 1);
+        assert_eq!(
+            capture.events().await,
+            RelayEventDelivery {
+                observed: 1,
+                landed: 1,
+                dropped: 0,
+                rejected: 0,
+            }
+        );
         assert_eq!(
             capture.network().await,
             NetworkObservations {
@@ -574,6 +623,10 @@ mod tests {
         let trusted = EventRelayExporter::connect_for_workload(&path, "workload-token".to_owned())
             .await
             .expect("trusted client");
+        let replay = EventRelayExporter::connect_for_workload(&path, "workload-token".to_owned())
+            .await
+            .expect_err("an authenticated role token is single-use");
+        assert!(replay.to_string().contains("authentication failed"));
         trusted
             .export_completion(&event, &completion)
             .await
@@ -585,6 +638,58 @@ mod tests {
                 .expect("trusted completion")
                 .0,
             completion
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        task.await.expect("relay task").expect("relay server");
+    }
+
+    #[tokio::test]
+    async fn failed_sink_delivery_is_observed_but_not_counted_as_landed() {
+        let directory = tempfile::tempdir().expect("relay directory");
+        let path = directory.path().join("events.sock");
+        let server = EventRelayServer::bind(
+            &path,
+            Arc::new(FailingExporter),
+            "gateway-token".to_owned(),
+            "workload-token".to_owned(),
+        )
+        .expect("bind relay");
+        let capture = server.capture_report();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve(async move {
+            let _ = shutdown_rx.await;
+        }));
+        let relay = EventRelayExporter::connect_gateway(&path, "gateway-token".to_owned())
+            .await
+            .expect("connect relay");
+        let event = Event::new(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            SignalType::Net,
+            EventName::from_static("fixture.event"),
+        )
+        .with_attribute(AttributeKey::from_static(L7_CAPTURE), false);
+
+        relay.export(&[event]).await.expect_err("sink write fails");
+        assert_eq!(
+            capture.events().await,
+            RelayEventDelivery {
+                observed: 1,
+                landed: 0,
+                dropped: 1,
+                rejected: 0,
+            }
+        );
+        assert_eq!(
+            capture.network().await,
+            NetworkObservations {
+                full: 0,
+                metadata_only: 1,
+            }
         );
 
         shutdown_tx.send(()).expect("send shutdown");

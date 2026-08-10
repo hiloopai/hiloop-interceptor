@@ -408,40 +408,18 @@ impl CaptureCompletionReport {
         self.error.as_deref()
     }
 
-    /// Replace event-delivery accounting while retaining source and blob truth.
-    pub fn with_event_delivery(
-        &self,
-        events: CaptureEventDelivery,
-    ) -> Result<Self, CaptureCompletionError> {
-        Self::new(
-            self.sources.clone(),
-            events,
-            self.blobs,
-            self.auth_refreshes,
-            self.error.clone(),
-        )
-    }
-
-    /// True only when every configured source stayed available and no event/blob was lost.
-    ///
-    /// Pending events do not count as loss for the local ordered-spool projection: this record
-    /// queues behind them, so its own durable arrival certifies that backlog. Managed capture
-    /// emits completion only after its final drain and therefore reports zero pending events.
+    /// True only when every configured source stayed available and event/blob delivery settled
+    /// without loss.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.error.is_none()
             && !self.sources.has_unavailable_source()
             && self.events.dropped == 0
             && self.events.rejected == 0
+            && self.events.pending == 0
             && self
                 .blobs
                 .is_none_or(|blobs| blobs.missing == 0 && blobs.oversize == 0)
-    }
-
-    /// True only when completion is lossless and no event remains pending.
-    #[must_use]
-    pub fn is_settled_complete(&self) -> bool {
-        self.events.pending == 0 && self.is_complete()
     }
 
     /// Build the canonical Event-v1 projection of this report.
@@ -807,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_completion_requires_a_settled_event_delivery() {
+    fn completion_requires_a_settled_event_delivery() {
         let report = CaptureCompletionReport::new(
             CaptureSourcesReport::new(
                 CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
@@ -825,12 +803,122 @@ mod tests {
             None,
             None,
         )
-        .expect("valid ordered local completion");
+        .expect("valid pending completion");
 
-        assert!(report.is_complete());
-        assert!(!report.is_settled_complete());
+        assert!(!report.is_complete());
         let mut value = serde_json::to_value(&report).expect("completion json");
         value["events"]["landed"] = 2.into();
         assert!(serde_json::from_value::<CaptureCompletionReport>(value).is_err());
+    }
+
+    #[test]
+    fn completion_json_wire_shape_is_stable() {
+        let report = CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::configured_unavailable(
+                    CaptureEvidenceTrust::PlatformObserved,
+                    CaptureSourceDegradation::StartupFailed,
+                ),
+                CaptureSourceReport::attached_full(CaptureEvidenceTrust::PlatformObserved, 2),
+                CaptureSourceReport::attached_metadata_only(
+                    CaptureEvidenceTrust::PlatformObserved,
+                    3,
+                    CaptureSourceDegradation::OpaqueNetworkTraffic,
+                ),
+                CaptureSourceReport::attached_mixed(
+                    CaptureEvidenceTrust::WorkloadReported,
+                    4,
+                    5,
+                    CaptureSourceDegradation::RuntimeFailed,
+                ),
+            ),
+            CaptureEventDelivery {
+                observed: 3,
+                spooled: 2,
+                landed: 1,
+                dropped: 1,
+                rejected: 1,
+                pending: 0,
+            },
+            Some(CaptureBlobDelivery {
+                found: 3,
+                landed: 1,
+                missing: 1,
+                oversize: 1,
+                missing_bytes: 7,
+            }),
+            Some(2),
+            Some("fixture failure".to_owned()),
+        )
+        .expect("valid completion");
+        let expected = serde_json::json!({
+            "sources": {
+                "process": {
+                    "trust": "platform_observed",
+                    "state": { "configured_unavailable": { "reason": "startup_failed" } }
+                },
+                "stdio": {
+                    "trust": "platform_observed",
+                    "state": { "attached_full": { "events": 2 } }
+                },
+                "network": {
+                    "trust": "platform_observed",
+                    "state": {
+                        "attached_metadata_only": {
+                            "events": 3,
+                            "reason": "opaque_network_traffic"
+                        }
+                    }
+                },
+                "otlp": {
+                    "trust": "workload_reported",
+                    "state": {
+                        "attached_mixed": {
+                            "full_events": 4,
+                            "metadata_only_events": 5,
+                            "reason": "runtime_failed"
+                        }
+                    }
+                }
+            },
+            "events": {
+                "observed": 3,
+                "spooled": 2,
+                "landed": 1,
+                "dropped": 1,
+                "rejected": 1,
+                "pending": 0
+            },
+            "blobs": {
+                "found": 3,
+                "landed": 1,
+                "missing": 1,
+                "oversize": 1,
+                "missing_bytes": 7
+            },
+            "auth_refreshes": 2,
+            "error": "fixture failure"
+        });
+
+        assert_eq!(
+            serde_json::to_value(&report).expect("completion json"),
+            expected
+        );
+        assert_eq!(
+            serde_json::from_value::<CaptureCompletionReport>(expected)
+                .expect("read stable completion wire"),
+            report
+        );
+        assert_eq!(
+            serde_json::to_value([
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::WorkloadReported),
+            ])
+            .expect("remaining source-state shapes"),
+            serde_json::json!([
+                { "trust": "platform_observed", "state": "off_by_policy" },
+                { "trust": "workload_reported", "state": "attached_no_data" }
+            ])
+        );
     }
 }
