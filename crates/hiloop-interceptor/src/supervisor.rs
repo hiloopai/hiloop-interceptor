@@ -51,7 +51,10 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::{ExitCode, ExitStatus, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     task::Poll,
     time::{Duration, Instant},
 };
@@ -759,6 +762,16 @@ impl<'a, E: ?Sized> DeliveryAccountingExporter<'a, E> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    fn reconcile_normalized(&self, normalized: u64) {
+        let mut delivery = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unattempted = normalized.saturating_sub(delivery.observed);
+        delivery.observed = delivery.observed.saturating_add(unattempted);
+        delivery.dropped = delivery.dropped.saturating_add(unattempted);
+    }
 }
 
 #[async_trait::async_trait]
@@ -1032,7 +1045,9 @@ where
         options_pipeline =
             options_pipeline.with_raw_retention_override(RawRetentionPolicy::Preserve);
     }
-    let capture_session = CaptureSession::start(options_pipeline);
+    let normalized_events = Arc::new(AtomicU64::new(0));
+    let capture_session =
+        CaptureSession::start(options_pipeline).with_event_counter(Arc::clone(&normalized_events));
     let capture_control = capture_session.control();
     let signal_tx = capture_control
         .signal_sender()
@@ -1255,6 +1270,8 @@ where
     .await;
 
     let status = status_result?;
+
+    delivery_accounting.reconcile_normalized(normalized_events.load(Ordering::Relaxed));
 
     // The child has exited: capture/export is best effort from here, so drain failures
     // become warnings instead of clobbering the child's exit code (exit-code transparency).
@@ -2610,6 +2627,7 @@ mod tests {
     struct FailFirstExporter {
         exports: std::sync::atomic::AtomicUsize,
         completions: Mutex<Vec<Event>>,
+        first_delay: Duration,
     }
 
     #[async_trait]
@@ -2636,6 +2654,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 == 0
             {
+                tokio::time::sleep(self.first_delay).await;
                 return Err(crate::seams::ExportError::unavailable(
                     "fixture",
                     "first export failed",
@@ -3366,9 +3385,13 @@ mod tests {
         let options = base_options(vec![
             "sh".to_owned(),
             "-c".to_owned(),
-            "printf 'captured output\\n'".to_owned(),
+            "i=0; while [ \"$i\" -lt 300 ]; do printf 'captured output\\n'; i=$((i+1)); done"
+                .to_owned(),
         ]);
-        let exporter = FailFirstExporter::default();
+        let exporter = FailFirstExporter {
+            first_delay: Duration::from_millis(50),
+            ..FailFirstExporter::default()
+        };
 
         Box::pin(run_captured(&options, &exporter, None, None, None))
             .await
@@ -3383,7 +3406,10 @@ mod tests {
         let observed = value["attributes"]["capture.events.observed"]
             .as_u64()
             .expect("observed count");
-        assert!(observed > 0);
+        assert!(
+            observed > options.export_batch_size as u64,
+            "normalized events buffered behind the failed batch remain accounted"
+        );
         assert_eq!(value["attributes"]["capture.events.landed"], 0);
         assert_eq!(
             value["attributes"]["capture.events.dropped"],

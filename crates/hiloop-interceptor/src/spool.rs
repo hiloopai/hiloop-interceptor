@@ -249,18 +249,40 @@ impl<E: Exporter> SpoolingExporter<E> {
                 return state.report();
             }
         }
-        let mut backoff = retry.initial_backoff;
-        for attempt in 0..retry.attempts.max(1) {
-            if attempt > 0 {
-                tokio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(2);
+        let phase_budget = self.drain_phase_budget(retry);
+        let elapsed = tokio::time::timeout(phase_budget, async {
+            let mut backoff = retry.initial_backoff;
+            for attempt in 0..retry.attempts.max(1) {
+                if attempt > 0 {
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2);
+                }
+                let mut state = self.state.lock().await;
+                if self.deliver_all(&mut state).await.is_ok() {
+                    break;
+                }
             }
-            let mut state = self.state.lock().await;
-            if self.deliver_all(&mut state).await.is_ok() {
-                break;
-            }
+        })
+        .await
+        .is_err();
+        let mut state = self.state.lock().await;
+        if elapsed {
+            state.last_failure = Some(format!(
+                "run-end drain phase timed out after {phase_budget:?}"
+            ));
         }
-        self.state.lock().await.report()
+        state.report()
+    }
+
+    fn drain_phase_budget(&self, retry: &DrainRetryPolicy) -> Duration {
+        let attempts = retry.attempts.max(1);
+        let mut budget = self.policy.attempt_timeout.saturating_mul(attempts);
+        let mut backoff = retry.initial_backoff;
+        for _ in 1..attempts {
+            budget = budget.saturating_add(backoff);
+            backoff = backoff.saturating_mul(2);
+        }
+        budget
     }
 
     /// One timeout-bounded call into the inner exporter, classified on failure.
@@ -510,6 +532,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Respond {
         Deliver,
+        DeliverAfter(Duration),
         Backpressure,
         Unavailable,
         Rejected,
@@ -562,6 +585,11 @@ mod tests {
                 .unwrap_or(Respond::Deliver);
             match response {
                 Respond::Deliver => {
+                    self.delivered.lock().expect("lock").push(events.to_vec());
+                    Ok(())
+                }
+                Respond::DeliverAfter(delay) => {
+                    tokio::time::sleep(delay).await;
                     self.delivered.lock().expect("lock").push(events.to_vec());
                     Ok(())
                 }
@@ -1054,6 +1082,37 @@ mod tests {
         assert_eq!(report.pending_events, 2, "undelivered events are reported");
         assert!(!report.is_clean());
         assert!(report.is_lossless_so_far(), "spooled, not dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_end_drain_bounds_the_whole_phase_not_each_chunk() {
+        let sink = FakeSink::scripted([
+            Respond::Unavailable,
+            Respond::DeliverAfter(Duration::from_millis(40)),
+            Respond::DeliverAfter(Duration::from_millis(40)),
+            Respond::DeliverAfter(Duration::from_millis(40)),
+        ]);
+        let policy = SpoolPolicy {
+            attempt_timeout: Duration::from_millis(50),
+            drain_batch_size: 1,
+            ..fast_policy()
+        };
+        let spool = SpoolingExporter::new(sink, policy);
+        for label in ["one", "two", "three"] {
+            spool.export(&[event(label)]).await.expect("export");
+        }
+
+        let report = spool.drain(&fast_drain(2)).await;
+
+        assert_eq!(report.delivered_events, 2);
+        assert_eq!(report.pending_events, 1);
+        assert!(
+            spool
+                .last_failure()
+                .await
+                .expect("phase timeout recorded")
+                .contains("drain phase timed out")
+        );
     }
 
     #[tokio::test(start_paused = true)]

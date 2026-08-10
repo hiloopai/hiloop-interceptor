@@ -73,8 +73,9 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   (redelivering a judged batch cannot succeed); anything else gets one inline retry, then spools.
   An outage no longer aborts the capture pipeline, so local sinks (`--events-jsonl`) keep
   capturing through it, and the child is never blocked on a sink known to be down. At run end the
-  ordinary data and then the terminal record each receive one bounded drain phase (31.5 seconds
-  per phase, 63 seconds total with the default three-attempt policy); anything
+  ordinary data receives one bounded drain phase (31.5 seconds with the default policy); only
+  after that prefix settles does the terminal record receive the same bounded phase (63 seconds
+  total when both run); anything
   still undelivered is reported on stderr with counts instead of being dropped silently. The
   `capture.drain` health record is now emitted for every gRPC-exported run (previously only
   proxy-capturing runs) and gains `capture.events.dropped`, `capture.events.rejected`, and

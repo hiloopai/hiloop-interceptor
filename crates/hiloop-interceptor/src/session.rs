@@ -10,7 +10,7 @@ use crate::{
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicU64},
     task::{Context, Poll},
 };
 use thiserror::Error;
@@ -27,6 +27,7 @@ pub struct CaptureSession {
     signal_rx: mpsc::Receiver<Result<RawSignal, SourceError>>,
     control: CaptureControl,
     options: PipelineOptions,
+    event_counter: Option<Arc<AtomicU64>>,
 }
 
 impl CaptureSession {
@@ -43,7 +44,13 @@ impl CaptureSession {
                 }),
             },
             options,
+            event_counter: None,
         }
+    }
+
+    pub(crate) fn with_event_counter(mut self, event_counter: Arc<AtomicU64>) -> Self {
+        self.event_counter = Some(event_counter);
+        self
     }
 
     /// A cloneable attachment and shutdown handle for runtime adapters.
@@ -66,10 +73,14 @@ impl CaptureSession {
             signal_rx,
             control,
             options,
+            event_counter,
         } = self;
         let _shutdown_on_drop = ShutdownOnDrop(control);
         let stream = ReceiverStream::new(signal_rx);
         let mut pipeline = Pipeline::with_router(context, router, exporter).options(options);
+        if let Some(event_counter) = event_counter {
+            pipeline = pipeline.event_counter(event_counter);
+        }
         if let Some(raw_store) = raw_store {
             pipeline = pipeline.raw_store(raw_store);
         }

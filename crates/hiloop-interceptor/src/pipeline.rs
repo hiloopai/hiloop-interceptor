@@ -17,7 +17,14 @@ use hiloop_core::{
     capture::L7_CAPTURE,
     event::{AttributeKey, Event},
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -205,6 +212,7 @@ pub struct Pipeline<'a, E> {
     exporter: &'a E,
     raw_store: Option<&'a dyn RawStore>,
     options: PipelineOptions,
+    event_counter: Option<Arc<AtomicU64>>,
 }
 
 impl<'a, E> Pipeline<'a, E>
@@ -235,7 +243,13 @@ where
             exporter,
             raw_store: None,
             options: PipelineOptions::default(),
+            event_counter: None,
         }
+    }
+
+    pub(crate) fn event_counter(mut self, event_counter: Arc<AtomicU64>) -> Self {
+        self.event_counter = Some(event_counter);
+        self
     }
 
     /// Attach a raw store so normalizers may request raw preservation.
@@ -264,6 +278,7 @@ where
             self.exporter,
             self.raw_store,
             self.options,
+            self.event_counter.as_deref(),
         )
         .await
     }
@@ -320,6 +335,7 @@ async fn run_pipeline<S, E>(
     exporter: &E,
     raw_store: Option<&dyn RawStore>,
     options: PipelineOptions,
+    event_counter: Option<&AtomicU64>,
 ) -> Result<PipelineReport, PipelineError>
 where
     S: futures_core::Stream<Item = Result<RawSignal, SourceError>> + Unpin,
@@ -418,11 +434,14 @@ where
                     } else {
                         source_report.full_events += 1;
                     }
+                    if let Some(counter) = event_counter {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    events += 1;
                     event_tx
                         .send(event)
                         .await
                         .map_err(|_| PipelineError::ChannelClosed { stage: "event" })?;
-                    events += 1;
                 }
             }
         }
