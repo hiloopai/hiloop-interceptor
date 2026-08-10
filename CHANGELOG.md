@@ -8,6 +8,12 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ## [Unreleased]
 
+### Removed
+
+- The unused placeholder secret broker and injection surface, including its CLI flags, public Rust
+  types, plaintext resolver client, and secret-only transparent-network policy branches. Capture,
+  redaction, egress enforcement, and network-namespace transport remain destination-agnostic.
+
 ### Changed
 
 - **Breaking (event schema):** the process provenance attribute `process.argv` is renamed to
@@ -92,10 +98,9 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   `process.signal` per forwarded terminating signal. A new `--env-allowlist` flag (or
   `RunOptions::with_env_allowlist`) records the listed environment variable *names* on
   `process.start` (`process.env_allowlist`), and captures each listed variable that is set in the
-  child's environment as a `process.env.<NAME>` attribute — the value scrubbed by the capture-side
-  secret redaction (the same pattern and known-secret-literal passes applied to captured bodies)
-  before it is recorded. The environment is a known secret carrier, so value capture is strictly
-  opt-in per name: variables outside the allowlist are never captured.
+  child's environment as a `process.env.<NAME>` attribute — the value scrubbed by capture-side
+  pattern redaction before it is recorded. The environment is a known secret carrier, so value
+  capture is strictly opt-in per name: variables outside the allowlist are never captured.
 - Egress policy enforcement for intercepted HTTP(S) traffic (`--egress-mode allow|deny` with
   repeatable `--egress-domain` / `--egress-cidr` rules, and the `RunOptions::with_egress` builder).
   Hosts are canonicalized (control-char/percent/userinfo rejection, IDNA→punycode, IP-literal
@@ -114,16 +119,6 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   additionally short-circuits the request with `403` and stamps `anomaly.blocked`. This is a
   **cooperative** defense-in-depth detection layer over proxied traffic; the un-bypassable boundary is
   host-side. Off by default.
-- Credential injection: bind a named secret to a destination host and request header
-  (`--secret-binding`, broker via `--secret-broker-url` + `HILOOP_SECRET_BROKER_TOKEN`, and the
-  `RunOptions::with_secret_bindings` builder). On a request to the bound host the proxy resolves the
-  secret from the broker and writes `<scheme> <value>` into the header; the value is scrubbed from the
-  captured telemetry, zeroized after use, and a broker failure fails the request closed. A host can
-  carry several bindings as long as each writes a different header (e.g. an `authorization` bearer
-  plus a separate `x-api-key`); two bindings writing the *same* header on one host are rejected at
-  build (`SecretConfigError::DuplicateBinding`, replacing the one-binding-per-host `DuplicateHost`
-  limit), and `SecretInjector::inject` now returns every resolved value
-  (`Vec<Zeroizing<String>>`) so all injected credentials are scrubbed from the capture.
 - gRPC export now flushes on a size **or** age trigger, whichever comes first: a partial batch ships
   once it has waited `--export-flush-interval-ms` (default 1000 ms; `0` disables the timer) even
   before it reaches `--export-batch-size` (default 128). This bounds export latency so a long-running
@@ -133,19 +128,6 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Fixed
 
-- The proxy's upstream TLS client now unions a deployment-provisioned egress interception CA (the
-  PEM file named by the `HILOOP_EGRESS_INTERCEPTION_CA` environment variable) with the compiled-in
-  public webpki roots. Behind a deployment whose host-side egress proxy TLS-terminates bound
-  (credential-injecting) destinations, the upstream hop previously trusted only public roots, so
-  those exchanges failed the upstream handshake and surfaced as 502s through `HTTP(S)_PROXY` even
-  though the child's own trust bundle accepted the leaf (rustls has no `SSL_CERT_FILE` behavior,
-  so the bundle never reached this hop). The union is strictly additive — every public root stays,
-  publicly-anchored (spliced) routes verify exactly as before, and verification is never relaxed —
-  and fail-safe: an unset variable adds nothing, while a missing/unreadable/non-certificate file —
-  or a certificate that is not actually a CA (`BasicConstraints CA=true`, plus `keyCertSign` when a
-  KeyUsage extension is present; an end-entity leaf planted where the CA belongs must not become a
-  trust anchor) — warns loudly and degrades to public-roots-only, so capture of publicly-anchored
-  traffic survives a broken provisioning and deployment-terminated routes fail closed as before.
 - Captured `http.target` values are normalized consistently: the scheme-default port is stripped
   (`https://host:443/x` → `https://host/x`). Intercepted HTTP/1.1 requests carry the CONNECT
   authority's explicit `:443` while HTTP/2 requests keep their port-less `:authority`, so the same

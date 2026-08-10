@@ -72,7 +72,6 @@ use crate::seams::{
     NormalizationContext, NormalizationOutcome, NormalizeError, Normalizer, NormalizerDescriptor,
     NormalizerSupport, RawSignal, RawSignalSink, ShutdownSignal, Source, SourceError,
 };
-use crate::secret::SecretInjector;
 
 /// Default cap on captured body bytes per request/response, applied when the cap is
 /// left unspecified. Capture is buffered in memory before redaction/offload, so a
@@ -298,8 +297,7 @@ impl CertificateAuthority for ProxyAuthority {
 /// The public roots anchor spliced routes, where the upstream hop sees the real
 /// origin certificate (they are compiled in because native roots are empty in the
 /// minimal sandbox bases the interceptor runs in). The extra anchors admit
-/// deployment-terminated routes: a host-side egress proxy that terminates TLS for
-/// bound destinations serves leaves chained to its own interception CA, which no
+/// private upstream routes whose certificates chain to a deployment-provided CA, which no
 /// public root anchors — without it those exchanges fail this hop's verification
 /// even though the child's own trust bundle accepts them. Strictly additive: every
 /// public root is always present, so an extra anchor can only add trust, never
@@ -403,7 +401,6 @@ impl ProxyServer {
             config.redaction,
             config.egress,
             config.anomaly,
-            config.injector,
         );
         // Mirrors hudsucker's `with_rustls_connector` (HTTPS-or-HTTP, http1+http2 ALPN
         // on the HTTP connector, the un-ALPN'd config on the websocket connector),
@@ -438,7 +435,6 @@ pub struct ProxySourceConfig {
     redaction: RedactionPolicy,
     egress: Arc<EgressPolicy>,
     anomaly: Arc<AnomalyConfig>,
-    injector: Option<SecretInjector>,
     upstream_extra_trust_anchors: Vec<CertificateDer<'static>>,
 }
 
@@ -451,7 +447,6 @@ impl ProxySourceConfig {
             redaction: RedactionPolicy::default(),
             egress: Arc::new(EgressPolicy::default()),
             anomaly: Arc::new(AnomalyConfig::default()),
-            injector: None,
             upstream_extra_trust_anchors: Vec::new(),
         }
     }
@@ -481,13 +476,6 @@ impl ProxySourceConfig {
     #[must_use]
     pub fn with_anomaly(mut self, anomaly: AnomalyConfig) -> Self {
         self.anomaly = Arc::new(anomaly);
-        self
-    }
-
-    /// Configure destination-bound credential injection.
-    #[must_use]
-    pub fn with_injector(mut self, injector: Option<SecretInjector>) -> Self {
-        self.injector = injector;
         self
     }
 
@@ -600,16 +588,9 @@ pub(crate) struct CaptureHandler {
     /// Request-body anomaly detection run over the original request body (not the
     /// truncated/redacted captured copy). Disabled by default (a no-op).
     anomaly: Arc<AnomalyConfig>,
-    /// Credential injector, when the run binds secrets to hosts.
-    injector: Option<SecretInjector>,
     /// The canonicalized host from this clone's CONNECT (the SNI host), stashed so the
     /// decrypted request can reject a `Host`/`:authority` that disagrees with it.
     connect_host: Option<CanonicalHost>,
-    /// The credential values injected into the current request (one per binding on
-    /// the host), retained only long enough to scrub them from this exchange's
-    /// captured request/response copies. Zeroized when the handler clone is dropped
-    /// at end of exchange.
-    injected_secrets: Vec<zeroize::Zeroizing<String>>,
     /// Exchange id for the request currently being handled by this clone,
     /// minted in `on_request` and read back in `on_response`.
     exchange_id: Option<String>,
@@ -627,10 +608,6 @@ pub(crate) struct CaptureHandler {
 }
 
 impl CaptureHandler {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the cooperative proxy and transparent gateway both supply the same independent capture, policy, and injection seams"
-    )]
     pub(crate) fn new(
         sink: RawSignalSink,
         clock: Arc<HlcClock>,
@@ -639,7 +616,6 @@ impl CaptureHandler {
         redaction: RedactionPolicy,
         egress: Arc<EgressPolicy>,
         anomaly: Arc<AnomalyConfig>,
-        injector: Option<SecretInjector>,
     ) -> Self {
         Self {
             sink,
@@ -650,9 +626,7 @@ impl CaptureHandler {
             redaction,
             egress,
             anomaly,
-            injector,
             connect_host: None,
-            injected_secrets: Vec::new(),
             exchange_id: None,
             exchange_host: None,
             exchange_method: None,
@@ -666,13 +640,11 @@ impl CaptureHandler {
         self
     }
 
-    /// Enforces egress and (on a match) credential injection before capture: a CONNECT
+    /// Enforces egress before capture: a CONNECT
     /// to a denied host short-circuits with `403` before any tunnel is established; a
     /// decrypted request to a denied host (or one whose `Host` disagrees with the
-    /// CONNECT's SNI host) also short-circuits with `403`; a broker failure on an
-    /// injected request fails closed with `502` so the request is never forwarded
-    /// without its credential. Inherent (not the trait method) to stay testable
-    /// without an `HttpContext`.
+    /// CONNECT's SNI host) also short-circuits with `403`. Inherent (not the trait
+    /// method) to stay testable without an `HttpContext`.
     pub(crate) async fn on_request(&mut self, request: Request<Body>) -> RequestOrResponse {
         // CONNECT only establishes the TLS tunnel; the real request arrives after
         // interception. Capture nothing here, but enforce egress on the SNI host and
@@ -713,7 +685,7 @@ impl CaptureHandler {
         };
 
         // Reject a decrypted Host that disagrees with the CONNECT's SNI host before
-        // policy or injection. HTTP/2 connection reuse must not turn one intercepted
+        // policy enforcement. HTTP/2 connection reuse must not turn one intercepted
         // authority into an authorization for another origin.
         if let Some(connect_host) = &self.connect_host
             && connect_host != destination.host()
@@ -726,31 +698,10 @@ impl CaptureHandler {
             return denied.into();
         }
 
-        // Inject the bound credentials, if any; fail the request closed on broker error.
-        // `inject` borrows the injector (no per-request HashMap clone); the borrow ends
-        // before `capture_request`/`injected_secrets` take `&mut self`.
-        if self.injector.is_some() {
-            let mut request = request;
-            let injected = {
-                let injector = self.injector.as_ref().expect("checked is_some");
-                injector.inject(destination.host(), &mut request).await
-            };
-            match injected {
-                Ok(values) => self.injected_secrets = values,
-                Err(error) => {
-                    eprintln!(
-                        "hiloop-interceptor: credential broker resolve failed; failing request closed: {error}"
-                    );
-                    return bad_gateway().into();
-                }
-            }
-            return self.capture_request(request).await;
-        }
-
         self.capture_request(request).await
     }
 
-    /// Capture and forward a (post-egress, post-injection) request.
+    /// Capture and forward a request after its egress checks pass.
     ///
     /// The request body is teed like the response: each frame is forwarded upstream
     /// the moment the client sends it while the captured copy accumulates separately
@@ -844,8 +795,6 @@ impl CaptureHandler {
             _ => bytes.clone(),
         };
         // Only the captured copy is redacted; the forwarded `bytes` are never touched.
-        // An injected credential is scrubbed as an exact literal even if redaction is
-        // off, so the placeholder — not the secret — is all that reaches telemetry.
         let captured = self.redact_capture(captured);
 
         // Inspect the ORIGINAL body (full pre-truncation length, unredacted bytes) for
@@ -1005,11 +954,9 @@ impl CaptureHandler {
         let _ = self.sink.try_send(raw);
     }
 
-    /// Redact a captured body: the configured pattern policy plus any credentials this
-    /// exchange injected (scrubbed as exact literals so they never reach telemetry,
-    /// even when pattern redaction is disabled).
+    /// Redact a captured body with the configured pattern policy.
     fn redact_capture(&self, body: Bytes) -> Bytes {
-        redact_with_injected(self.redaction, body, &self.injected_secrets)
+        self.redaction.redact_body(body)
     }
 
     pub(crate) fn on_response(&mut self, response: Response<Body>) -> Response<Body> {
@@ -1072,7 +1019,6 @@ impl CaptureHandler {
             max_capture_bytes: self.max_capture_bytes,
             truncated: false,
             redaction: self.redaction,
-            injected_secrets: self.injected_secrets.clone(),
             capped: false,
             media_type,
             attributes,
@@ -1196,9 +1142,6 @@ struct TeeState {
     /// Scrubs secrets from the buffered capture before it reaches the blob; the
     /// bytes forwarded onward are never touched.
     redaction: RedactionPolicy,
-    /// Credentials injected into this exchange, scrubbed as exact literals from the
-    /// captured copy so they never reach telemetry (even if pattern redaction is off).
-    injected_secrets: Vec<zeroize::Zeroizing<String>>,
     /// Set once the cap is hit and further bytes stop being captured.
     capped: bool,
     media_type: Option<String>,
@@ -1267,7 +1210,6 @@ impl TeeState {
             blob_store: self.blob_store.as_ref(),
             captured: std::mem::take(&mut self.captured),
             redaction: self.redaction,
-            injected_secrets: std::mem::take(&mut self.injected_secrets),
             media_type: self.media_type.take(),
             truncated: truncated || self.truncated || self.capped,
             inspection: self.inspection.take(),
@@ -1303,7 +1245,6 @@ impl Drop for TeeState {
         let captured = std::mem::take(&mut self.captured);
         let capture_permit = self.capture_permit.take();
         let redaction = self.redaction;
-        let injected_secrets = std::mem::take(&mut self.injected_secrets);
         let media_type = self.media_type.take();
         let inspection = self.inspection.take();
         let sink = self.sink.clone();
@@ -1316,7 +1257,6 @@ impl Drop for TeeState {
                 blob_store: blob_store.as_ref(),
                 captured,
                 redaction,
-                injected_secrets,
                 media_type,
                 truncated: true,
                 inspection,
@@ -1337,7 +1277,6 @@ struct FinalizeTee<'a> {
     blob_store: &'a dyn BlobStore,
     captured: Vec<u8>,
     redaction: RedactionPolicy,
-    injected_secrets: Vec<zeroize::Zeroizing<String>>,
     media_type: Option<String>,
     truncated: bool,
     /// Request-tee anomaly scan to evaluate and stamp; `None` on response tees.
@@ -1345,21 +1284,6 @@ struct FinalizeTee<'a> {
     /// Body bytes observed on the wire (counted past the capture cap); on a
     /// mid-stream abort, what was seen before the stream ended.
     wire_bytes: u64,
-}
-
-/// Redact `body` with the configured pattern policy plus the exchange's injected
-/// credentials as exact literals (scrubbed even when pattern redaction is disabled,
-/// so an injected secret can never reach telemetry).
-fn redact_with_injected(
-    redaction: RedactionPolicy,
-    body: Bytes,
-    secrets: &[zeroize::Zeroizing<String>],
-) -> Bytes {
-    if secrets.is_empty() {
-        return redaction.redact_body(body);
-    }
-    let literals: Vec<&[u8]> = secrets.iter().map(|secret| secret.as_bytes()).collect();
-    redaction.redact_body_with_literals(body, &literals)
 }
 
 /// Redact the buffered capture once, offload it to the blob store, and build the
@@ -1375,7 +1299,6 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         blob_store,
         captured,
         redaction,
-        injected_secrets,
         media_type,
         truncated,
         inspection,
@@ -1383,7 +1306,7 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
     } = args;
 
     let captured = Bytes::from(captured);
-    let stored = redact_with_injected(redaction, captured, &injected_secrets);
+    let stored = redaction.redact_body(captured);
     let host = attributes
         .iter()
         .find_map(|(key, value)| (*key == "http.host").then(|| value.clone()));
@@ -1511,8 +1434,7 @@ fn forbidden() -> Response<Body> {
         .expect("static 403 response builds")
 }
 
-/// A `502 Bad Gateway` short-circuit returned when an injected credential could not be
-/// resolved — the request is failed closed rather than forwarded without it.
+/// A `502 Bad Gateway` short-circuit returned when the upstream request fails.
 fn bad_gateway() -> Response<Body> {
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)
@@ -1959,7 +1881,6 @@ mod tests {
             max_capture_bytes,
             redaction,
             Arc::new(EgressPolicy::default()),
-            None,
         )
     }
 
@@ -1967,7 +1888,6 @@ mod tests {
         max_capture_bytes: Option<u64>,
         redaction: RedactionPolicy,
         egress: Arc<EgressPolicy>,
-        injector: Option<SecretInjector>,
     ) -> (
         CaptureHandler,
         mpsc::Receiver<Result<RawSignal, SourceError>>,
@@ -1978,7 +1898,6 @@ mod tests {
             redaction,
             egress,
             Arc::new(AnomalyConfig::default()),
-            injector,
         )
     }
 
@@ -1987,7 +1906,6 @@ mod tests {
         redaction: RedactionPolicy,
         egress: Arc<EgressPolicy>,
         anomaly: Arc<AnomalyConfig>,
-        injector: Option<SecretInjector>,
     ) -> (
         CaptureHandler,
         mpsc::Receiver<Result<RawSignal, SourceError>>,
@@ -2003,7 +1921,6 @@ mod tests {
             redaction,
             egress,
             anomaly,
-            injector,
         );
         (handler, rx, store)
     }
@@ -2266,8 +2183,7 @@ mod tests {
         use hudsucker::rustls::pki_types::{ServerName, UnixTime};
 
         let host = Authority::from_static("api.example.com");
-        // The deployment interception CA and a leaf it terminated `host` with —
-        // the exact shape a host-side egress proxy presents on bound routes.
+        // A private upstream CA and a leaf it issued for `host`.
         let interception_ca = ProxyCa::generate().expect("generate interception CA");
         let bound_leaf = interception_ca.authority.gen_cert(&host);
         // A CA the deployment never provisioned.
@@ -2743,7 +2659,6 @@ mod tests {
             RedactionPolicy::default(),
             Arc::new(EgressPolicy::default()),
             anomaly,
-            None,
         );
         let request = Request::builder()
             .method("POST")
@@ -2780,7 +2695,6 @@ mod tests {
             RedactionPolicy::default(),
             Arc::new(EgressPolicy::default()),
             anomaly,
-            None,
         );
         let request = Request::builder()
             .method("POST")
@@ -3007,7 +2921,6 @@ mod tests {
             RedactionPolicy::default(),
             Arc::new(EgressPolicy::default()),
             anomaly,
-            None,
         );
         let request = Request::builder()
             .method("POST")
@@ -3043,7 +2956,6 @@ mod tests {
             RedactionPolicy::default(),
             Arc::new(EgressPolicy::default()),
             anomaly,
-            None,
         );
         // A large, all-base64-alphabet body: without inspecting the original it would be
         // truncated to 64 bytes and evade both the upload and base64 rules.
@@ -3186,74 +3098,6 @@ mod tests {
         assert_eq!(
             signal.attributes.get("http.host").map(String::as_str),
             Some("fallback.example.com")
-        );
-    }
-
-    #[tokio::test]
-    async fn brokered_llm_request_records_safe_model_without_tool_definition_metadata() {
-        let url = stub_broker("sk-real-secret-value").await;
-        let injector = injector_for(&url, "api.openai.com");
-        let (mut handler, mut rx, store) = handler_with_egress(
-            None,
-            RedactionPolicy::default(),
-            Arc::new(EgressPolicy::default()),
-            Some(injector),
-        );
-        let body = Bytes::from_static(
-            br#"{"model":"gpt-5-codex","messages":[{"role":"user","content":"do not leak this prompt"}],"tools":[{"type":"function","function":{"name":"run_shell","description":"do not leak this description"}}],"metadata":{"echo":"sk-real-secret-value"}}"#,
-        );
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/responses")
-            .header(CONTENT_TYPE, "application/json")
-            .header(HOST, "api.openai.com:443")
-            .header("authorization", "Bearer hil-secret://openai-prod")
-            .body(Body::from(body.clone()))
-            .expect("request");
-
-        let forwarded = expect_forwarded(handler.on_request(request).await);
-        assert_eq!(
-            forwarded
-                .headers()
-                .get("authorization")
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer sk-real-secret-value")
-        );
-        assert_eq!(drain_body(forwarded.into_body()).await.concat(), body);
-
-        let signal = rx.recv().await.expect("signal").expect("raw");
-        assert_eq!(
-            signal.attributes.get("http.host").map(String::as_str),
-            Some("api.openai.com")
-        );
-        assert_eq!(
-            signal
-                .attributes
-                .get(GEN_AI_REQUEST_MODEL_ATTR)
-                .map(String::as_str),
-            Some("gpt-5-codex")
-        );
-        assert!(!signal.attributes.contains_key(TOOL_CALL_ATTR));
-        for forbidden in [
-            "do not leak this prompt",
-            "do not leak this description",
-            "run_shell",
-            "sk-real-secret-value",
-        ] {
-            assert!(
-                signal
-                    .attributes
-                    .values()
-                    .all(|value| !value.contains(forbidden)),
-                "attributes must not include {forbidden}"
-            );
-        }
-        let blob = &store.blobs()[0].1;
-        assert!(
-            !blob
-                .windows(20)
-                .any(|window| window == b"sk-real-secret-value"),
-            "captured blob must redact the brokered credential"
         );
     }
 
@@ -3549,7 +3393,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             Arc::new(EgressPolicy::default()),
-            None,
         );
         let request = Request::builder()
             .method("GET")
@@ -3569,7 +3412,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             deny_policy(&["api.anthropic.com"], &[]),
-            None,
         );
         let response =
             expect_response(handler.on_request(connect_request("example.com:443")).await);
@@ -3605,7 +3447,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             deny_policy(&["api.anthropic.com"], &[]),
-            None,
         );
         let _forwarded = expect_forwarded(
             handler
@@ -3624,7 +3465,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             allow_block_policy(&["blocked.example.com"]),
-            None,
         );
         let request = Request::builder()
             .method("POST")
@@ -3658,7 +3498,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             deny_policy(&["allowed.example.com"], &[]),
-            None,
         );
         let _ = expect_forwarded(
             handler
@@ -3688,7 +3527,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             Arc::new(EgressPolicy::default()),
-            None,
         );
         let _ = expect_forwarded(
             handler
@@ -3717,7 +3555,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             deny_policy(&[], &["10.0.0.0/8"]),
-            None,
         );
         // Decimal-notation IP for a denied address — must be canonicalized and denied.
         let response = expect_response(handler.on_request(connect_request("2130706433:443")).await);
@@ -3737,7 +3574,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             deny_policy(&["allowed.example.com"], &[]),
-            None,
         );
         // A Host header carrying whitespace is a valid header value but fails
         // canonicalization (which rejects whitespace, percent, control chars, etc.).
@@ -3771,7 +3607,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             deny_policy(&["allowed.example.com"], &[]),
-            None,
         );
         let request = Request::builder()
             .method("GET")
@@ -3795,7 +3630,6 @@ mod tests {
             None,
             RedactionPolicy::default(),
             Arc::new(EgressPolicy::default()),
-            None,
         );
         let request = Request::builder()
             .method("GET")
@@ -3805,146 +3639,6 @@ mod tests {
         let _forwarded = expect_forwarded(handler.on_request(request).await);
         let signal = rx.recv().await.expect("signal").expect("raw");
         assert_eq!(signal.kind, REQUEST_KIND);
-    }
-
-    // --- credential injection through the handler ---
-
-    use crate::secret::{BrokerConfig, SecretBinding};
-    use hyper::server::conn::http1 as broker_http1;
-    use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
-
-    /// Spin a stub broker that always returns `{"value": <value>}` with 200.
-    async fn stub_broker(value: &'static str) -> String {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let io = TokioIo::new(stream);
-                tokio::spawn(async move {
-                    let service = service_fn(move |_req| async move {
-                        Ok::<_, std::convert::Infallible>(
-                            Response::builder()
-                                .status(200)
-                                .body(http_body_util::Full::new(Bytes::from_static(
-                                    format!("{{\"value\":\"{value}\"}}").leak().as_bytes(),
-                                )))
-                                .expect("response"),
-                        )
-                    });
-                    let _ = broker_http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await;
-                });
-            }
-        });
-        format!("http://{addr}/resolve")
-    }
-
-    fn injector_for(url: &str, host: &str) -> SecretInjector {
-        SecretInjector::new(
-            [SecretBinding {
-                name: "openai-prod".to_owned(),
-                env_placeholder: "hil-secret://openai-prod".to_owned(),
-                host: host.to_owned(),
-                header: "authorization".to_owned(),
-                scheme: "Bearer".to_owned(),
-            }],
-            &BrokerConfig {
-                url: url.to_owned(),
-                token: "broker-token".to_owned(),
-            },
-        )
-        .expect("injector")
-    }
-
-    #[tokio::test]
-    async fn injected_credential_is_redacted_from_captured_body() {
-        // The credential value the broker returns is echoed into the request body here
-        // to prove the capture path scrubs it (real injection is into a header, which
-        // the proxy never captures; this guards the literal-redaction wiring).
-        let url = stub_broker("sk-real-secret-value").await;
-        let injector = injector_for(&url, "api.openai.com");
-        let (mut handler, mut rx, store) = handler_with_egress(
-            None,
-            RedactionPolicy::default(),
-            Arc::new(EgressPolicy::default()),
-            Some(injector),
-        );
-        let request = Request::builder()
-            .method("POST")
-            .uri("http://api.openai.com/v1/chat")
-            .header("authorization", "Bearer hil-secret://openai-prod")
-            .body(Body::from(Bytes::from_static(
-                b"echo sk-real-secret-value here",
-            )))
-            .expect("request");
-
-        let forwarded = expect_forwarded(handler.on_request(request).await);
-        // The forwarded request carries the real credential in the header.
-        assert_eq!(
-            forwarded
-                .headers()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok()),
-            Some("Bearer sk-real-secret-value")
-        );
-        drain_body(forwarded.into_body()).await;
-
-        let signal = rx.recv().await.expect("signal").expect("raw");
-        assert_eq!(signal.kind, REQUEST_KIND);
-        // The captured copy must not contain the secret value.
-        let blob = &store.blobs()[0].1;
-        assert!(
-            !blob.windows(20).any(|w| w == b"sk-real-secret-value"),
-            "captured body must not leak the injected credential"
-        );
-        assert_eq!(blob, b"echo [REDACTED] here");
-    }
-
-    #[tokio::test]
-    async fn credential_not_injected_on_unbound_host() {
-        let url = stub_broker("sk-real-secret-value").await;
-        let injector = injector_for(&url, "api.openai.com");
-        let (mut handler, _rx, _store) = handler_with_egress(
-            None,
-            RedactionPolicy::default(),
-            Arc::new(EgressPolicy::default()),
-            Some(injector),
-        );
-        let request = Request::builder()
-            .method("GET")
-            .uri("http://other.example.com/")
-            .body(Body::empty())
-            .expect("request");
-        let forwarded = expect_forwarded(handler.on_request(request).await);
-        assert!(
-            forwarded.headers().get("authorization").is_none(),
-            "an unbound host must not receive a credential"
-        );
-    }
-
-    #[tokio::test]
-    async fn broker_failure_fails_request_closed() {
-        // Point at a closed port so the broker call fails; the request must be blocked.
-        let injector = injector_for("http://127.0.0.1:1/resolve", "api.openai.com");
-        let (mut handler, _rx, _store) = handler_with_egress(
-            None,
-            RedactionPolicy::default(),
-            Arc::new(EgressPolicy::default()),
-            Some(injector),
-        );
-        let request = Request::builder()
-            .method("POST")
-            .uri("http://api.openai.com/v1/chat")
-            .body(Body::empty())
-            .expect("request");
-        let response = expect_response(handler.on_request(request).await);
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_GATEWAY,
-            "a broker failure must fail the request closed, not forward it"
-        );
     }
 
     // --- streaming request bodies (client-streaming / bidi gRPC shape) ---

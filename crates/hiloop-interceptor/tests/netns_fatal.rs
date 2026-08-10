@@ -2,7 +2,7 @@
 
 use std::{
     net::Ipv6Addr,
-    num::{NonZeroU8, NonZeroU16},
+    num::NonZeroU16,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -11,14 +11,14 @@ use std::{
 
 use async_trait::async_trait;
 use hiloop_core::{
-    capture::{CaptureFatalReason, OriginalDestination, TlsFlowIdentity},
-    event::Event,
+    capture::CaptureFatalReason,
+    event::{AttributeValue, Event},
     identity::RunContext,
 };
 use hiloop_interceptor::{
     netns::{
-        DataplaneLatch, FatalReport, FatalRunSupervisor, FragmentedUdpBehavior, NamespaceCommand,
-        NetworkProvisioner, ProvisionRequest, SubstrateExit, SubstrateInfo,
+        FatalRunSupervisor, FragmentedUdpBehavior, NamespaceCommand, NetworkProvisioner,
+        ProvisionRequest, SubstrateInfo,
         testing::{
             FakeNetworkProvisioner, FakeProvisionerCall, FakeProvisionerHandle, FakeSessionOutcome,
         },
@@ -26,9 +26,6 @@ use hiloop_interceptor::{
     seams::{ExportError, Exporter},
 };
 use tokio::sync::{Notify, oneshot};
-
-#[cfg(target_os = "linux")]
-use hiloop_interceptor::netns::GatewayFatalController;
 
 fn info() -> SubstrateInfo {
     SubstrateInfo::new(
@@ -52,39 +49,11 @@ fn request() -> ProvisionRequest {
     )
 }
 
-fn tls_report(reason: CaptureFatalReason) -> FatalReport {
-    let destination =
-        OriginalDestination::new("203.0.113.10".parse().expect("test destination"), 443)
-            .expect("valid destination");
-    let flow = TlsFlowIdentity::new(destination)
-        .with_server_name("api.example.com")
-        .expect("test SNI")
-        .with_client_hello_fingerprint("ja4:test")
-        .expect("test fingerprint");
-    FatalReport::tls(reason, flow)
-}
-
-fn teardown_calls(handle: &FakeProvisionerHandle) -> Vec<FakeProvisionerCall> {
-    handle
-        .calls()
-        .into_iter()
-        .filter(|call| {
-            matches!(
-                call,
-                FakeProvisionerCall::Shutdown
-                    | FakeProvisionerCall::CloseDataplane
-                    | FakeProvisionerCall::TerminateNamespace
-                    | FakeProvisionerCall::ReapHelpers
-            )
-        })
-        .collect()
-}
-
 #[derive(Debug)]
 struct OrderingExporter {
     provisioner: FakeProvisionerHandle,
-    events: Mutex<Vec<Event>>,
     calls_at_export: Mutex<Vec<FakeProvisionerCall>>,
+    events: Mutex<Vec<Event>>,
     flushes: AtomicUsize,
 }
 
@@ -92,17 +61,10 @@ impl OrderingExporter {
     fn new(provisioner: FakeProvisionerHandle) -> Self {
         Self {
             provisioner,
-            events: Mutex::new(Vec::new()),
             calls_at_export: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             flushes: AtomicUsize::new(0),
         }
-    }
-
-    fn events(&self) -> Vec<Event> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
     fn calls_at_export(&self) -> Vec<FakeProvisionerCall> {
@@ -112,8 +74,11 @@ impl OrderingExporter {
             .clone()
     }
 
-    fn flushes(&self) -> usize {
-        self.flushes.load(Ordering::Acquire)
+    fn events(&self) -> Vec<Event> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -132,69 +97,8 @@ impl Exporter for OrderingExporter {
     }
 
     async fn flush(&self) -> Result<(), ExportError> {
-        self.flushes.fetch_add(1, Ordering::AcqRel);
+        self.flushes.fetch_add(1, Ordering::SeqCst);
         Ok(())
-    }
-}
-
-#[tokio::test]
-async fn every_secret_fatal_closes_and_reaps_before_durable_nonzero_result() {
-    for reason in [
-        CaptureFatalReason::SecretBindUnterminatable,
-        CaptureFatalReason::SecretRouteAmbiguous,
-        CaptureFatalReason::SecretDestinationMismatch,
-        CaptureFatalReason::SecretPassthroughForbidden,
-        CaptureFatalReason::SecretRouteIdentityMismatch,
-        CaptureFatalReason::SecretTransportInsecure,
-        CaptureFatalReason::SecretTransportUnsupported,
-    ] {
-        let (fake, handle) = FakeNetworkProvisioner::passing(
-            hiloop_interceptor::netns::PreflightReport::passed(true),
-            info(),
-            SubstrateExit::Code(0),
-        );
-        let mut session = fake.provision(request()).await.expect("fake provision");
-        let exporter = Arc::new(OrderingExporter::new(handle.clone()));
-        let supervisor = FatalRunSupervisor::new(
-            RunContext::new_local_root(),
-            Arc::<OrderingExporter>::clone(&exporter),
-        );
-
-        let fatal = supervisor
-            .terminate(session.as_mut(), tls_report(reason))
-            .await;
-
-        assert_eq!(fatal.reason(), reason);
-        assert_eq!(
-            fatal.exit_code(),
-            NonZeroU8::new(1).expect("one is nonzero")
-        );
-        assert!(fatal.event_persisted(), "{reason}");
-        assert_eq!(exporter.flushes(), 1, "{reason}");
-        assert_eq!(
-            teardown_calls(&handle),
-            [
-                FakeProvisionerCall::Shutdown,
-                FakeProvisionerCall::CloseDataplane,
-                FakeProvisionerCall::TerminateNamespace,
-                FakeProvisionerCall::ReapHelpers,
-            ],
-            "{reason}"
-        );
-        assert!(
-            exporter.calls_at_export().ends_with(&[
-                FakeProvisionerCall::CloseDataplane,
-                FakeProvisionerCall::TerminateNamespace,
-                FakeProvisionerCall::ReapHelpers,
-            ]),
-            "persistence began before teardown for {reason}"
-        );
-        let event = serde_json::to_value(&exporter.events()[0]).expect("fatal event JSON");
-        assert_eq!(event["name"], "capture.fatal");
-        assert_eq!(event["attributes"]["reason"], reason.to_string());
-        assert!(event["attributes"].get("secret").is_none());
-        assert!(event["attributes"].get("secret.name").is_none());
-        assert!(event["attributes"].get("secret.value").is_none());
     }
 }
 
@@ -237,40 +141,18 @@ async fn worker_crash_becomes_dataplane_fatal_after_ordered_teardown() {
             .calls_at_export()
             .ends_with(&[FakeProvisionerCall::ReapHelpers])
     );
-}
-
-#[tokio::test]
-async fn gateway_fatal_signal_reaches_the_supervisor_only_after_fake_teardown() {
-    let report = tls_report(CaptureFatalReason::SecretDestinationMismatch);
-    let (fake, handle) = FakeNetworkProvisioner::scripted(
-        hiloop_interceptor::netns::PreflightReport::passed(true),
-        info(),
-        FakeSessionOutcome::Fatal(report),
-    );
-    let mut session = fake.provision(request()).await.expect("fake provision");
-    let exporter = Arc::new(OrderingExporter::new(handle.clone()));
-    let supervisor = FatalRunSupervisor::new(
-        RunContext::new_local_root(),
-        Arc::<OrderingExporter>::clone(&exporter),
-    );
-
-    let fatal = supervisor
-        .wait(session.as_mut())
-        .await
-        .expect_err("fatal report must fail the run")
-        .into_fatal()
-        .expect("typed fatal result");
-
+    let events = exporter.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name.as_str(), "capture.fatal");
     assert_eq!(
-        fatal.reason(),
-        CaptureFatalReason::SecretDestinationMismatch
+        events[0]
+            .attributes
+            .iter()
+            .find(|(key, _)| key.as_str() == "reason")
+            .map(|(_, value)| value),
+        Some(&AttributeValue::String("dataplane_failed".to_owned()))
     );
-    assert!(fatal.event_persisted());
-    assert!(
-        exporter
-            .calls_at_export()
-            .ends_with(&[FakeProvisionerCall::ReapHelpers])
-    );
+    assert_eq!(exporter.flushes.load(Ordering::SeqCst), 1);
 }
 
 #[derive(Debug)]
@@ -298,10 +180,13 @@ impl Exporter for BlockingExporter {
 
 #[tokio::test]
 async fn event_backpressure_starts_only_after_the_retry_window_is_closed() {
-    let (fake, handle) = FakeNetworkProvisioner::passing(
+    let (fake, handle) = FakeNetworkProvisioner::scripted(
         hiloop_interceptor::netns::PreflightReport::passed(true),
         info(),
-        SubstrateExit::Code(0),
+        FakeSessionOutcome::DataplaneFailure {
+            component: "gateway_worker",
+            diagnostic: "fixture crash".to_owned(),
+        },
     );
     let mut session = fake.provision(request()).await.expect("fake provision");
     let (started_tx, started_rx) = oneshot::channel();
@@ -314,21 +199,7 @@ async fn event_backpressure_starts_only_after_the_retry_window_is_closed() {
         RunContext::new_local_root(),
         Arc::<BlockingExporter>::clone(&exporter),
     );
-    let transition = tokio::spawn(async move {
-        supervisor
-            .terminate(
-                session.as_mut(),
-                FatalReport::destination(
-                    CaptureFatalReason::SecretTransportUnsupported,
-                    OriginalDestination::new(
-                        "203.0.113.10".parse().expect("test destination"),
-                        443,
-                    )
-                    .expect("valid destination"),
-                ),
-            )
-            .await
-    });
+    let transition = tokio::spawn(async move { supervisor.wait(session.as_mut()).await });
 
     let calls = started_rx.await.expect("export started");
     assert!(calls.ends_with(&[
@@ -342,91 +213,11 @@ async fn event_backpressure_starts_only_after_the_retry_window_is_closed() {
     );
 
     exporter.release.notify_one();
-    assert!(transition.await.expect("transition task").event_persisted());
-}
-
-#[tokio::test]
-async fn atomic_latch_cancels_active_flows_and_rejects_later_admission() {
-    let latch = DataplaneLatch::new();
-    let active = latch.clone();
-    let (started_tx, started_rx) = oneshot::channel();
-    let flow = tokio::spawn(async move {
-        active
-            .run(async move {
-                let _ = started_tx.send(());
-                std::future::pending::<()>().await;
-            })
-            .await
-    });
-    started_rx.await.expect("flow started");
-
-    latch.close().await;
-
-    assert!(latch.is_closed());
-    assert!(flow.await.expect("flow task").is_err());
-    assert!(latch.run(async {}).await.is_err());
-}
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn gateway_controller_drains_the_latch_before_reporting_fatality() {
-    use std::os::unix::net::UnixDatagram;
-
-    let (manager, worker) = UnixDatagram::pair().expect("private control pair");
-    manager.set_nonblocking(true).expect("nonblocking manager");
-    let manager = tokio::net::UnixDatagram::from_std(manager).expect("async manager");
-    let latch = DataplaneLatch::new();
-    let controller = GatewayFatalController::new(latch.clone(), &worker).expect("fatal controller");
-    let active = latch.clone();
-    let (started_tx, started_rx) = oneshot::channel();
-    let flow = tokio::spawn(async move {
-        active
-            .run(async move {
-                let _ = started_tx.send(());
-                std::future::pending::<()>().await;
-            })
-            .await
-    });
-    started_rx.await.expect("flow started");
-
-    controller
-        .trigger(&tls_report(CaptureFatalReason::SecretBindUnterminatable))
+    let fatal = transition
         .await
-        .expect("report fatal");
-
-    assert!(latch.is_closed());
-    assert!(flow.await.expect("flow task").is_err());
-    let mut frame = [0_u8; 4 * 1024];
-    assert!(manager.recv(&mut frame).await.expect("manager report") > 1);
-}
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn cancelling_a_trigger_waiter_cannot_strand_the_closed_dataplane() {
-    use std::os::unix::net::UnixDatagram;
-
-    let (manager, worker) = UnixDatagram::pair().expect("private control pair");
-    manager.set_nonblocking(true).expect("nonblocking manager");
-    let manager = tokio::net::UnixDatagram::from_std(manager).expect("async manager");
-    let controller =
-        GatewayFatalController::new(DataplaneLatch::new(), &worker).expect("fatal controller");
-    let waiter = {
-        let controller = controller.clone();
-        tokio::spawn(async move {
-            controller
-                .trigger(&tls_report(CaptureFatalReason::SecretRouteAmbiguous))
-                .await
-        })
-    };
-    tokio::task::yield_now().await;
-    waiter.abort();
-
-    let mut frame = [0_u8; 4 * 1024];
-    let received =
-        tokio::time::timeout(std::time::Duration::from_secs(1), manager.recv(&mut frame))
-            .await
-            .expect("internally owned report task timed out")
-            .expect("manager report");
-    assert!(received > 1);
-    assert!(controller.latch().is_closed());
+        .expect("transition task")
+        .expect_err("worker crash")
+        .into_fatal()
+        .expect("typed dataplane fatal");
+    assert!(fatal.event_persisted());
 }

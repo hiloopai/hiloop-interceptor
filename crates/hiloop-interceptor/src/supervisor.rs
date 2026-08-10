@@ -25,7 +25,6 @@ use crate::{
         Exporter, NormalizationContext, Normalizer, NormalizerRouter, ProcessContext,
         RawRetentionPolicy, RawSignal, RawStore, SourceError, provenance_keys,
     },
-    secret::{BrokerConfig, SecretBinding, SecretInjector},
     session::CaptureSession,
     spool::{SpoolPolicy, SpoolReport, SpoolingExporter},
     stdio::StdioLogNormalizer,
@@ -37,7 +36,6 @@ use hiloop_core::{
     event::{AttributeKey, AttributeValue, Attributes, Event, EventName, SignalType},
     identity::{Hlc, RunContext},
 };
-use hudsucker::rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use std::{
     ffi::OsString,
     future::Future,
@@ -139,71 +137,6 @@ pub(crate) fn union_ca_bundle(system_roots: Option<&[u8]>, interception_ca_pem: 
     bundle
 }
 
-/// Names the PEM file of a deployment's egress interception CA, when the wrapper runs
-/// behind a host-side egress proxy that terminates TLS for bound (credential-injecting)
-/// destinations. Deployments that provision such a proxy also provision this variable
-/// and file into the sandbox; both are absent everywhere else.
-///
-/// The proxy's *upstream* TLS client must trust that CA explicitly: rustls has no
-/// `SSL_CERT_FILE` behavior, so the union bundle exported to the child does not reach
-/// this hop. See [`load_extra_upstream_trust_anchors`].
-const EGRESS_INTERCEPTION_CA_ENV: &str = "HILOOP_EGRESS_INTERCEPTION_CA";
-
-/// Load the deployment egress interception CA named by [`EGRESS_INTERCEPTION_CA_ENV`]
-/// for the proxy's upstream trust union.
-///
-/// Fail-safe by contract: an unset/empty variable means no deployment CA is
-/// provisioned (the common case outside managed sandboxes) and contributes nothing,
-/// silently; a set variable whose file is unreadable, empty, or not certificate PEM
-/// warns loudly and contributes nothing — capture of publicly-anchored traffic must
-/// survive a broken CA provisioning, while deployment-terminated routes then fail
-/// closed at the upstream handshake exactly as if the CA had never been provisioned.
-fn load_extra_upstream_trust_anchors() -> Vec<CertificateDer<'static>> {
-    match std::env::var_os(EGRESS_INTERCEPTION_CA_ENV) {
-        Some(path) if !path.is_empty() => interception_ca_anchors(Path::new(&path)),
-        _ => Vec::new(),
-    }
-}
-
-/// Parse the interception CA file into upstream trust anchors, warning loudly (and
-/// returning no anchors) on any failure. See [`load_extra_upstream_trust_anchors`]
-/// for the fail-safe contract.
-fn interception_ca_anchors(path: &Path) -> Vec<CertificateDer<'static>> {
-    let pem = match std::fs::read(path) {
-        Ok(pem) => pem,
-        Err(error) => {
-            eprintln!(
-                "hiloop-interceptor: warning: egress interception CA {} is unreadable; \
-                 continuing with public roots only, so TLS the egress proxy terminates for \
-                 bound routes will fail upstream verification: {error}",
-                path.display()
-            );
-            return Vec::new();
-        }
-    };
-    match CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>() {
-        Ok(anchors) if anchors.is_empty() => {
-            eprintln!(
-                "hiloop-interceptor: warning: egress interception CA {} contains no \
-                 certificates; continuing with public roots only, so TLS the egress proxy \
-                 terminates for bound routes will fail upstream verification",
-                path.display()
-            );
-            Vec::new()
-        }
-        Ok(anchors) => anchors,
-        Err(error) => {
-            eprintln!(
-                "hiloop-interceptor: warning: egress interception CA {} is not certificate \
-                 PEM; continuing with public roots only, so TLS the egress proxy terminates \
-                 for bound routes will fail upstream verification: {error}",
-                path.display()
-            );
-            Vec::new()
-        }
-    }
-}
-
 type CaptureFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 
 /// gRPC export target for captured events.
@@ -251,8 +184,6 @@ pub struct RunOptions {
     redaction: RedactionPolicy,
     egress: EgressPolicy,
     anomaly: AnomalyConfig,
-    secret_bindings: Vec<SecretBinding>,
-    secret_broker: Option<BrokerConfig>,
     verbose_diagnostics: bool,
     env_allowlist: Vec<String>,
     ca_bundle: Option<PathBuf>,
@@ -321,8 +252,6 @@ impl RunOptions {
             redaction: RedactionPolicy::default(),
             egress: EgressPolicy::default(),
             anomaly: AnomalyConfig::default(),
-            secret_bindings: Vec::new(),
-            secret_broker: None,
             verbose_diagnostics: false,
             env_allowlist: Vec::new(),
             ca_bundle: None,
@@ -365,20 +294,6 @@ impl RunOptions {
     /// The configured anomaly-detection policy (default disabled).
     pub fn anomaly_config(&self) -> &AnomalyConfig {
         &self.anomaly
-    }
-
-    /// Bind named secrets to destination hosts and configure the credential broker the
-    /// proxy resolves them from. Injection applies only when `proxy` is enabled; a
-    /// binding with no broker configured is a configuration error caught by [`run`].
-    #[must_use]
-    pub fn with_secret_bindings(
-        mut self,
-        bindings: Vec<SecretBinding>,
-        broker: BrokerConfig,
-    ) -> Self {
-        self.secret_bindings = bindings;
-        self.secret_broker = Some(broker);
-        self
     }
 
     /// Override the export batch size: a partial batch is shipped once this many events accumulate.
@@ -448,8 +363,7 @@ impl RunOptions {
     /// Record these environment variables on the run's `process.start` event:
     /// the names as `process.env_allowlist`, and each listed variable that is
     /// set in the child's environment as a `process.env.<NAME>` attribute whose
-    /// value is scrubbed by the run's capture-side redaction (the same pattern
-    /// and known-secret-literal passes applied to captured bodies) before it is
+    /// value is scrubbed by the run's capture-side pattern redaction before it is
     /// recorded. Variables not listed here are never captured — the environment
     /// is a known secret carrier, so value capture stays strictly opt-in. Empty
     /// (the default) captures nothing and omits both attributes.
@@ -527,14 +441,6 @@ impl RunOptions {
 
     pub(crate) fn anomaly(&self) -> &AnomalyConfig {
         &self.anomaly
-    }
-
-    pub(crate) fn secret_bindings(&self) -> &[SecretBinding] {
-        &self.secret_bindings
-    }
-
-    pub(crate) fn secret_broker(&self) -> Option<&BrokerConfig> {
-        self.secret_broker.as_ref()
     }
 
     pub(crate) fn execution_id(&self) -> Option<&str> {
@@ -740,17 +646,6 @@ pub async fn run(options: &RunOptions) -> Result<ExitCode> {
         }
     }
 
-    if !options.secret_bindings.is_empty() {
-        if !options.network_capture.uses_proxy() {
-            bail!(
-                "secret bindings require --proxy: credentials are injected into intercepted HTTP(S) requests"
-            );
-        }
-        if options.secret_broker.is_none() {
-            bail!("secret bindings require a configured credential broker");
-        }
-    }
-
     if !options.egress.is_allow_all() && !options.network_capture.uses_proxy() {
         bail!(
             "an egress policy requires --proxy: egress is enforced on intercepted HTTP(S) traffic"
@@ -925,13 +820,6 @@ where
         )),
         _ => None,
     };
-    let injector = match (&options.secret_broker, options.secret_bindings.is_empty()) {
-        (Some(broker), false) => Some(
-            SecretInjector::new(options.secret_bindings.clone(), broker)
-                .context("failed to build the credential injector from the secret bindings")?,
-        ),
-        _ => None,
-    };
     let proxy_source = match (&blob_store, options.network_capture.uses_proxy()) {
         (Some(blob_store), true) => {
             let blob_store: Arc<dyn crate::blob::BlobStore> = blob_store.clone();
@@ -939,9 +827,7 @@ where
                 .with_max_capture_bytes(options.max_capture_bytes)
                 .with_redaction(options.redaction)
                 .with_egress(options.egress.clone())
-                .with_anomaly(options.anomaly.clone())
-                .with_injector(injector)
-                .with_upstream_trust_anchors(load_extra_upstream_trust_anchors());
+                .with_anomaly(options.anomaly.clone());
             Some(
                 ProxySource::bind(Arc::clone(&clock), config)
                     .await
@@ -1056,19 +942,10 @@ where
     // Process-boundary lifecycle capture: `process.start` now, `process.signal`
     // on each forwarded terminating signal, `process.exit` once the child exits.
     let exec_emitter = ExecLifecycleEmitter::new(signal_tx.clone(), Arc::clone(&clock));
-    // The broker token is the one secret the supervisor itself holds at spawn;
-    // scrub it as a literal so an allowlist mistake can't record it verbatim.
-    let secret_literals: Vec<&[u8]> = options
-        .secret_broker
-        .as_ref()
-        .map(|broker| broker.token.as_bytes())
-        .into_iter()
-        .collect();
     let env_values = captured_env_values(
         &options.env_allowlist,
         |name| child_env.child_value(name),
         options.redaction,
-        &secret_literals,
     );
     exec_emitter
         .emit_start(spawn_ts, &options.env_allowlist, &env_values)
@@ -2662,40 +2539,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn interception_ca_anchors_loads_certificate_pem() {
-        let ca = crate::proxy::ProxyCa::generate().expect("generate CA");
-        let file = tempfile::NamedTempFile::new().expect("temp file");
-        std::fs::write(file.path(), ca.cert_pem()).expect("write CA");
-
-        let anchors = interception_ca_anchors(file.path());
-        assert_eq!(anchors.len(), 1, "one certificate PEM block, one anchor");
-    }
-
-    #[test]
-    fn interception_ca_anchors_is_empty_when_the_file_is_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let anchors = interception_ca_anchors(&dir.path().join("no-such-ca.pem"));
-        assert!(
-            anchors.is_empty(),
-            "a dangling CA pointer degrades to public-roots-only, it never fails the proxy"
-        );
-    }
-
-    #[test]
-    fn interception_ca_anchors_is_empty_for_non_certificate_content() {
-        let file = tempfile::NamedTempFile::new().expect("temp file");
-        std::fs::write(file.path(), "not a pem certificate").expect("write junk");
-        assert!(interception_ca_anchors(file.path()).is_empty());
-
-        std::fs::write(
-            file.path(),
-            "-----BEGIN CERTIFICATE-----\n%%%not-base64%%%\n-----END CERTIFICATE-----\n",
-        )
-        .expect("write malformed pem");
-        assert!(interception_ca_anchors(file.path()).is_empty());
-    }
-
     #[cfg(unix)]
     #[test]
     fn exit_u8_maps_normal_and_signal_termination() {
@@ -3195,29 +3038,6 @@ mod tests {
             error
                 .to_string()
                 .contains("anomaly detection requires --proxy")
-        );
-    }
-
-    #[tokio::test]
-    async fn secret_bindings_without_proxy_are_rejected() {
-        let options = base_options(vec!["echo".to_owned(), "hi".to_owned()]).with_secret_bindings(
-            vec![SecretBinding {
-                name: "k".to_owned(),
-                env_placeholder: "hil-secret://k".to_owned(),
-                host: "api.openai.com".to_owned(),
-                header: "authorization".to_owned(),
-                scheme: "Bearer".to_owned(),
-            }],
-            BrokerConfig {
-                url: "http://localhost:9/resolve".to_owned(),
-                token: "t".to_owned(),
-            },
-        );
-        let error = run(&options).await.expect_err("secrets need proxy");
-        assert!(
-            error
-                .to_string()
-                .contains("secret bindings require --proxy")
         );
     }
 

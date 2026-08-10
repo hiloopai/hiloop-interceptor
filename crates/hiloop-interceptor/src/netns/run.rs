@@ -328,7 +328,7 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
     let workload = WorkloadConfig::from_options(options, event_socket, ca_bundle);
     let request = ProvisionRequest::new(
         workload.workload_command(&runner.helper_path, options.command())?,
-        gateway.worker_command(&runner.helper_path, options.secret_broker())?,
+        gateway.worker_command(&runner.helper_path)?,
     );
 
     let transport = NormalizationContext::new(options.context().clone())
@@ -523,9 +523,7 @@ async fn drain_blobs(
 
 #[cfg(target_os = "linux")]
 fn capture_policy(options: &RunOptions) -> CapturePolicy {
-    if !options.secret_bindings().is_empty() {
-        CapturePolicy::SecretStrict
-    } else if options.egress().is_allow_all() {
+    if options.egress().is_allow_all() {
         CapturePolicy::Observe
     } else {
         CapturePolicy::PolicyStrict

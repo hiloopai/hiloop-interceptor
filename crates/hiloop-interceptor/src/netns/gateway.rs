@@ -14,7 +14,6 @@ use std::{
 };
 
 use hiloop_core::{
-    capture::TlsFlowIdentity,
     event::{Attributes, Event},
     identity::{HlcClock, RunContext},
 };
@@ -53,16 +52,14 @@ use crate::{
     seams::{
         Exporter, NormalizationContext, NormalizerRouter, RawSignal, RawSignalSink, SourceError,
     },
-    secret::{BrokerConfig, SecretBinding, SecretInjector},
     supervisor::{RunOptions, run_captured_with_exporter},
 };
 
 use super::{
-    AdmittedTcpFlow, AuthorizedRoute, DataplaneClosed, DirectTcpConnector, DnsAnswerTracker,
-    DnsRelayClient, FatalReport, GatewayDnsRelay, GatewayFatalController, GatewayWorkerBootstrap,
-    IngressError, NamespaceCommand, NetworkCapture, RequestAuthorityRejection, SecretRoute,
-    TcpProtocol, TlsPolicyEngine, TlsPolicyFlow, TlsTransportDecision, TransparentTcpIngress,
-    TransparentUdpChildSink, TransparentUdpIngress, UdpFlowRelay, UdpIngressError,
+    AdmittedTcpFlow, AuthorizedRoute, DirectTcpConnector, DnsAnswerTracker, DnsRelayClient,
+    GatewayDnsRelay, GatewayWorkerBootstrap, IngressError, NamespaceCommand, NetworkCapture,
+    TlsPolicyEngine, TlsPolicyFlow, TlsTransportDecision, TransparentTcpIngress,
+    TransparentUdpChildSink, TransparentUdpIngress, UdpFlowRelay,
     classifier::HTTP2_PREFACE,
     classify_client_handshake_error, connect_authorized,
     event_relay::EventRelayExporter,
@@ -74,7 +71,6 @@ pub(super) const CAPTURED_WORKLOAD_ROLE: &str = "__hiloop-netns-captured-workloa
 
 const GATEWAY_CONFIG_ENV: &str = "HILOOP_NETNS_GATEWAY_CONFIG";
 const WORKLOAD_CONFIG_ENV: &str = "HILOOP_NETNS_WORKLOAD_CONFIG";
-const BROKER_TOKEN_ENV: &str = "HILOOP_NETNS_BROKER_TOKEN";
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,8 +84,6 @@ pub(super) struct GatewayConfig {
     redaction_enabled: bool,
     egress: EgressConfig,
     anomaly: AnomalyConfigWire,
-    bindings: Vec<SecretBindingWire>,
-    broker_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,15 +117,6 @@ struct AnomalyConfigWire {
     suspicious_content_types: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SecretBindingWire {
-    name: String,
-    env_placeholder: String,
-    host: String,
-    header: String,
-    scheme: String,
-}
-
 impl GatewayConfig {
     pub(super) fn from_options(
         options: &RunOptions,
@@ -149,27 +134,13 @@ impl GatewayConfig {
             redaction_enabled: options.redaction().is_enabled(),
             egress: EgressConfig::from(options.egress()),
             anomaly: AnomalyConfigWire::from(options.anomaly()),
-            bindings: options
-                .secret_bindings()
-                .iter()
-                .map(SecretBindingWire::from)
-                .collect(),
-            broker_url: options.secret_broker().map(|broker| broker.url.clone()),
         }
     }
 
-    pub(super) fn worker_command(
-        &self,
-        helper: &Path,
-        broker: Option<&BrokerConfig>,
-    ) -> io::Result<NamespaceCommand> {
-        let mut command = NamespaceCommand::new(helper)
+    pub(super) fn worker_command(&self, helper: &Path) -> io::Result<NamespaceCommand> {
+        Ok(NamespaceCommand::new(helper)
             .arg(GATEWAY_WORKER_ROLE)
-            .env(GATEWAY_CONFIG_ENV, encode(self)?);
-        if let Some(broker) = broker {
-            command = command.env(BROKER_TOKEN_ENV, &broker.token);
-        }
-        Ok(command)
+            .env(GATEWAY_CONFIG_ENV, encode(self)?))
     }
 }
 
@@ -272,30 +243,6 @@ impl AnomalyConfigWire {
     }
 }
 
-impl From<&SecretBinding> for SecretBindingWire {
-    fn from(binding: &SecretBinding) -> Self {
-        Self {
-            name: binding.name.clone(),
-            env_placeholder: binding.env_placeholder.clone(),
-            host: binding.host.clone(),
-            header: binding.header.clone(),
-            scheme: binding.scheme.clone(),
-        }
-    }
-}
-
-impl From<SecretBindingWire> for SecretBinding {
-    fn from(binding: SecretBindingWire) -> Self {
-        Self {
-            name: binding.name,
-            env_placeholder: binding.env_placeholder,
-            host: binding.host,
-            header: binding.header,
-            scheme: binding.scheme,
-        }
-    }
-}
-
 pub(super) fn gateway_worker_entrypoint() -> io::Result<ExitCode> {
     let config: GatewayConfig = decode_environment(GATEWAY_CONFIG_ENV)?;
     tokio::runtime::Builder::new_current_thread()
@@ -362,15 +309,7 @@ async fn run_gateway(config: GatewayConfig) -> io::Result<ExitCode> {
     write_ca_bundle(&config.ca_bundle, ca.cert_pem())?;
     let egress = Arc::new(config.egress.build()?);
     let anomaly = Arc::new(config.anomaly.build());
-    let bindings = config
-        .bindings
-        .into_iter()
-        .map(SecretBinding::from)
-        .collect::<Vec<_>>();
-    let bound_hosts = binding_hosts(&bindings)?;
-    let injector = build_injector(bindings.clone(), config.broker_url)?;
     let tls_policy = Arc::new(TlsPolicyEngine::new(
-        !bindings.is_empty(),
         &egress,
         CompatibilityRegistry::current(),
     ));
@@ -392,12 +331,8 @@ async fn run_gateway(config: GatewayConfig) -> io::Result<ExitCode> {
     let tcp = Arc::new(TransparentTcpIngress::from_std(tcp_ipv4, tcp_ipv6)?);
     let udp = Arc::new(TransparentUdpIngress::from_std(udp_ipv4, udp_ipv6)?);
     let child_sink = Arc::new(TransparentUdpChildSink::new(broker.try_clone()?)?);
-    let latch = super::DataplaneLatch::new();
-    let fatal = GatewayFatalController::new(latch.clone(), &broker)?;
-    let (fatal_tx, mut fatal_rx) = mpsc::channel::<FatalReport>(1);
     let (summary_tx, mut summary_rx) = mpsc::channel(128);
     let udp_relay = Arc::new(UdpFlowRelay::new(
-        !bindings.is_empty(),
         &egress,
         UDP_IDLE_TIMEOUT,
         child_sink,
@@ -417,7 +352,6 @@ async fn run_gateway(config: GatewayConfig) -> io::Result<ExitCode> {
         },
         Arc::clone(&egress),
         anomaly,
-        injector,
     );
 
     let normalizer = ProxyNormalizer;
@@ -439,22 +373,19 @@ async fn run_gateway(config: GatewayConfig) -> io::Result<ExitCode> {
         Ok::<(), io::Error>(())
     };
     let context = Arc::new(config.context);
-    let tcp_task = latch.run(serve_tcp(TcpGateway {
+    let tcp_task = serve_tcp(TcpGateway {
         ingress: tcp,
         context: Arc::clone(&context),
         clock: Arc::clone(&clock),
         egress: Arc::clone(&egress),
         tracker: Arc::clone(&tracker),
         policy: tls_policy,
-        bound_hosts: Arc::new(bound_hosts),
         handler,
         ca,
         event_tx,
-        fatal_tx: fatal_tx.clone(),
-        latch: latch.clone(),
-    }));
-    let dns_task = latch.run(dns.serve());
-    let udp_task = serve_udp(latch.clone(), udp, udp_relay, fatal_tx.clone());
+    });
+    let dns_task = dns.serve();
+    let udp_task = serve_udp(udp, udp_relay);
     let summary_context = Arc::clone(&context);
     let summary_clock = Arc::clone(&clock);
     let summary_exporter = Arc::clone(&exporter);
@@ -470,24 +401,13 @@ async fn run_gateway(config: GatewayConfig) -> io::Result<ExitCode> {
         }
         Ok::<(), io::Error>(())
     };
-    let fatal_task = async move {
-        let report = fatal_rx
-            .recv()
-            .await
-            .ok_or_else(|| io::Error::other("gateway fatal channel closed"))?;
-        fatal.trigger(&report).await.map_err(io::Error::other)?;
-        std::future::pending::<()>().await;
-        Ok::<(), io::Error>(())
-    };
-
     tokio::select! {
         result = pipeline => result.map(|_| ()).map_err(io::Error::other)?,
         result = event_pump => result?,
-        result = tcp_task => require_latch_task("TCP gateway", result).await?,
-        result = dns_task => require_latch_task("DNS gateway", result).await?,
+        result = tcp_task => require_gateway_task("TCP gateway", result)?,
+        result = dns_task => require_gateway_task("DNS gateway", result)?,
         result = udp_task => result?,
         result = summary_task => result?,
-        result = fatal_task => result?,
     }
     Err(io::Error::other("gateway worker stopped unexpectedly"))
 }
@@ -499,12 +419,9 @@ struct TcpGateway {
     egress: Arc<EgressPolicy>,
     tracker: Arc<DnsAnswerTracker>,
     policy: Arc<TlsPolicyEngine>,
-    bound_hosts: Arc<Vec<CanonicalHost>>,
     handler: CaptureHandler,
     ca: Arc<ProxyCa>,
     event_tx: mpsc::Sender<Event>,
-    fatal_tx: mpsc::Sender<FatalReport>,
-    latch: super::DataplaneLatch,
 }
 
 async fn serve_tcp(gateway: TcpGateway) -> io::Result<()> {
@@ -520,8 +437,7 @@ async fn serve_tcp(gateway: TcpGateway) -> io::Result<()> {
         };
         let gateway = gateway.clone();
         tokio::spawn(async move {
-            let latch = gateway.latch.clone();
-            let _ = Box::pin(latch.run(handle_tcp_flow(gateway, admitted))).await;
+            let _ = handle_tcp_flow(gateway, admitted).await;
         });
     }
 }
@@ -535,40 +451,31 @@ impl Clone for TcpGateway {
             egress: Arc::clone(&self.egress),
             tracker: Arc::clone(&self.tracker),
             policy: Arc::clone(&self.policy),
-            bound_hosts: Arc::clone(&self.bound_hosts),
             handler: self.handler.clone(),
             ca: Arc::clone(&self.ca),
             event_tx: self.event_tx.clone(),
-            fatal_tx: self.fatal_tx.clone(),
-            latch: self.latch.clone(),
         }
     }
 }
 
 async fn handle_tcp_flow(gateway: TcpGateway, admitted: AdmittedTcpFlow) -> io::Result<()> {
-    let secret_route = secret_route(&admitted, &gateway.bound_hosts);
     let decision = gateway
         .policy
         .decide(TlsPolicyFlow::Admitted {
             route: admitted.route(),
             protocol: admitted.protocol(),
-            secret_route,
         })
         .await;
-    consume_transport_decision(gateway, admitted, secret_route, decision).await
+    consume_transport_decision(gateway, admitted, decision).await
 }
 
 async fn consume_transport_decision(
     gateway: TcpGateway,
     admitted: AdmittedTcpFlow,
-    secret_route: SecretRoute,
     decision: TlsTransportDecision,
 ) -> io::Result<()> {
     match decision {
         TlsTransportDecision::Denied(_) => Ok(()),
-        TlsTransportDecision::Fatal(reason) => {
-            send_fatal(&gateway.fatal_tx, fatal_for_admitted(reason, &admitted)?).await
-        }
         TlsTransportDecision::PassthroughTls(reason) => {
             let flow = admitted
                 .tls_flow_identity()
@@ -608,9 +515,9 @@ async fn consume_transport_decision(
         TlsTransportDecision::CaptureHttp => {
             let (client, route, _) = admitted.into_parts();
             let h2 = cleartext_http2(&client).await?;
-            serve_http(client, false, h2, route, None, secret_route, gateway).await
+            serve_http(client, false, h2, route, gateway).await
         }
-        TlsTransportDecision::TerminateTls => terminate_tls(gateway, admitted, secret_route).await,
+        TlsTransportDecision::TerminateTls => terminate_tls(gateway, admitted).await,
     }
 }
 
@@ -620,18 +527,7 @@ async fn cleartext_http2(client: &tokio::net::TcpStream) -> io::Result<bool> {
     Ok(length == prefix.len() && prefix == HTTP2_PREFACE)
 }
 
-async fn terminate_tls(
-    gateway: TcpGateway,
-    admitted: AdmittedTcpFlow,
-    secret_route: SecretRoute,
-) -> io::Result<()> {
-    if let Err(reason) = gateway.policy.validate_termination_destination(
-        admitted.route(),
-        &*gateway.tracker,
-        secret_route,
-    ) {
-        return send_fatal(&gateway.fatal_tx, fatal_for_admitted(reason, &admitted)?).await;
-    }
+async fn terminate_tls(gateway: TcpGateway, admitted: AdmittedTcpFlow) -> io::Result<()> {
     let flow = admitted
         .tls_flow_identity()
         .map_err(io::Error::other)?
@@ -644,7 +540,7 @@ async fn terminate_tls(
     match TlsAcceptor::from(server_config).accept(client).await {
         Ok(tls) => {
             let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-            serve_http(tls, true, h2, route, Some(flow), secret_route, gateway).await
+            serve_http(tls, true, h2, route, gateway).await
         }
         Err(error) => {
             let decision = gateway
@@ -653,7 +549,6 @@ async fn terminate_tls(
                     TlsPolicyFlow::Admitted {
                         route: &route,
                         protocol: &protocol,
-                        secret_route,
                     },
                     classify_client_handshake_error(&error),
                 )
@@ -664,13 +559,9 @@ async fn terminate_tls(
                 gateway.clock.tick(),
                 &flow,
                 decision,
-                secret_route == SecretRoute::Bound,
             )
             .await
             .map_err(io::Error::other)?;
-            if let Some(report) = decision.fatal_report(flow) {
-                send_fatal(&gateway.fatal_tx, report).await?;
-            }
             Ok(())
         }
     }
@@ -681,8 +572,6 @@ async fn serve_http<S>(
     tls: bool,
     h2: bool,
     route: AuthorizedRoute,
-    tls_flow: Option<TlsFlowIdentity>,
-    secret_route: SecretRoute,
     gateway: TcpGateway,
 ) -> io::Result<()>
 where
@@ -694,12 +583,9 @@ where
     let forwarder = HttpForwarder {
         tls,
         route: Arc::new(route),
-        tls_flow,
-        secret_route,
         policy: Arc::clone(&gateway.policy),
         upstream,
         handler,
-        fatal_tx: gateway.fatal_tx.clone(),
     };
     let service = service_fn(move |request: Request<Incoming>| {
         proxy_http_request(request, forwarder.clone())
@@ -723,12 +609,9 @@ type PinnedClient = Client<hyper_rustls::HttpsConnector<HttpConnector<PinnedReso
 struct HttpForwarder {
     tls: bool,
     route: Arc<AuthorizedRoute>,
-    tls_flow: Option<TlsFlowIdentity>,
-    secret_route: SecretRoute,
     policy: Arc<TlsPolicyEngine>,
     upstream: PinnedClient,
     handler: CaptureHandler,
-    fatal_tx: mpsc::Sender<FatalReport>,
 }
 
 fn pinned_client(route: &AuthorizedRoute) -> io::Result<PinnedClient> {
@@ -755,27 +638,14 @@ async fn proxy_http_request(
     let request = request.map(Body::from);
     let authority = request_authority(&request);
     let validation = authority.as_deref().map_or_else(
-        || {
-            Err(RequestAuthorityRejection::Denied(
-                super::RouteDenial::IdentityUnavailable,
-            ))
-        },
+        || Err(super::RouteDenial::IdentityUnavailable),
         |authority| {
-            forwarder.policy.validate_request_authority(
-                &forwarder.route,
-                authority,
-                forwarder.secret_route,
-            )
+            forwarder
+                .policy
+                .validate_request_authority(&forwarder.route, authority)
         },
     );
-    if let Err(rejection) = validation {
-        if let Some(report) = rejection.fatal_report(
-            forwarder
-                .tls_flow
-                .unwrap_or_else(|| tls_flow_for_route(&forwarder.route)),
-        ) {
-            let _ = forwarder.fatal_tx.send(report).await;
-        }
+    if validation.is_err() {
         return Ok(forbidden());
     }
     let Ok(request) = absolute_request(request, &forwarder.route, forwarder.tls) else {
@@ -856,115 +726,21 @@ impl Service<Name> for PinnedResolver {
 }
 
 async fn serve_udp(
-    latch: super::DataplaneLatch,
     ingress: Arc<TransparentUdpIngress>,
     relay: Arc<UdpFlowRelay>,
-    fatal_tx: mpsc::Sender<FatalReport>,
 ) -> io::Result<()> {
-    match latch.run(ingress.serve(&relay)).await {
-        Err(DataplaneClosed) => {
-            std::future::pending::<()>().await;
-            Ok(())
-        }
-        Ok(Ok(())) => Err(io::Error::other("UDP gateway stopped unexpectedly")),
-        Ok(Err(error)) => {
-            if let UdpIngressError::Relay(relay_error) = &error
-                && let Some(report) = relay_error.fatal_report().map_err(io::Error::other)?
-            {
-                send_fatal(&fatal_tx, report).await?;
-                return Ok(());
-            }
-            Err(io::Error::other(error))
-        }
+    match ingress.serve(&relay).await {
+        Ok(()) => Err(io::Error::other("UDP gateway stopped unexpectedly")),
+        Err(error) => Err(io::Error::other(error)),
     }
 }
 
-fn secret_route(flow: &AdmittedTcpFlow, bound_hosts: &[CanonicalHost]) -> SecretRoute {
-    if bound_hosts.is_empty() {
-        return SecretRoute::Unbound;
-    }
-    if bound_hosts.contains(flow.route().identity().host()) {
-        SecretRoute::Bound
-    } else if matches!(
-        flow.protocol(),
-        TcpProtocol::TlsClientHello(hello) if hello.server_name().is_some() && !hello.encrypted_client_hello()
-    ) || matches!(flow.protocol(), TcpProtocol::CleartextHttp(http) if http.authority().is_some())
-    {
-        SecretRoute::Unbound
-    } else {
-        SecretRoute::Ambiguous
-    }
-}
-
-fn binding_hosts(bindings: &[SecretBinding]) -> io::Result<Vec<CanonicalHost>> {
-    bindings
-        .iter()
-        .map(|binding| {
-            crate::egress::canonicalize_host(&binding.host)
-                .map(|destination| destination.host().clone())
-                .map_err(io::Error::other)
-        })
-        .collect()
-}
-
-fn build_injector(
-    bindings: Vec<SecretBinding>,
-    broker_url: Option<String>,
-) -> io::Result<Option<SecretInjector>> {
-    if bindings.is_empty() {
-        return Ok(None);
-    }
-    let url = broker_url.ok_or_else(|| io::Error::other("secret bindings require broker URL"))?;
-    let token = std::env::var(BROKER_TOKEN_ENV)
-        .map_err(|_| io::Error::other("secret bindings require broker token"))?;
-    SecretInjector::new(bindings, &BrokerConfig { url, token })
-        .map(Some)
-        .map_err(io::Error::other)
-}
-
-fn fatal_for_admitted(
-    reason: hiloop_core::capture::CaptureFatalReason,
-    flow: &AdmittedTcpFlow,
-) -> io::Result<FatalReport> {
-    match flow.tls_flow_identity().map_err(io::Error::other)? {
-        Some(identity) => Ok(FatalReport::tls(reason, identity)),
-        None => Ok(FatalReport::destination(
-            reason,
-            flow.route().original_destination(),
-        )),
-    }
-}
-
-fn tls_flow_for_route(route: &AuthorizedRoute) -> TlsFlowIdentity {
-    let flow = TlsFlowIdentity::new(route.original_destination());
-    match route.identity().host() {
-        CanonicalHost::Domain(host) => flow
-            .with_server_name(host)
-            .unwrap_or_else(|_| TlsFlowIdentity::new(route.original_destination())),
-        CanonicalHost::Ip(_) => flow,
-    }
-}
-
-async fn send_fatal(sender: &mpsc::Sender<FatalReport>, report: FatalReport) -> io::Result<()> {
-    sender
-        .send(report)
-        .await
-        .map_err(|_| io::Error::other("gateway fatal coordinator stopped"))
-}
-
-async fn require_latch_task(
-    component: &str,
-    result: Result<Result<(), io::Error>, DataplaneClosed>,
-) -> io::Result<()> {
+fn require_gateway_task(component: &str, result: Result<(), io::Error>) -> io::Result<()> {
     match result {
-        Err(DataplaneClosed) => {
-            std::future::pending::<()>().await;
-            Ok(())
-        }
-        Ok(Ok(())) => Err(io::Error::other(format!(
+        Ok(()) => Err(io::Error::other(format!(
             "{component} stopped unexpectedly"
         ))),
-        Ok(Err(error)) => Err(error),
+        Err(error) => Err(error),
     }
 }
 
@@ -1005,7 +781,8 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use crate::netns::{
-        ClassificationProgress, FragmentedUdpBehavior, SubstrateInfo, classify_tcp_prefix,
+        ClassificationProgress, FragmentedUdpBehavior, SubstrateInfo, TcpProtocol,
+        classify_tcp_prefix,
     };
     use tokio::io::AsyncWriteExt as _;
 
@@ -1017,8 +794,7 @@ mod tests {
                 | TlsTransportDecision::TerminateTls
                 | TlsTransportDecision::CaptureHttp
                 | TlsTransportDecision::PassthroughTls(_)
-                | TlsTransportDecision::PassthroughTcp
-                | TlsTransportDecision::Fatal(_) => {}
+                | TlsTransportDecision::PassthroughTcp => {}
             }
         }
 
@@ -1037,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_route_uses_visible_authority_and_treats_opaque_identity_as_ambiguous() {
+    fn classifier_distinguishes_visible_http_from_opaque_tcp() {
         let visible = classified(b"GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n");
         assert!(matches!(visible, TcpProtocol::CleartextHttp(_)));
         let opaque = classified(b"SSH-2.0-fixture\r\n");

@@ -76,14 +76,14 @@ preflight/run calls, and returns a deterministic exit or error without host priv
 The transparent workload receives no proxy variables. It receives only child-scoped trust hints for
 the ephemeral interception CA, plus the same run identity and optional OTLP receiver environment as
 ordinary capture. The gateway worker owns transparent TCP classification and policy, TLS
-termination or raw splice, request-authority revalidation, HTTP capture and secret injection, DNS,
+termination or raw splice, request-authority revalidation, HTTP capture, DNS,
 and opaque UDP relay. Both internal roles are production dispatch paths; an embedding binary must
 call `netns::dispatch_internal_helper` before creating an async runtime.
 
 The first-connection TLS compatibility registry is a versioned interceptor configuration made of
 reviewed exact host-and-port rows. Wildcards, embedded ports, duplicates, zero ports, blank evidence
 or ownership, and invalid `YYYY-MM-DD` revalidation dates are rejected. Registry matching may never
-weaken restrictive-policy or secret-binding behavior.
+weaken restrictive-policy behavior.
 
 `hiloop_interceptor::netns::NetworkProvisioner` is the wrapper-local lifecycle port for the Linux
 substrate. `preflight` performs the real operations and returns the existing closed transport reason
@@ -92,18 +92,12 @@ cancellation-safe `wait` can be followed by ordered `shutdown`. Both terminal pa
 dataplane and reap its helpers. `SystemNetworkProvisioner` owns the user/PID/mount and two network
 namespaces, veth, nftables TPROXY rules, dual-stack policy routes, and separately executed pinned
 pasta process. The cap-free gateway worker receives pre-opened transparent TCP and UDP listeners
-through an internal bootstrap. Every accept loop and application-flow future runs under one
-`DataplaneLatch`. `GatewayFatalController` closes that latch, waits for active futures to drop, and
-sends only the first route-safe fatal report over the private manager channel. The manager deletes
-the workload veth, kills the PID-namespace descendants, reaps helpers, and only then returns the
-report. `FatalRunSupervisor` directly exports and flushes `capture.fatal` after teardown, so event
-backpressure cannot leave a network retry window; the matching fatal reason remains in a nonzero
-terminal result even when cleanup or persistence also fails loudly. The worker's UDP relay
-raw-forwards opaque flows only for a no-binding, allow-all run; restrictive policy denies before
-opening an upstream socket, and any binding closes the relay with
-`secret_transport_unsupported`. A narrow manager socket broker creates per-flow transparent reply
-sockets so the worker retains no capabilities. All fragmented UDP, including fragmented DNS, is
-dropped before the carrier.
+through an internal bootstrap. The manager deletes the workload veth, kills the PID-namespace
+descendants, and reaps helpers before returning a terminal result. The worker's UDP relay
+raw-forwards opaque flows only for an allow-all run; restrictive policy denies before opening an
+upstream socket. A narrow manager socket broker creates per-flow transparent reply sockets so the
+worker retains no capabilities. All fragmented UDP, including fragmented DNS, is dropped before the
+carrier.
 
 The workload resolver points only at reserved dual-stack gateway listeners. A private Unix channel
 forwards UDP and TCP DNS messages to a relay that remains in the host network namespace, preserving
@@ -113,9 +107,9 @@ and any shorter CNAME-chain TTL. The workload receives no setup or namespace des
 
 Substrate tests use `netns::testing::FakeNetworkProvisioner` behind the existing
 `test-support` feature. It implements the same production port, records lifecycle calls, and can
-script successful exits, typed fatal signals, worker failures, cleanup failures, and
-unavailable-host results without requiring Linux privileges. It also records close-dataplane,
-terminate-namespace, and reap-helper ordering and can fail a typed startup stage. Embedding binaries must call
+script successful exits, worker failures, cleanup failures, and unavailable-host results without
+requiring Linux privileges. It also records close-dataplane, terminate-namespace, and reap-helper
+ordering and can fail a typed startup stage. Embedding binaries must call
 `netns::dispatch_internal_helper` before creating an async runtime so the namespace manager remains
 single-threaded across user-namespace creation and re-exec.
 

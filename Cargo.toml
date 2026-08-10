@@ -23,18 +23,14 @@ hiloop-core = { version = "0.1.0", path = "crates/hiloop-core" }
 hudsucker = { version = "0.24", features = ["http2"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-# `client-legacy`/`http1` power the credential-broker HTTP client; `tokio` the proxy.
+# `client-legacy` powers the proxy and transparent gateway upstream clients.
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1", "http2"] }
-# The credential broker on the hosted path is the public HTTPS API edge, so the broker client needs
-# TLS: a plaintext `HttpConnector` rejects an `https://` URL before it ever connects (surfacing as a
-# `client error (Connect)`). `hyper-rustls` gives the legacy client an HTTPS-or-HTTP connector, and
-# `webpki-roots` anchors the public chain in the minimal sandbox base where native roots are empty
-# (same reason the gRPC exporter enables the webpki bundle — see the tonic note below).
+# Transparent and cooperative proxy upstream clients need HTTPS-or-HTTP connectors, while
+# `webpki-roots` anchors public chains in the minimal sandbox base where native roots are empty.
 hyper-rustls = "0.27"
 rustls = "0.23"
 webpki-roots = "1"
-# TLS terminates transparent client connections in production and also serves the
-# credential-broker regression fixture with a self-signed test certificate.
+# TLS terminates transparent client connections and serves production-shaped proxy tests.
 tokio-rustls = "0.26"
 # IDNA/host canonicalization for egress policy matching (NFC + IDN→punycode + IP-literal
 # detection in every notation, via the WHATWG URL host parser). MSRV 1.63.
@@ -68,8 +64,6 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 ulid = { version = "1", features = ["serde"] }
 x509-parser = "0.18"
-# Best-effort zeroing of fetched secret values after each request is built.
-zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

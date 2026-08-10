@@ -97,7 +97,6 @@ pub async fn emit_interception_failure(
     timestamp: Hlc,
     flow: &TlsFlowIdentity,
     decision: HandshakeFailureDecision,
-    secret_bound: bool,
 ) -> Result<(), TlsTransportError> {
     event_tx
         .send(Event::tls_interception_failed(
@@ -106,7 +105,6 @@ pub async fn emit_interception_failure(
             decision.reason(),
             flow,
             decision.retry_required(),
-            secret_bound,
         ))
         .await
         .map_err(|_| TlsTransportError::EventChannelClosed)
@@ -372,7 +370,6 @@ mod tests {
         let decision = HandshakeFailureDecision::Failed {
             reason: TlsInterceptionFailedReason::ClientTrustRejected,
             retry_required: true,
-            fatal: None,
         };
         emit_interception_failure(
             &event_tx,
@@ -380,7 +377,6 @@ mod tests {
             timestamp(),
             &tls_flow("new.example.com", 443, "ch1:new"),
             decision,
-            false,
         )
         .await
         .expect("emit failure");

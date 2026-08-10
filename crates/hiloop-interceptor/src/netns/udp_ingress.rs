@@ -132,7 +132,7 @@ impl TransparentUdpIngress {
         }
     }
 
-    /// Dispatch datagrams until transparent ingress or a binding-fatal relay decision stops it.
+    /// Dispatch datagrams until transparent ingress or the relay stops it.
     pub async fn serve(&self, relay: &UdpFlowRelay) -> Result<(), UdpIngressError> {
         loop {
             let datagram = self.receive().await?;
@@ -303,7 +303,7 @@ pub enum UdpIngressError {
     /// Reading a transparent listener failed.
     #[error("receive transparent UDP datagram: {0}")]
     Receive(#[from] io::Error),
-    /// The flow relay closed or made a strict-run fatal decision.
+    /// The flow relay closed or failed.
     #[error(transparent)]
     Relay(#[from] UdpRelayError),
 }
