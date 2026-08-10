@@ -40,6 +40,7 @@ const HILOOP_PRIVATE_HEADER_PREFIX: &str = "x-hiloop-";
 const SEC_WEBSOCKET_KEY_HEADER: &str = "sec-websocket-key";
 const SEC_WEBSOCKET_VERSION_HEADER: &str = "sec-websocket-version";
 const MAX_PROOF_BYTES: usize = 16 * 1024;
+const PROOF_IO_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const RELAY_CONNECT_TLS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// An exact DNS destination whose HTTPS port is always 443.
@@ -82,6 +83,7 @@ pub struct FixedTlsRelayConfig {
     trust_anchors: Arc<[CertificateDer<'static>]>,
     proof_file: PathBuf,
     selectors: Arc<BTreeSet<BoundHttpsSelector>>,
+    bound_port: u16,
 }
 
 type HttpsConnector = hyper_rustls::HttpsConnector<HttpConnector>;
@@ -144,7 +146,18 @@ impl FixedTlsRelayConfig {
             trust_anchors: trust_anchors.into(),
             proof_file,
             selectors: Arc::new(exact),
+            bound_port: 443,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bound_port_for_test(mut self, port: u16) -> Self {
+        self.bound_port = port;
+        self
+    }
+
+    const fn bound_port(&self) -> u16 {
+        self.bound_port
     }
 
     pub(crate) fn endpoint(&self) -> SocketAddr {
@@ -173,7 +186,7 @@ impl FixedTlsRelayConfig {
         if !self.contains_host(destination.host()) {
             return RelayRoute::Direct;
         }
-        if scheme == Some("https") && destination.port().unwrap_or(443) == 443 {
+        if scheme == Some("https") && destination.port().unwrap_or(443) == self.bound_port() {
             RelayRoute::Bound
         } else {
             RelayRoute::Denied
@@ -184,7 +197,7 @@ impl FixedTlsRelayConfig {
         if !self.contains_host(destination.host()) {
             return RelayRoute::Direct;
         }
-        if destination.port() == Some(443) {
+        if destination.port() == Some(self.bound_port()) {
             RelayRoute::Bound
         } else {
             RelayRoute::Denied
@@ -224,14 +237,38 @@ impl FixedTlsRelayConfig {
     }
 
     pub(crate) async fn read_proof(&self) -> Result<HeaderValue, RelayProofError> {
-        let file = tokio::fs::File::open(&self.proof_file)
+        let path = self.proof_file.clone();
+        let mut bytes = tokio::time::timeout(PROOF_IO_TIMEOUT, async move {
+            let file = tokio::task::spawn_blocking(move || {
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.custom_flags(nix::libc::O_NONBLOCK);
+                }
+                let file = options.open(path)?;
+                if !file.metadata()?.file_type().is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "proof path is not a regular file",
+                    ));
+                }
+                Ok::<_, io::Error>(file)
+            })
             .await
+            .map_err(|_| RelayProofError::Unavailable)?
             .map_err(|_| RelayProofError::Unavailable)?;
-        let mut bytes = Vec::with_capacity(MAX_PROOF_BYTES + 1);
-        file.take((MAX_PROOF_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|_| RelayProofError::Unavailable)?;
+            let mut bytes = Vec::with_capacity(MAX_PROOF_BYTES + 1);
+            tokio::fs::File::from_std(file)
+                .take((MAX_PROOF_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| RelayProofError::Unavailable)?;
+            Ok::<_, RelayProofError>(bytes)
+        })
+        .await
+        .map_err(|_| RelayProofError::Unavailable)??;
         while matches!(bytes.last(), Some(b'\r' | b'\n')) {
             bytes.pop();
         }
@@ -690,5 +727,34 @@ mod tests {
             .await
             .expect("oversized");
         assert_eq!(relay.read_proof().await, Err(RelayProofError::Invalid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proof_rejects_devices_and_fifos_without_blocking() {
+        let device = config(PathBuf::from("/dev/zero"));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), device.read_proof())
+                .await
+                .expect("device rejection is prompt"),
+            Err(RelayProofError::Unavailable)
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("proof.fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("run mkfifo")
+                .success()
+        );
+        let fifo = config(fifo);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), fifo.read_proof())
+                .await
+                .expect("FIFO rejection is prompt"),
+            Err(RelayProofError::Unavailable)
+        );
     }
 }

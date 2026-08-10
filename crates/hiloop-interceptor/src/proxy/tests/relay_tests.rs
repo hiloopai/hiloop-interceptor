@@ -478,6 +478,28 @@ async fn connect_tunnel(proxy_addr: SocketAddr, authority: &str) -> tokio::net::
     tcp
 }
 
+async fn connect_tunnel_without_host(
+    proxy_addr: SocketAddr,
+    authority: &str,
+) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut tcp = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    tcp.write_all(format!("CONNECT {authority} HTTP/1.1\r\n\r\n").as_bytes())
+        .await
+        .expect("send CONNECT");
+    let mut response = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !response.ends_with(b"\r\n\r\n") {
+        assert!(tcp.read(&mut byte).await.expect("CONNECT response") > 0);
+        response.push(byte[0]);
+    }
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    tcp
+}
+
 async fn client_hello(server_name: &str, send_sni: bool) -> Vec<u8> {
     use hudsucker::rustls::pki_types::ServerName;
     use tokio::io::AsyncReadExt as _;
@@ -525,6 +547,24 @@ async fn blackhole_relay() -> (SocketAddr, mpsc::Receiver<()>) {
     (addr, accepted_rx)
 }
 
+async fn named_loopback_observer(host: &str) -> (SocketAddr, mpsc::Receiver<()>) {
+    let listener = TcpListener::bind((host, 0))
+        .await
+        .expect("bind named loopback observer");
+    let addr = listener.local_addr().expect("named loopback address");
+    let (accepted_tx, accepted_rx) = mpsc::channel(4);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let _ = accepted_tx.send(()).await;
+            tokio::spawn(async move {
+                let _stream = stream;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    (addr, accepted_rx)
+}
+
 async fn strict_proxy(
     relay_addr: SocketAddr,
     selector: &str,
@@ -554,8 +594,35 @@ async fn fragmented_tls_and_unknown_prefaces_never_reach_an_upstream() {
     let (relay_addr, mut relay_accepts) = blackhole_relay().await;
     let (proxy_addr, _ca, _dir) = strict_proxy(relay_addr, "api.example.com").await;
 
-    let hello = client_hello("api.example.com", true).await;
-    let mut fragmented = connect_tunnel(proxy_addr, "api.example.com:443").await;
+    let origin_host = "api.localhost";
+    let (origin_addr, mut origin_accepts) = named_loopback_observer(origin_host).await;
+    let origin_control = tokio::net::TcpStream::connect((origin_host, origin_addr.port()))
+        .await
+        .expect("selected origin is reachable by authority name");
+    origin_accepts
+        .recv()
+        .await
+        .expect("selected origin observes control connection");
+    drop(origin_control);
+    let relay_ca = ProxyCa::generate().expect("relay CA");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_file = dir.path().join("proof");
+    tokio::fs::write(&proof_file, b"proof")
+        .await
+        .expect("proof");
+    let relay = FixedTlsRelayConfig::new(
+        relay_addr,
+        "secret-egress.test",
+        vec![ca_trust_anchor(&relay_ca)],
+        proof_file,
+        [BoundHttpsSelector::new(origin_host).expect("selector")],
+    )
+    .expect("relay config")
+    .with_bound_port_for_test(origin_addr.port());
+    let (fragment_proxy, _ca, _signals, _store) = spawn_bound_proxy(relay).await;
+    let authority = format!("{origin_host}:{}", origin_addr.port());
+    let hello = client_hello(origin_host, true).await;
+    let mut fragmented = connect_tunnel_without_host(fragment_proxy, &authority).await;
     fragmented.write_all(&hello[..1]).await.expect("first byte");
     tokio::time::sleep(Duration::from_millis(50)).await;
     fragmented.write_all(&hello[1..]).await.expect("hello tail");
@@ -565,6 +632,12 @@ async fn fragmented_tls_and_unknown_prefaces_never_reach_an_upstream() {
         .await
         .expect("fragmented connection closes")
         .expect("read close");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), origin_accepts.recv())
+            .await
+            .is_err(),
+        "selected origin receives no raw fallback connection"
+    );
 
     let mut unknown = connect_tunnel(proxy_addr, "api.example.com:443").await;
     unknown
@@ -582,16 +655,40 @@ async fn fragmented_tls_and_unknown_prefaces_never_reach_an_upstream() {
 #[tokio::test]
 async fn missing_or_mismatched_client_hello_sni_fails_before_upstream() {
     use hudsucker::rustls::pki_types::ServerName;
+    use hudsucker::rustls::pki_types::pem::PemObject as _;
 
     let (relay_addr, mut relay_accepts) = blackhole_relay().await;
-    let (proxy_addr, _ca, _dir) = strict_proxy(relay_addr, "api.example.com").await;
+    let (proxy_addr, proxy_ca, _dir) = strict_proxy(relay_addr, "api.example.com").await;
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(proxy_ca.as_bytes()).expect("proxy CA der"))
+        .expect("trust proxy CA");
+
+    let tcp = connect_tunnel(proxy_addr, "api.example.com:443").await;
+    let matching = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("client versions")
+        .with_root_certificates(roots.clone())
+        .with_no_client_auth();
+    let matching = tokio_rustls::TlsConnector::from(Arc::new(matching));
+    assert!(
+        matching
+            .connect(
+                ServerName::try_from("api.example.com").expect("matching server name"),
+                tcp,
+            )
+            .await
+            .is_ok(),
+        "matching trusted SNI completes the MITM handshake"
+    );
+
     for (name, send_sni) in [("other.example.com", true), ("api.example.com", false)] {
         let tcp = connect_tunnel(proxy_addr, "api.example.com:443").await;
         let mut config =
             ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
                 .with_safe_default_protocol_versions()
                 .expect("client versions")
-                .with_root_certificates(RootCertStore::empty())
+                .with_root_certificates(roots.clone())
                 .with_no_client_auth();
         config.enable_sni = send_sni;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
@@ -651,8 +748,11 @@ async fn response_blackhole_relay(relay_ca: &ProxyCa) -> (SocketAddr, mpsc::Rece
 
 async fn trailer_observing_relay(
     relay_ca: &ProxyCa,
-) -> (SocketAddr, mpsc::Receiver<hudsucker::hyper::HeaderMap>) {
-    use http_body_util::BodyExt as _;
+) -> (
+    SocketAddr,
+    mpsc::Receiver<hudsucker::hyper::HeaderMap>,
+    mpsc::Receiver<()>,
+) {
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
     let leaf = relay_ca
@@ -672,10 +772,12 @@ async fn trailer_observing_relay(
         .expect("bind relay");
     let addr = listener.local_addr().expect("relay address");
     let (trailers_tx, trailers_rx) = mpsc::channel(1);
+    let (data_tx, data_rx) = mpsc::channel(8);
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             let trailers_tx = trailers_tx.clone();
+            let data_tx = data_tx.clone();
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
@@ -683,9 +785,19 @@ async fn trailer_observing_relay(
                 let service =
                     hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
                         let trailers_tx = trailers_tx.clone();
+                        let data_tx = data_tx.clone();
                         async move {
-                            let body = request.into_body().collect().await.expect("request body");
-                            let trailers = body.trailers().cloned().unwrap_or_default();
+                            let mut frames = BodyStream::new(request.into_body());
+                            let mut trailers = hudsucker::hyper::HeaderMap::new();
+                            while let Some(frame) = frames.next().await {
+                                let frame = frame.expect("request frame");
+                                if frame.data_ref().is_some() {
+                                    let _ = data_tx.send(()).await;
+                                }
+                                if let Ok(value) = frame.into_trailers() {
+                                    trailers = value;
+                                }
+                            }
                             let _ = trailers_tx.send(trailers).await;
                             Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
                         }
@@ -696,7 +808,7 @@ async fn trailer_observing_relay(
             });
         }
     });
-    (addr, trailers_rx)
+    (addr, trailers_rx, data_rx)
 }
 
 #[tokio::test]
@@ -704,7 +816,7 @@ async fn private_http2_trailers_are_scrubbed_on_the_relay_wire() {
     use hudsucker::hyper::body::Frame;
 
     let relay_ca = ProxyCa::generate().expect("relay CA");
-    let (relay_addr, mut observed) = trailer_observing_relay(&relay_ca).await;
+    let (relay_addr, mut observed, _data) = trailer_observing_relay(&relay_ca).await;
     let dir = tempfile::tempdir().expect("tempdir");
     let proof_file = dir.path().join("proof");
     tokio::fs::write(&proof_file, b"proof")
@@ -754,6 +866,65 @@ async fn private_http2_trailers_are_scrubbed_on_the_relay_wire() {
     assert!(trailers.get(AUTHORIZATION).is_none());
     assert!(trailers.get("x-hiloop-private").is_none());
     assert_eq!(trailers["x-safe-trailer"], "preserved");
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_progressing_upload_may_receive_headers_after_request_eof() {
+    use hudsucker::hyper::body::Frame;
+
+    let relay_ca = ProxyCa::generate().expect("relay CA");
+    let (relay_addr, mut observed, mut data) = trailer_observing_relay(&relay_ca).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_file = dir.path().join("proof");
+    tokio::fs::write(&proof_file, b"proof")
+        .await
+        .expect("proof");
+    let relay = FixedTlsRelayConfig::new(
+        relay_addr,
+        "secret-egress.test",
+        vec![ca_trust_anchor(&relay_ca)],
+        proof_file,
+        [BoundHttpsSelector::new("api.example.com").expect("selector")],
+    )
+    .expect("relay config");
+    let (proxy_addr, proxy_ca, _signals, _store) = spawn_bound_proxy(relay).await;
+    let mut sender = h2_client_through_proxy(proxy_addr, &proxy_ca, "api.example.com:443").await;
+    let (frames_tx, frames_rx) = mpsc::channel(4);
+    let body = Body::from(StreamBody::new(
+        tokio_stream::wrappers::ReceiverStream::new(frames_rx),
+    ));
+    let response = tokio::spawn(async move {
+        sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://api.example.com/slow")
+                    .body(body)
+                    .expect("request"),
+            )
+            .await
+    });
+    for payload in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+        frames_tx
+            .send(Ok::<_, hudsucker::Error>(Frame::data(
+                Bytes::copy_from_slice(payload),
+            )))
+            .await
+            .expect("progress frame");
+        data.recv().await.expect("relay observed progress");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+    }
+    drop(frames_tx);
+    assert_eq!(
+        response
+            .await
+            .expect("request task")
+            .expect("response")
+            .status(),
+        StatusCode::OK
+    );
+    observed.recv().await.expect("relay observed EOF");
 }
 
 #[tokio::test(start_paused = true)]

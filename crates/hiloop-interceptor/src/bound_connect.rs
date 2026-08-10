@@ -2,6 +2,8 @@
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
+use futures_util::StreamExt as _;
+use http_body_util::{BodyStream, StreamBody};
 use hudsucker::{
     Body, RequestOrResponse,
     certificate_authority::CertificateAuthority,
@@ -132,10 +134,19 @@ async fn forward_bound_request(
         RequestOrResponse::Request(request) => request,
         RequestOrResponse::Response(response) => return Ok(response),
     };
-    match tokio::time::timeout(RELAY_RESPONSE_HEADER_TIMEOUT, client.request(request)).await {
-        Ok(Ok(response)) => Ok(handler.on_response(response.map(Body::from))),
-        Ok(Err(error)) => Ok(handler.on_upstream_client_error(error).await),
-        Err(_) => {
+    let (parts, body) = request.into_parts();
+    let (body, completion) = request_body_with_completion(body);
+    let mut response = Box::pin(client.request(Request::from_parts(parts, body)));
+    let outcome = tokio::select! {
+        result = &mut response => Some(result),
+        _ = completion => tokio::time::timeout(RELAY_RESPONSE_HEADER_TIMEOUT, &mut response)
+            .await
+            .ok(),
+    };
+    match outcome {
+        Some(Ok(response)) => Ok(handler.on_response(response.map(Body::from))),
+        Some(Err(error)) => Ok(handler.on_upstream_client_error(error).await),
+        None => {
             eprintln!("hiloop-interceptor: bound secret relay response timed out");
             handler
                 .on_upstream_error("upstream_error", "relay response timed out".to_owned())
@@ -143,6 +154,23 @@ async fn forward_bound_request(
             Ok(bad_gateway())
         }
     }
+}
+
+fn request_body_with_completion(body: Body) -> (Body, tokio::sync::oneshot::Receiver<()>) {
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let frames = futures_util::stream::unfold(
+        (BodyStream::new(body), Some(completion_tx)),
+        |(mut frames, mut completion_tx)| async move {
+            if let Some(frame) = frames.next().await {
+                return Some((frame, (frames, completion_tx)));
+            }
+            if let Some(completion_tx) = completion_tx.take() {
+                let _ = completion_tx.send(());
+            }
+            None
+        },
+    );
+    (Body::from(StreamBody::new(frames)), completion_rx)
 }
 
 fn forbidden() -> Response<Body> {
