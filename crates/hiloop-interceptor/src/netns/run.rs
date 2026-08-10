@@ -666,11 +666,10 @@ mod tests {
             info: substrate_info(),
         };
         let wait_result = session.wait().await;
-        let relay_tail = Event::new(
+        let relay_tail = Event::capture_fatal(
             &RunContext::new_local_root(),
             hiloop_core::identity::HlcClock::new().tick(),
-            hiloop_core::event::SignalType::Net,
-            hiloop_core::event::EventName::from_static("fixture.relay-tail"),
+            hiloop_core::capture::CaptureFatalReason::DataplaneFailed,
         );
         fatal_exporter
             .export(&[relay_tail])
@@ -703,7 +702,7 @@ mod tests {
                     .iter()
                     .map(|event| event.name.as_str())
                     .collect::<Vec<_>>(),
-                ["fixture.relay-tail", "capture.fatal", "capture-health"]
+                ["capture.fatal", "capture.fatal", "capture-health"]
             );
             assert!(matches!(
                 &fatal,
