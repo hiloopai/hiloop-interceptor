@@ -40,7 +40,14 @@ impl FatalRunResult {
 pub struct FatalRunError {
     result: FatalRunResult,
     substrate_error: Option<ProvisionError>,
-    persistence_error: Option<ExportError>,
+    persistence: FatalPersistence,
+}
+
+#[derive(Debug)]
+enum FatalPersistence {
+    Pending,
+    Persisted,
+    Failed(ExportError),
 }
 
 impl FatalRunError {
@@ -56,7 +63,7 @@ impl FatalRunError {
 
     /// True only after direct export and flush both completed successfully.
     pub fn event_persisted(&self) -> bool {
-        self.persistence_error.is_none()
+        matches!(self.persistence, FatalPersistence::Persisted)
     }
 
     /// Underlying worker failure or ordered-cleanup failure, when present.
@@ -66,7 +73,10 @@ impl FatalRunError {
 
     /// Fatal-event export or flush failure, if durability could not be established.
     pub fn persistence_error(&self) -> Option<&ExportError> {
-        self.persistence_error.as_ref()
+        match &self.persistence {
+            FatalPersistence::Failed(error) => Some(error),
+            FatalPersistence::Pending | FatalPersistence::Persisted => None,
+        }
     }
 }
 
@@ -122,7 +132,25 @@ impl FatalRunSupervisor {
         &self,
         session: &mut dyn NetworkSession,
     ) -> Result<SubstrateExit, SupervisedRunError> {
-        match session.wait().await {
+        let mut result = self.finish_wait(session.wait().await).await;
+        if matches!(
+            result,
+            Err(SupervisedRunError::Fatal(FatalRunError {
+                persistence: FatalPersistence::Pending,
+                ..
+            }))
+        ) {
+            Self::record_flush(&mut result, self.exporter.flush().await);
+        }
+        result
+    }
+
+    /// Convert a completed session wait into a supervised result without flushing its exporter.
+    pub(crate) async fn finish_wait(
+        &self,
+        result: Result<SubstrateExit, ProvisionError>,
+    ) -> Result<SubstrateExit, SupervisedRunError> {
+        match result {
             Ok(exit) => Ok(exit),
             Err(error @ ProvisionError::Dataplane { .. }) => Err(self
                 .persist(CaptureFatalReason::DataplaneFailed, Some(error))
@@ -132,6 +160,23 @@ impl FatalRunSupervisor {
         }
     }
 
+    /// Attach the composing boundary's final flush result to a pending fatal transition.
+    pub(crate) fn record_flush(
+        result: &mut Result<SubstrateExit, SupervisedRunError>,
+        flush: Result<(), ExportError>,
+    ) {
+        let Err(SupervisedRunError::Fatal(error)) = result else {
+            return;
+        };
+        if !matches!(error.persistence, FatalPersistence::Pending) {
+            return;
+        }
+        error.persistence = match flush {
+            Ok(()) => FatalPersistence::Persisted,
+            Err(error) => FatalPersistence::Failed(error),
+        };
+    }
+
     async fn persist(
         &self,
         reason: CaptureFatalReason,
@@ -139,14 +184,14 @@ impl FatalRunSupervisor {
     ) -> FatalRunError {
         let result = FatalRunResult { reason };
         let event = Event::capture_fatal(&self.context, self.clock.tick(), reason);
-        let persistence_error = match self.exporter.export(&[event]).await {
-            Ok(()) => self.exporter.flush().await.err(),
-            Err(error) => Some(error),
+        let persistence = match self.exporter.export(&[event]).await {
+            Ok(()) => FatalPersistence::Pending,
+            Err(error) => FatalPersistence::Failed(error),
         };
         FatalRunError {
             result,
             substrate_error,
-            persistence_error,
+            persistence,
         }
     }
 }

@@ -23,7 +23,7 @@ use crate::{
     grpc_export::GrpcIngestExporter,
     seams::{Exporter, NormalizationContext},
     spool::{SpoolPolicy, SpoolingExporter},
-    supervisor::{CAPTURE_HEALTH_EXPORT_TIMEOUT, capture_drain_event, export_supervisor_record},
+    supervisor::{CAPTURE_HEALTH_EXPORT_TIMEOUT, capture_drain_event},
 };
 
 #[cfg(target_os = "linux")]
@@ -345,15 +345,14 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
 
     let mut session = runner.provisioner.provision(request).await?;
     let supervisor = FatalRunSupervisor::new(options.context().clone(), Arc::clone(&exporter));
-    let result = supervisor.wait(session.as_mut()).await;
+    let wait_result = session.wait().await;
 
     let _ = relay_shutdown_tx.send(());
     let relay_result = match relay_task.await {
         Ok(result) => result.context("serve transparent-run event relay"),
         Err(error) => Err(error).context("join transparent-run event relay"),
     };
-    let flush_result = flush_after_supervision(&result, exporter.as_ref()).await;
-
+    let mut result = supervisor.finish_wait(wait_result).await;
     let blob_outcome = drain_blobs(options, &blob_dir, gateway_credential.as_ref()).await;
     let blobs_complete = blob_outcome
         .as_ref()
@@ -383,17 +382,12 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
                 .as_ref()
                 .map(GatewayCredential::refreshes),
         );
-        if let Err(warning) = export_supervisor_record(
-            &exporter,
-            health_event,
-            "capture-health",
-            CAPTURE_HEALTH_EXPORT_TIMEOUT,
-        )
-        .await
-        {
+        if let Err(warning) = export_run_health(exporter.as_ref(), health_event).await {
             eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
         }
     }
+
+    let flush_result = flush_after_supervision(&mut result, exporter.as_ref()).await;
 
     if let Some(spool) = spool {
         let report = spool.drain(options.blob_drain_retry()).await;
@@ -427,19 +421,32 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
 
 #[cfg(target_os = "linux")]
 async fn flush_after_supervision(
-    result: &Result<SubstrateExit, SupervisedRunError>,
+    result: &mut Result<SubstrateExit, SupervisedRunError>,
     exporter: &dyn Exporter,
 ) -> anyhow::Result<()> {
-    if matches!(
-        result,
-        Err(SupervisedRunError::Fatal(error)) if error.event_persisted()
-    ) {
-        return Ok(());
+    let flush = exporter.flush().await;
+    let failure = flush.as_ref().err().map(ToString::to_string);
+    FatalRunSupervisor::record_flush(result, flush);
+    match failure {
+        Some(error) => Err(anyhow::anyhow!(error)).context("flush transparent-run events"),
+        None => Ok(()),
     }
-    exporter
-        .flush()
-        .await
-        .context("flush transparent-run events")
+}
+
+#[cfg(target_os = "linux")]
+async fn export_run_health(exporter: &dyn Exporter, event: Event) -> anyhow::Result<()> {
+    match tokio::time::timeout(
+        CAPTURE_HEALTH_EXPORT_TIMEOUT,
+        exporter.export(std::slice::from_ref(&event)),
+    )
+    .await
+    {
+        Ok(result) => result.context("failed to export the capture-health event"),
+        Err(_elapsed) => anyhow::bail!(
+            "capture-health export timed out after {}s",
+            CAPTURE_HEALTH_EXPORT_TIMEOUT.as_secs()
+        ),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -658,29 +665,56 @@ mod tests {
         let mut session = CrashingSession {
             info: substrate_info(),
         };
-        let fatal = supervisor.wait(&mut session).await;
-
-        flush_after_supervision(&fatal, fatal_exporter.as_ref())
+        let wait_result = session.wait().await;
+        let relay_tail = Event::capture_fatal(
+            &RunContext::new_local_root(),
+            hiloop_core::identity::HlcClock::new().tick(),
+            hiloop_core::capture::CaptureFatalReason::DataplaneFailed,
+        );
+        fatal_exporter
+            .export(&[relay_tail])
             .await
-            .expect("fatal flush is already owned by the supervisor");
-        assert!(matches!(fatal, Err(SupervisedRunError::Fatal(_))));
+            .expect("relay tail reaches the exporter before supervision completes");
+        let mut fatal = supervisor.finish_wait(wait_result).await;
+        let health = Event::new(
+            &RunContext::new_local_root(),
+            hiloop_core::identity::HlcClock::new().tick(),
+            hiloop_core::event::SignalType::Net,
+            hiloop_core::event::EventName::from_static("capture-health"),
+        );
+        fatal_exporter
+            .export(&[health])
+            .await
+            .expect("capture health reaches the exporter before supervision completes");
+
+        flush_after_supervision(&mut fatal, fatal_exporter.as_ref())
+            .await
+            .expect("the composer flushes all run events once");
+        assert!(matches!(&fatal, Err(SupervisedRunError::Fatal(_))));
         assert_eq!(fatal_exporter.flushes.load(Ordering::SeqCst), 1);
         {
             let events = fatal_exporter
                 .events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].name.as_str(), "capture.fatal");
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["capture.fatal", "capture.fatal", "capture-health"]
+            );
+            assert!(matches!(
+                &fatal,
+                Err(SupervisedRunError::Fatal(error)) if error.event_persisted()
+            ));
         }
 
         let normal_exporter = CountingExporter::default();
-        flush_after_supervision(
-            &Ok::<SubstrateExit, SupervisedRunError>(SubstrateExit::Code(0)),
-            &normal_exporter,
-        )
-        .await
-        .expect("normal completion flushes at the composer boundary");
+        let mut normal = Ok::<SubstrateExit, SupervisedRunError>(SubstrateExit::Code(0));
+        flush_after_supervision(&mut normal, &normal_exporter)
+            .await
+            .expect("normal completion flushes at the composer boundary");
         assert_eq!(normal_exporter.flushes.load(Ordering::SeqCst), 1);
     }
 
@@ -697,29 +731,11 @@ mod tests {
         let mut session = CrashingSession {
             info: substrate_info(),
         };
-        let fatal = supervisor.wait(&mut session).await;
+        let mut fatal = supervisor.finish_wait(session.wait().await).await;
 
-        flush_after_supervision(&fatal, export_failure.as_ref())
+        flush_after_supervision(&mut fatal, export_failure.as_ref())
             .await
             .expect("composer flushes buffered events after fatal export fails");
         assert_eq!(export_failure.flushes.load(Ordering::SeqCst), 1);
-
-        let flush_failure = Arc::new(CountingExporter {
-            flush_failures_remaining: AtomicUsize::new(1),
-            ..CountingExporter::default()
-        });
-        let supervisor = FatalRunSupervisor::new(
-            RunContext::new_local_root(),
-            Arc::<CountingExporter>::clone(&flush_failure),
-        );
-        let mut session = CrashingSession {
-            info: substrate_info(),
-        };
-        let fatal = supervisor.wait(&mut session).await;
-
-        flush_after_supervision(&fatal, flush_failure.as_ref())
-            .await
-            .expect("composer retries after the fatal flush fails");
-        assert_eq!(flush_failure.flushes.load(Ordering::SeqCst), 2);
     }
 }
