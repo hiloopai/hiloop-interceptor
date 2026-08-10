@@ -18,6 +18,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 const DESCRIPTOR: NormalizerDescriptor =
     NormalizerDescriptor::new("stdio-log", env!("CARGO_PKG_VERSION"), "hiloop.event.v1");
 
+pub(crate) const STDIO_SOURCE: &str = "stdio";
+
 /// Default read buffer for [`StdioSource`].
 const STDIO_READ_BUFFER_BYTES: usize = 8192;
 
@@ -83,7 +85,7 @@ async fn deliver_record(
     clock: &HlcClock,
     record: Vec<u8>,
 ) -> SinkSend {
-    let raw = RawSignal::new("stdio", stream_name, clock.tick(), Bytes::from(record));
+    let raw = RawSignal::new(STDIO_SOURCE, stream_name, clock.tick(), Bytes::from(record));
     sink.send(raw).await
 }
 
@@ -176,7 +178,8 @@ impl Normalizer for StdioLogNormalizer {
     }
 
     fn supports(&self, raw: &RawSignal) -> NormalizerSupport {
-        if raw.source == "stdio" && matches!(raw.kind.as_str(), "stdin" | "stdout" | "stderr") {
+        if raw.source == STDIO_SOURCE && matches!(raw.kind.as_str(), "stdin" | "stdout" | "stderr")
+        {
             NormalizerSupport::Exact
         } else {
             NormalizerSupport::Unsupported

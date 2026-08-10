@@ -41,7 +41,7 @@ use crate::seams::{
     NormalizerSupport, RawSignal, RawSignalSink, ShutdownSignal, SinkSend, Source, SourceError,
 };
 
-const OTLP_SOURCE: &str = "otlp";
+pub(crate) const OTLP_SOURCE: &str = "otlp";
 const OTLP_TRACES_KIND: &str = "traces";
 const TRACES_PATH: &str = "/v1/traces";
 const MAX_OTLP_BODY_BYTES: u64 = 1024 * 1024; // 1 MiB

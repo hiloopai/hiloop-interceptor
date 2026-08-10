@@ -47,8 +47,15 @@ async fn capture_tees_mixed_stdio_and_links_raw_observations() {
     assert_eq!(output.stderr, b"err1\nerr-partial");
 
     let events = read_jsonl(&events_path);
-    assert_eq!(events.len(), 6, "4 stdio lines + process.start/exit");
-    for event in &events {
+    assert_eq!(
+        events.len(),
+        7,
+        "4 stdio lines + process.start/exit + capture.drain"
+    );
+    for event in events
+        .iter()
+        .filter(|event| event["name"] != "capture.drain")
+    {
         assert_common_event_provenance(event, "preserve");
         assert!(
             event["attributes"][provenance_keys::RAW_OBSERVATION_ID]
@@ -97,6 +104,7 @@ async fn capture_tees_mixed_stdio_and_links_raw_observations() {
         .collect::<BTreeSet<_>>();
     let event_raw_ids = events
         .iter()
+        .filter(|event| event["name"] != "capture.drain")
         .map(|event| {
             event["attributes"][provenance_keys::RAW_OBSERVATION_ID]
                 .as_str()
@@ -339,8 +347,8 @@ async fn capture_is_lossless_and_ordered_per_stream_under_load() {
     let events = read_jsonl(&events_path);
     assert_eq!(
         events.len(),
-        LINE_COUNT * 2 + 2,
-        "stdio + process.start/exit"
+        LINE_COUNT * 2 + 3,
+        "stdio + process.start/exit + capture.drain"
     );
     assert_eq!(
         event_messages(&events, "stdout"),
@@ -350,7 +358,10 @@ async fn capture_is_lossless_and_ordered_per_stream_under_load() {
         event_messages(&events, "stderr"),
         expected_lines("stderr", LINE_COUNT)
     );
-    for event in &events {
+    for event in events
+        .iter()
+        .filter(|event| event["name"] != "capture.drain")
+    {
         assert_common_event_provenance(event, "discard_after_normalize");
         assert!(
             event["attributes"]
@@ -379,7 +390,11 @@ async fn capture_preserves_non_utf8_and_empty_lines() {
     assert!(output.stderr.is_empty());
 
     let events = read_jsonl(&events_path);
-    assert_eq!(events.len(), 4, "2 stdio lines + process.start/exit");
+    assert_eq!(
+        events.len(),
+        5,
+        "2 stdio lines + process.start/exit + capture.drain"
+    );
     let stdio = log_events(&events);
     assert_eq!(stdio.len(), 2);
     assert_eq!(stdio[0]["attributes"]["message_base64"], "/wBB");
@@ -421,7 +436,11 @@ async fn capture_flushes_telemetry_before_returning_nonzero_child_exit() {
     assert_eq!(output.stdout, b"stdout-before-exit\n");
     assert_eq!(output.stderr, b"stderr-before-exit\n");
     let events = read_jsonl(&events_path);
-    assert_eq!(events.len(), 4, "2 stdio lines + process.start/exit");
+    assert_eq!(
+        events.len(),
+        5,
+        "2 stdio lines + process.start/exit + capture.drain"
+    );
     assert_eq!(
         events
             .iter()
@@ -432,6 +451,7 @@ async fn capture_flushes_telemetry_before_returning_nonzero_child_exit() {
             "process.start",
             "process.stderr",
             "process.stdout",
+            "capture.drain",
         ])
     );
     assert_process_lifecycle(&events, 23);
@@ -624,12 +644,13 @@ async fn spawn_failure_is_captured_as_a_process_spawn_failed_event() {
         "stderr: {stderr}"
     );
 
-    // Full capture includes the failed attempt: exactly one exec-signal record
-    // stating what was attempted and why no process ever started.
+    // Full capture includes the failed attempt plus an explicit completion receipt.
     let events = read_jsonl(&events_path);
-    let [event] = events.as_slice() else {
-        panic!("expected exactly the spawn-failure event, got {events:?}");
-    };
+    assert_eq!(events.len(), 2, "events: {events:?}");
+    let event = events
+        .iter()
+        .find(|event| event["name"] == "process.spawn_failed")
+        .expect("spawn-failure event");
     assert_eq!(event["name"], "process.spawn_failed");
     assert_eq!(event["signal"], "exec");
     assert_eq!(event["run_id"], RUN_ID);
@@ -658,6 +679,19 @@ async fn spawn_failure_is_captured_as_a_process_spawn_failed_event() {
         .as_str()
         .expect("wrapper.invocation_id on the spawn-failure event");
     ulid::Ulid::from_string(invocation_id).expect("wrapper.invocation_id is a valid ULID");
+    let drain = events
+        .iter()
+        .find(|event| event["name"] == "capture.drain")
+        .expect("capture completion event");
+    assert_eq!(drain["attributes"]["capture.complete"], true);
+    assert_eq!(
+        drain["attributes"]["capture.source.process.state"],
+        "attached_full"
+    );
+    assert_eq!(
+        drain["attributes"][provenance_keys::WRAPPER_INVOCATION_ID],
+        invocation_id
+    );
 }
 
 #[tokio::test]
@@ -733,7 +767,7 @@ async fn inspect_summarizes_captured_events() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     assert!(
-        stdout.contains("6 events across 1 run lineage path(s)"),
+        stdout.contains("7 events across 1 run lineage path(s)"),
         "summary header missing: {stdout}"
     );
     assert!(
@@ -751,6 +785,10 @@ async fn inspect_summarizes_captured_events() {
     assert!(
         stdout.contains("process.exit: 1"),
         "process.exit count: {stdout}"
+    );
+    assert!(
+        stdout.contains("capture.drain: 1"),
+        "capture completion count: {stdout}"
     );
 }
 
@@ -791,6 +829,48 @@ async fn captures_otlp_traces_from_child_export() {
         llm["attributes"][provenance_keys::NORMALIZER_NAME],
         "otlp-trace"
     );
+    let drain = events
+        .iter()
+        .find(|event| event["name"] == "capture.drain")
+        .expect("unconditional completion event");
+    assert_eq!(
+        drain["attributes"]["capture.source.otlp.state"],
+        "attached_full"
+    );
+    assert_eq!(
+        drain["attributes"]["capture.source.otlp.trust"],
+        "workload_reported"
+    );
+}
+
+#[tokio::test]
+async fn configured_otlp_with_no_exports_is_reported_as_available_no_data() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let events_path = temp.path().join("events.jsonl");
+    let mut command = interceptor_command();
+    command
+        .arg("--otlp")
+        .arg("--events-jsonl")
+        .arg(&events_path);
+    append_mock_harness(&mut command, "lines", &["0"]);
+
+    let output = run(command).await;
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = read_jsonl(&events_path);
+    let drain = events
+        .iter()
+        .find(|event| event["name"] == "capture.drain")
+        .expect("unconditional completion event");
+    assert_eq!(
+        drain["attributes"]["capture.source.otlp.state"],
+        "attached_no_data"
+    );
+    assert_eq!(drain["attributes"]["capture.complete"], true);
 }
 
 fn otlp_trace_fixture() -> Vec<u8> {
@@ -1068,6 +1148,14 @@ async fn proxy_capture_without_blob_dir_uploads_bodies_to_the_gateway() {
         proto_attr_i64(drain_event, "capture.blobs.found"),
         proto_attr_i64(drain_event, "capture.blobs.landed"),
     );
+    assert_eq!(
+        proto_attr_str(drain_event, "capture.source.network.state"),
+        Some("attached_full")
+    );
+    assert_eq!(
+        proto_attr_str(drain_event, "capture.source.otlp.state"),
+        Some("off_by_policy")
+    );
 }
 
 #[tokio::test]
@@ -1279,6 +1367,17 @@ fn proto_attr_i64(event: &hiloop_interceptor::grpc_client::proto::Event, key: &s
     }
 }
 
+fn proto_attr_str<'a>(
+    event: &'a hiloop_interceptor::grpc_client::proto::Event,
+    key: &str,
+) -> Option<&'a str> {
+    use hiloop_interceptor::grpc_client::proto::attribute_value::Value;
+    match event.attributes.get(key)?.value.as_ref()? {
+        Value::StringValue(value) => Some(value),
+        _ => None,
+    }
+}
+
 fn proto_attr_bool(
     event: &hiloop_interceptor::grpc_client::proto::Event,
     key: &str,
@@ -1430,8 +1529,8 @@ async fn gateway_outage_keeps_local_capture_complete_and_reports_undelivered_cou
     );
     assert_process_lifecycle(&events, 0);
 
-    // The capture-health record is minted and captured locally; it accounts for the
-    // backlog without claiming loss (the spool drops nothing under its caps here).
+    // The local completion record accounts for the unsettled remote backlog and does
+    // not certify complete capture while those events remain undelivered.
     let drain = events
         .iter()
         .find(|event| event["name"] == "capture.drain")
@@ -1446,8 +1545,8 @@ async fn gateway_outage_keeps_local_capture_complete_and_reports_undelivered_cou
         "the backlog at mint time is recorded: {drain}"
     );
     assert_eq!(
-        drain["attributes"]["capture.complete"], true,
-        "spooled-but-undelivered is a backlog, not a loss: {drain}"
+        drain["attributes"]["capture.complete"], false,
+        "an unsettled remote backlog is incomplete: {drain}"
     );
 }
 
@@ -1789,6 +1888,7 @@ fn mock_harness_path() -> PathBuf {
 }
 
 async fn run(mut command: Command) -> Output {
+    command.stdin(std::process::Stdio::null());
     tokio::time::timeout(E2E_TIMEOUT, command.output())
         .await
         .expect("interceptor e2e scenario timed out")
@@ -1803,11 +1903,11 @@ fn read_jsonl(path: &std::path::Path) -> Vec<Value> {
         .collect()
 }
 
-/// The stdio (`signal == "log"`) subset of `events`, in file order.
+/// The stdio log subset of `events`, in file order.
 fn log_events(events: &[Value]) -> Vec<&Value> {
     events
         .iter()
-        .filter(|event| event["signal"] == "log")
+        .filter(|event| event["attributes"]["source"] == "stdio")
         .collect()
 }
 

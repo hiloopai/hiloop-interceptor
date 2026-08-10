@@ -65,6 +65,7 @@ fn tls_interception_failed_event_shape_is_locked() {
         "tls.interception_failed",
         &json!({
             "client_hello_fingerprint": "ja4:t13d1516h2",
+            "l7_capture": false,
             "original_destination.ip": "203.0.113.10",
             "original_destination.port": 443,
             "reason": "client_trust_rejected",

@@ -29,7 +29,8 @@ pub fn capture_otlp_queue_override(current: Option<&str>) -> Option<usize> {
 
 const CLIENT_HELLO_FINGERPRINT: &str = "client_hello_fingerprint";
 const DOWNSTREAM_BYTES: &str = "downstream_bytes";
-const L7_CAPTURE: &str = "l7_capture";
+/// Event attribute reporting whether application-layer traffic was captured.
+pub const L7_CAPTURE: &str = "l7_capture";
 const ORIGINAL_DESTINATION_IP: &str = "original_destination.ip";
 const ORIGINAL_DESTINATION_PORT: &str = "original_destination.port";
 const REASON: &str = "reason";
@@ -226,6 +227,13 @@ string_enum! {
     }
 }
 
+mod completion;
+pub use completion::{
+    CaptureBlobDelivery, CaptureCompletionError, CaptureCompletionReport, CaptureEventDelivery,
+    CaptureEvidenceTrust, CaptureSourceDegradation, CaptureSourceReport, CaptureSourceState,
+    CaptureSourcesReport,
+};
+
 /// Original transport destination recovered before application classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OriginalDestination {
@@ -349,6 +357,7 @@ impl Event {
                 EventName::from_static("tls.interception_failed"),
             )
             .with_attribute(AttributeKey::from_static(REASON), reason.to_string())
+            .with_attribute(AttributeKey::from_static(L7_CAPTURE), false)
             .with_attribute(AttributeKey::from_static("retry_required"), retry_required),
             flow,
         )

@@ -33,7 +33,7 @@ use crate::blob_drain::DrainRetryPolicy;
 use crate::pipeline::DEFAULT_EXPORT_BATCH_SIZE;
 use crate::seams::{ExportError, Exporter};
 use async_trait::async_trait;
-use hiloop_core::event::Event;
+use hiloop_core::{capture::CaptureCompletionReport, event::Event};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -79,6 +79,10 @@ impl Default for SpoolPolicy {
 /// Backlog and loss accounting of one spool at one instant.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SpoolReport {
+    /// Events that entered the retry spool at least once.
+    pub spooled_events: u64,
+    /// Events confirmed delivered by the inner exporter.
+    pub delivered_events: u64,
     /// Events parked in the spool, awaiting redelivery.
     pub pending_events: usize,
     /// Serialized size of the pending events.
@@ -87,13 +91,21 @@ pub struct SpoolReport {
     pub dropped_events: u64,
     /// Events dropped because the sink permanently rejected their batch.
     pub rejected_events: u64,
+    /// The terminal completion record still awaits delivery.
+    pub completion_pending: bool,
+    /// The terminal completion record was permanently rejected.
+    pub completion_rejected: bool,
 }
 
 impl SpoolReport {
     /// True when nothing was lost and nothing is still waiting.
     #[must_use]
     pub const fn is_clean(&self) -> bool {
-        self.pending_events == 0 && self.dropped_events == 0 && self.rejected_events == 0
+        self.pending_events == 0
+            && self.dropped_events == 0
+            && self.rejected_events == 0
+            && !self.completion_pending
+            && !self.completion_rejected
     }
 
     /// True when no event was dropped (pending events may still await redelivery).
@@ -136,12 +148,23 @@ struct SpooledEvent {
     bytes: u64,
 }
 
+#[derive(Clone)]
+struct TerminalEvent {
+    event: Event,
+    report: CaptureCompletionReport,
+}
+
 #[derive(Default)]
 struct SpoolState {
     queue: VecDeque<SpooledEvent>,
+    terminal: Option<TerminalEvent>,
+    terminal_seen: bool,
+    terminal_rejected: bool,
     queued_bytes: u64,
     dropped_events: u64,
     rejected_events: u64,
+    spooled_events: u64,
+    delivered_events: u64,
     /// Consecutive failed delivery attempts; drives the exponential backoff.
     consecutive_failures: u32,
     /// No delivery attempt before this instant; `None` means deliver immediately.
@@ -159,10 +182,14 @@ impl SpoolState {
 
     fn report(&self) -> SpoolReport {
         SpoolReport {
+            spooled_events: self.spooled_events,
+            delivered_events: self.delivered_events,
             pending_events: self.queue.len(),
             pending_bytes: self.queued_bytes,
             dropped_events: self.dropped_events,
             rejected_events: self.rejected_events,
+            completion_pending: self.terminal.is_some(),
+            completion_rejected: self.terminal_rejected,
         }
     }
 
@@ -212,23 +239,50 @@ impl<E: Exporter> SpoolingExporter<E> {
         self.state.lock().await.last_failure.clone()
     }
 
-    /// Run-end drain: give the spooled backlog its final chance within `retry`'s
-    /// bounded budget (the same schedule shape as the run-end blob drain), ignoring
-    /// the in-run backoff gate — the budget is the gate now. Returns the end state;
-    /// `pending_events` is what remains undelivered when the budget is exhausted.
+    /// Run-end drain: before completion admission, give the data backlog its final chance within
+    /// `retry`'s bounded budget. After completion admission the data prefix is frozen; only an
+    /// already-queued terminal record can retry. Returns the final settled/pending state.
     pub async fn drain(&self, retry: &DrainRetryPolicy) -> SpoolReport {
-        let mut backoff = retry.initial_backoff;
-        for attempt in 0..retry.attempts.max(1) {
-            if attempt > 0 {
-                tokio::time::sleep(backoff).await;
-                backoff = backoff.saturating_mul(2);
-            }
-            let mut state = self.state.lock().await;
-            if state.queue.is_empty() || self.deliver_queue(&mut state).await.is_ok() {
-                break;
+        {
+            let state = self.state.lock().await;
+            if state.terminal_seen && !state.queue.is_empty() {
+                return state.report();
             }
         }
-        self.state.lock().await.report()
+        let phase_budget = self.drain_phase_budget(retry);
+        let elapsed = tokio::time::timeout(phase_budget, async {
+            let mut backoff = retry.initial_backoff;
+            for attempt in 0..retry.attempts.max(1) {
+                if attempt > 0 {
+                    tokio::time::sleep(backoff).await;
+                    backoff = backoff.saturating_mul(2);
+                }
+                let mut state = self.state.lock().await;
+                if self.deliver_all(&mut state).await.is_ok() {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_err();
+        let mut state = self.state.lock().await;
+        if elapsed {
+            state.last_failure = Some(format!(
+                "run-end drain phase timed out after {phase_budget:?}"
+            ));
+        }
+        state.report()
+    }
+
+    fn drain_phase_budget(&self, retry: &DrainRetryPolicy) -> Duration {
+        let attempts = retry.attempts.max(1);
+        let mut budget = self.policy.attempt_timeout.saturating_mul(attempts);
+        let mut backoff = retry.initial_backoff;
+        for _ in 1..attempts {
+            budget = budget.saturating_add(backoff);
+            backoff = backoff.saturating_mul(2);
+        }
+        budget
     }
 
     /// One timeout-bounded call into the inner exporter, classified on failure.
@@ -252,6 +306,52 @@ impl<E: Exporter> SpoolingExporter<E> {
         }
     }
 
+    async fn attempt_completion(&self, terminal: &TerminalEvent) -> Result<(), AttemptFailure> {
+        match tokio::time::timeout(
+            self.policy.attempt_timeout,
+            self.inner
+                .export_completion(&terminal.event, &terminal.report),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(classify(&error)),
+            Err(_elapsed) => Err(AttemptFailure::Transient(format!(
+                "completion export attempt timed out after {:?}",
+                self.policy.attempt_timeout
+            ))),
+        }
+    }
+
+    async fn deliver_terminal(&self, state: &mut SpoolState) -> Result<(), ()> {
+        let Some(terminal) = state.terminal.clone() else {
+            return Ok(());
+        };
+        let outcome = match self.attempt_completion(&terminal).await {
+            Err(AttemptFailure::Ambiguous(_)) => self.attempt_completion(&terminal).await,
+            outcome => outcome,
+        };
+        match outcome {
+            Ok(()) => {
+                state.terminal = None;
+                state.on_success();
+                Ok(())
+            }
+            Err(AttemptFailure::Permanent(message)) => {
+                state.terminal = None;
+                state.terminal_rejected = true;
+                eprintln!(
+                    "hiloop-interceptor: warning: the export sink permanently rejected the capture completion record: {message}"
+                );
+                Ok(())
+            }
+            Err(failure) => {
+                state.on_failure(&self.policy, failure.message().to_owned());
+                Err(())
+            }
+        }
+    }
+
     /// Redeliver the spooled backlog in arrival order. A permanent rejection drops
     /// only the refused chunk (the verdict is about that batch) and keeps going; a
     /// transient/ambiguous failure stops the pass and arms the backoff.
@@ -266,6 +366,7 @@ impl<E: Exporter> SpoolingExporter<E> {
                 .collect();
             match self.deliver(&chunk).await {
                 Ok(()) => {
+                    state.delivered_events += chunk_len as u64;
                     Self::pop_front(state, chunk_len);
                     state.on_success();
                 }
@@ -283,6 +384,14 @@ impl<E: Exporter> SpoolingExporter<E> {
         Ok(())
     }
 
+    async fn deliver_all(&self, state: &mut SpoolState) -> Result<(), ()> {
+        if state.terminal_seen && !state.queue.is_empty() {
+            return Err(());
+        }
+        self.deliver_queue(state).await?;
+        self.deliver_terminal(state).await
+    }
+
     fn pop_front(state: &mut SpoolState, count: usize) {
         for _ in 0..count {
             if let Some(spooled) = state.queue.pop_front() {
@@ -294,6 +403,7 @@ impl<E: Exporter> SpoolingExporter<E> {
     /// Park `events` at the spool's tail, then enforce both caps by dropping the
     /// oldest events (counted; one loud warning per run when dropping starts).
     fn enqueue(&self, state: &mut SpoolState, events: &[Event]) {
+        state.spooled_events += events.len() as u64;
         for event in events {
             let bytes = approx_event_bytes(event);
             state.queue.push_back(SpooledEvent {
@@ -333,12 +443,21 @@ impl<E: Exporter> Exporter for SpoolingExporter<E> {
             return Ok(());
         }
         let mut state = self.state.lock().await;
+        if state.terminal_seen {
+            return Err(ExportError::rejected(
+                "event-spool",
+                "capture completion has already closed the event stream",
+            ));
+        }
         if state.in_backoff() || self.deliver_queue(&mut state).await.is_err() {
             self.enqueue(&mut state, events);
             return Ok(());
         }
         match self.deliver(events).await {
-            Ok(()) => state.on_success(),
+            Ok(()) => {
+                state.delivered_events += events.len() as u64;
+                state.on_success();
+            }
             Err(AttemptFailure::Permanent(message)) => {
                 state.rejected_events += events.len() as u64;
                 warn_rejected(events.len(), &message);
@@ -351,12 +470,32 @@ impl<E: Exporter> Exporter for SpoolingExporter<E> {
         Ok(())
     }
 
-    /// Best-effort: redeliver the backlog when the backoff allows, then flush the
-    /// inner exporter. Events still spooled after an outage-time flush stay parked
-    /// for the run-end [`drain`](SpoolingExporter::drain).
+    async fn export_completion(
+        &self,
+        event: &Event,
+        report: &CaptureCompletionReport,
+    ) -> Result<(), ExportError> {
+        let mut state = self.state.lock().await;
+        if state.terminal_seen {
+            return Err(ExportError::rejected(
+                "event-spool",
+                "capture completion was already queued",
+            ));
+        }
+        state.terminal = Some(TerminalEvent {
+            event: event.clone(),
+            report: report.clone(),
+        });
+        state.terminal_seen = true;
+        Ok(())
+    }
+
+    /// Best-effort: redeliver the ordinary backlog when the backoff allows, then flush the inner
+    /// exporter. The terminal lane is attempted only by the one final run-end
+    /// [`drain`](SpoolingExporter::drain), which owns its bounded retry budget.
     async fn flush(&self) -> Result<(), ExportError> {
         let mut state = self.state.lock().await;
-        if !state.queue.is_empty() && !state.in_backoff() {
+        if !state.terminal_seen && !state.queue.is_empty() && !state.in_backoff() {
             let _ = self.deliver_queue(&mut state).await;
         }
         drop(state);
@@ -379,8 +518,13 @@ fn warn_rejected(count: usize, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hiloop_core::event::{AttributeKey, EventName, SignalType};
     use hiloop_core::identity::{Hlc, RunContext};
+    use hiloop_core::{
+        capture::{
+            CaptureEventDelivery, CaptureEvidenceTrust, CaptureSourceReport, CaptureSourcesReport,
+        },
+        event::{AttributeKey, EventName, SignalType},
+    };
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -388,6 +532,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Respond {
         Deliver,
+        DeliverAfter(Duration),
         Backpressure,
         Unavailable,
         Rejected,
@@ -440,6 +585,11 @@ mod tests {
                 .unwrap_or(Respond::Deliver);
             match response {
                 Respond::Deliver => {
+                    self.delivered.lock().expect("lock").push(events.to_vec());
+                    Ok(())
+                }
+                Respond::DeliverAfter(delay) => {
+                    tokio::time::sleep(delay).await;
                     self.delivered.lock().expect("lock").push(events.to_vec());
                     Ok(())
                 }
@@ -496,6 +646,31 @@ mod tests {
         }
     }
 
+    fn completion_with_delivery(events: CaptureEventDelivery) -> CaptureCompletionReport {
+        CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::attached_full(CaptureEvidenceTrust::PlatformObserved, 1),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            ),
+            events,
+            None,
+            None,
+            None,
+        )
+        .expect("valid completion")
+    }
+
+    fn completion_for_pending_event() -> CaptureCompletionReport {
+        completion_with_delivery(CaptureEventDelivery {
+            observed: 1,
+            spooled: 1,
+            pending: 1,
+            ..CaptureEventDelivery::default()
+        })
+    }
+
     #[tokio::test]
     async fn healthy_path_passes_batches_straight_through() {
         let spool = SpoolingExporter::new(FakeSink::default(), fast_policy());
@@ -511,7 +686,10 @@ mod tests {
             messages(&spool.inner.delivered_flat()),
             ["one", "two", "three"]
         );
-        assert!(spool.report().await.is_clean());
+        let report = spool.report().await;
+        assert!(report.is_clean());
+        assert_eq!(report.spooled_events, 0);
+        assert_eq!(report.delivered_events, 3);
     }
 
     #[tokio::test]
@@ -546,7 +724,10 @@ mod tests {
             messages(&spool.inner.delivered_flat()),
             ["one", "two", "three", "four"]
         );
-        assert!(spool.report().await.is_clean());
+        let report = spool.report().await;
+        assert!(report.is_clean());
+        assert_eq!(report.spooled_events, 3);
+        assert_eq!(report.delivered_events, 4);
     }
 
     #[tokio::test(start_paused = true)]
@@ -613,6 +794,171 @@ mod tests {
         );
         assert_eq!(report.pending_events, 0);
         assert_eq!(report.dropped_events, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_spool_reserves_completion_without_evicting_data() {
+        let sink = FakeSink::scripted([Respond::Unavailable]);
+        let policy = SpoolPolicy {
+            max_events: 1,
+            ..fast_policy()
+        };
+        let spool = SpoolingExporter::new(sink, policy);
+        let data = event("one");
+        spool
+            .export(std::slice::from_ref(&data))
+            .await
+            .expect("spool data");
+        let completion = completion_for_pending_event();
+        let completion_event = completion.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+
+        spool
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("reserve completion");
+        let before = spool.report().await;
+        assert_eq!(before.pending_events, 1);
+        assert_eq!(before.dropped_events, 0);
+
+        let after = spool.drain(&fast_drain(1)).await;
+        assert_eq!(after.pending_events, 1);
+        assert!(after.completion_pending);
+        assert_eq!(after.dropped_events, 0);
+        assert!(spool.inner.delivered_flat().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_admission_defers_delivery_to_the_final_drain() {
+        let sink = FakeSink::scripted([Respond::Hang, Respond::Deliver]);
+        let spool = SpoolingExporter::new(sink, fast_policy());
+        let completion = completion_with_delivery(CaptureEventDelivery::default());
+        let completion_event = completion.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+
+        spool
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("admit completion");
+        assert!(spool.report().await.completion_pending);
+        assert_eq!(
+            spool.inner.calls(),
+            0,
+            "admission does not spend retry budget"
+        );
+
+        let report = spool.drain(&fast_drain(2)).await;
+        assert!(report.is_clean());
+        assert_eq!(
+            spool.inner.delivered_flat()[0].name.as_str(),
+            "capture.drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_completion_closes_the_event_stream() {
+        let spool = SpoolingExporter::new(FakeSink::default(), fast_policy());
+        let completion = completion_with_delivery(CaptureEventDelivery::default());
+        let completion_event = completion.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+        spool
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("completion");
+
+        let error = spool
+            .export(&[event("late")])
+            .await
+            .expect_err("post-terminal data is rejected");
+        assert!(matches!(error, ExportError::Rejected { .. }));
+        assert!(spool.inner.delivered_flat().is_empty());
+        assert!(spool.drain(&fast_drain(1)).await.is_clean());
+        assert_eq!(spool.inner.delivered_flat().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flush_cannot_mutate_the_prefix_after_completion_admission() {
+        let sink = FakeSink::scripted([Respond::Unavailable, Respond::Deliver]);
+        let spool = SpoolingExporter::new(sink, fast_policy());
+        spool.export(&[event("pending")]).await.expect("export");
+        let completion = completion_for_pending_event();
+        let completion_event = completion.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+        spool
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("admit completion");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        spool.flush().await.expect("flush inner sink");
+
+        let report = spool.report().await;
+        assert_eq!(report.pending_events, 1);
+        assert_eq!(report.delivered_events, 0);
+        assert!(report.completion_pending);
+        assert_eq!(
+            spool.inner.calls(),
+            1,
+            "no post-completion delivery attempt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_carries_the_settled_data_prefix_unchanged() {
+        let sink = FakeSink::scripted([Respond::Unavailable, Respond::Rejected, Respond::Deliver]);
+        let spool = SpoolingExporter::new(sink, fast_policy());
+        spool.export(&[event("one")]).await.expect("spool data");
+        let settled = spool.drain(&fast_drain(1)).await;
+        assert_eq!(settled.rejected_events, 1);
+        let completion = completion_with_delivery(CaptureEventDelivery {
+            observed: 1,
+            spooled: settled.spooled_events,
+            landed: settled.delivered_events,
+            dropped: settled.dropped_events,
+            rejected: settled.rejected_events,
+            pending: settled.pending_events as u64,
+        });
+        let completion_event = completion.to_event(
+            &RunContext::new_local_root(),
+            Hlc {
+                wall_ns: 2,
+                logical: 0,
+            },
+        );
+        spool
+            .export_completion(&completion_event, &completion)
+            .await
+            .expect("reserve completion");
+
+        let report = spool.drain(&fast_drain(1)).await;
+        assert_eq!(report.rejected_events, 1);
+        assert!(!report.completion_pending);
+        let delivered = spool.inner.delivered_flat();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].name.as_str(), "capture.drain");
+        let value = serde_json::to_value(&delivered[0]).expect("completion json");
+        assert_eq!(value["attributes"]["capture.events.rejected"], 1);
+        assert_eq!(value["attributes"]["capture.complete"], false);
     }
 
     #[tokio::test(start_paused = true)]
@@ -736,6 +1082,37 @@ mod tests {
         assert_eq!(report.pending_events, 2, "undelivered events are reported");
         assert!(!report.is_clean());
         assert!(report.is_lossless_so_far(), "spooled, not dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_end_drain_bounds_the_whole_phase_not_each_chunk() {
+        let sink = FakeSink::scripted([
+            Respond::Unavailable,
+            Respond::DeliverAfter(Duration::from_millis(40)),
+            Respond::DeliverAfter(Duration::from_millis(40)),
+            Respond::DeliverAfter(Duration::from_millis(40)),
+        ]);
+        let policy = SpoolPolicy {
+            attempt_timeout: Duration::from_millis(50),
+            drain_batch_size: 1,
+            ..fast_policy()
+        };
+        let spool = SpoolingExporter::new(sink, policy);
+        for label in ["one", "two", "three"] {
+            spool.export(&[event(label)]).await.expect("export");
+        }
+
+        let report = spool.drain(&fast_drain(2)).await;
+
+        assert_eq!(report.delivered_events, 2);
+        assert_eq!(report.pending_events, 1);
+        assert!(
+            spool
+                .last_failure()
+                .await
+                .expect("phase timeout recorded")
+                .contains("drain phase timed out")
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -24,6 +24,17 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Added
 
+- A shared, validated capture-completion report now produces the sole `capture.drain` Event-v1
+  shape for local and embedded runtimes. Every controlled terminal path attempts it, including
+  zero-event runs and spawn failures; durable presence certifies a terminal producer receipt, and
+  only `capture.complete=true` certifies complete settled capture. Absence means no durable producer
+  receipt. Transparent capture relays the workload report as typed state and
+  merges it once with network and gateway delivery truth instead of emitting competing records.
+  Fixed process, stdio, network, and OTLP source fields report platform-observed versus
+  workload-reported trust, off-by-policy / unavailable / attached-no-data / full /
+  metadata-only / mixed fidelity, and typed degradation. Event and blob delivery now include
+  observed, spooled, landed, pending, dropped, rejected, missing, and oversize counts. An
+  oversize payload or unsettled event backlog makes `capture.complete=false`.
 - An `UNAUTHENTICATED` gateway rejection of a refreshable credential is now retryable-after-refresh
   instead of a permanent drop. The gateway credential is a shared, rotatable handle
   (`GatewayCredential`, one per run, presented by both the event exporter and the blob uploader),
@@ -62,13 +73,15 @@ minor releases may include breaking changes to the CLI, its flags, and the event
   (redelivering a judged batch cannot succeed); anything else gets one inline retry, then spools.
   An outage no longer aborts the capture pipeline, so local sinks (`--events-jsonl`) keep
   capturing through it, and the child is never blocked on a sink known to be down. At run end the
-  spool drains best-effort within the same bounded budget as the payload-blob drain; anything
+  ordinary data receives one bounded drain phase (31.5 seconds with the default policy); only
+  after that prefix settles does the terminal record receive the same bounded phase (63 seconds
+  total when both run); anything
   still undelivered is reported on stderr with counts instead of being dropped silently. The
   `capture.drain` health record is now emitted for every gRPC-exported run (previously only
   proxy-capturing runs) and gains `capture.events.dropped`, `capture.events.rejected`, and
   `capture.events.pending` attributes; `capture.complete` now also requires that no exported
-  event was lost. `ExportError` gains `Unavailable` and `Rejected` variants carrying these retry
-  semantics at the exporter seam.
+  event was lost or remained pending. `ExportError` gains `Unavailable` and `Rejected` variants
+  carrying these retry semantics at the exporter seam.
 
 - Every event the wrapper emits now carries `wrapper.invocation_id`: a ULID minted once per wrap
   invocation (at `RunOptions` construction) that identifies which invocation produced the event —

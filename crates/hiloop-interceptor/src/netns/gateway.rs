@@ -32,7 +32,7 @@ use hyper_util::{
     },
     rt::{TokioExecutor, TokioIo},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
@@ -64,6 +64,7 @@ use super::{
     classify_client_handshake_error, connect_authorized,
     event_relay::EventRelayExporter,
     routing::{GATEWAY_IPV4, GATEWAY_IPV6},
+    security::deny_process_inspection,
 };
 
 pub(super) const GATEWAY_WORKER_ROLE: &str = "__hiloop-netns-gateway-worker";
@@ -73,11 +74,12 @@ const GATEWAY_CONFIG_ENV: &str = "HILOOP_NETNS_GATEWAY_CONFIG";
 const WORKLOAD_CONFIG_ENV: &str = "HILOOP_NETNS_WORKLOAD_CONFIG";
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct GatewayConfig {
     context: RunContext,
     attributes: Attributes,
     event_socket: PathBuf,
+    event_token: String,
     ca_bundle: PathBuf,
     blob_dir: PathBuf,
     max_capture_bytes: Option<u64>,
@@ -86,11 +88,12 @@ pub(super) struct GatewayConfig {
     anomaly: AnomalyConfigWire,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct WorkloadConfig {
     context: RunContext,
     attributes: Attributes,
     event_socket: PathBuf,
+    event_token: String,
     ca_bundle: PathBuf,
     execution_id: Option<String>,
     otlp: bool,
@@ -123,11 +126,13 @@ impl GatewayConfig {
         event_socket: PathBuf,
         ca_bundle: PathBuf,
         blob_dir: PathBuf,
+        event_token: String,
     ) -> Self {
         Self {
             context: options.context().clone(),
             attributes: options.attributes().clone(),
             event_socket,
+            event_token,
             ca_bundle,
             blob_dir,
             max_capture_bytes: options.max_capture_bytes(),
@@ -149,11 +154,13 @@ impl WorkloadConfig {
         options: &RunOptions,
         event_socket: PathBuf,
         ca_bundle: PathBuf,
+        event_token: String,
     ) -> Self {
         Self {
             context: options.context().clone(),
             attributes: options.attributes().clone(),
             event_socket,
+            event_token,
             ca_bundle,
             execution_id: options.execution_id().map(str::to_owned),
             otlp: options.otlp_enabled(),
@@ -244,7 +251,7 @@ impl AnomalyConfigWire {
 }
 
 pub(super) fn gateway_worker_entrypoint() -> io::Result<ExitCode> {
-    let config: GatewayConfig = decode_environment(GATEWAY_CONFIG_ENV)?;
+    let config: GatewayConfig = take_bootstrap_config(GATEWAY_CONFIG_ENV)?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -252,13 +259,16 @@ pub(super) fn gateway_worker_entrypoint() -> io::Result<ExitCode> {
 }
 
 pub(super) fn captured_workload_entrypoint() -> io::Result<ExitCode> {
-    let config = take_workload_config()?;
+    let config: WorkloadConfig = take_bootstrap_config(WORKLOAD_CONFIG_ENV)?;
+    deny_process_inspection()?;
     let command = std::env::args().skip(2).collect::<Vec<_>>();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let exporter = EventRelayExporter::connect(&config.event_socket).await?;
+        let exporter =
+            EventRelayExporter::connect_for_workload(&config.event_socket, config.event_token)
+                .await?;
         let mut options = RunOptions::new(
             config.context,
             command,
@@ -293,17 +303,19 @@ pub(super) fn captured_workload_entrypoint() -> io::Result<ExitCode> {
     unsafe_code,
     reason = "the fresh re-exec helper is single-threaded and removes its private bootstrap value before constructing a runtime or child"
 )]
-fn take_workload_config() -> io::Result<WorkloadConfig> {
-    let config = decode_environment(WORKLOAD_CONFIG_ENV)?;
+fn take_bootstrap_config<T: DeserializeOwned>(name: &'static str) -> io::Result<T> {
+    let config = decode_environment(name)?;
     // SAFETY: dispatch_internal_helper runs before the embedding binary constructs any runtime;
-    // this dedicated workload helper has not started a thread and performs no concurrent env access.
-    unsafe { std::env::remove_var(WORKLOAD_CONFIG_ENV) };
+    // the dedicated helpers have not started a thread and perform no concurrent env access.
+    unsafe { std::env::remove_var(name) };
     Ok(config)
 }
 
 async fn run_gateway(config: GatewayConfig) -> io::Result<ExitCode> {
     let bootstrap = GatewayWorkerBootstrap::from_inherited_fds()?;
-    let exporter = Arc::new(EventRelayExporter::connect(&config.event_socket).await?);
+    let exporter = Arc::new(
+        EventRelayExporter::connect_gateway(&config.event_socket, config.event_token).await?,
+    );
     let clock = Arc::new(HlcClock::new());
     let ca = Arc::new(ProxyCa::generate().map_err(io::Error::other)?);
     write_ca_bundle(&config.ca_bundle, ca.cert_pem())?;

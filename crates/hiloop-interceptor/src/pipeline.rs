@@ -1,13 +1,30 @@
 //! Tokio pipeline for source, normalization, and export stages.
 
-use crate::seams::{
-    ExportError, Exporter, NormalizationContext, NormalizeError, Normalizer, NormalizerDescriptor,
-    NormalizerRouter, RawObservationRef, RawRetentionPolicy, RawSignal, RawSignalSink, RawStore,
-    RawStoreError, ShutdownSignal, Source, SourceError, provenance_keys,
+use crate::{
+    exec_events::EXEC_SOURCE,
+    otlp::OTLP_SOURCE,
+    proxy::PROXY_SOURCE,
+    seams::{
+        ExportError, Exporter, NormalizationContext, NormalizeError, Normalizer,
+        NormalizerDescriptor, NormalizerRouter, RawObservationRef, RawRetentionPolicy, RawSignal,
+        RawSignalSink, RawStore, RawStoreError, ShutdownSignal, Source, SourceError,
+        provenance_keys,
+    },
+    stdio::STDIO_SOURCE,
 };
 use futures_util::{FutureExt, StreamExt};
-use hiloop_core::event::{AttributeKey, Event};
-use std::time::Duration;
+use hiloop_core::{
+    capture::L7_CAPTURE,
+    event::{AttributeKey, Event},
+};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -133,13 +150,24 @@ pub enum PipelineOptionsError {
 }
 
 /// Counts emitted by a completed pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineSourceReport {
+    /// Normalized events with the source's full supported fidelity.
+    pub full_events: usize,
+    /// Normalized events explicitly marked as metadata-only.
+    pub metadata_only_events: usize,
+}
+
+/// Counts emitted by a completed pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineReport {
     pub raw_signals: usize,
     pub events: usize,
     pub diagnostics: usize,
     pub raw_observations: usize,
     pub export_batches: usize,
+    /// Per-source normalized event counts and fidelity, with unknown sources aggregated.
+    pub sources: BTreeMap<String, PipelineSourceReport>,
 }
 
 /// Pipeline failure with the stage that produced it.
@@ -184,6 +212,7 @@ pub struct Pipeline<'a, E> {
     exporter: &'a E,
     raw_store: Option<&'a dyn RawStore>,
     options: PipelineOptions,
+    event_counter: Option<Arc<AtomicU64>>,
 }
 
 impl<'a, E> Pipeline<'a, E>
@@ -214,7 +243,13 @@ where
             exporter,
             raw_store: None,
             options: PipelineOptions::default(),
+            event_counter: None,
         }
+    }
+
+    pub(crate) fn event_counter(mut self, event_counter: Arc<AtomicU64>) -> Self {
+        self.event_counter = Some(event_counter);
+        self
     }
 
     /// Attach a raw store so normalizers may request raw preservation.
@@ -243,6 +278,7 @@ where
             self.exporter,
             self.raw_store,
             self.options,
+            self.event_counter.as_deref(),
         )
         .await
     }
@@ -299,6 +335,7 @@ async fn run_pipeline<S, E>(
     exporter: &E,
     raw_store: Option<&dyn RawStore>,
     options: PipelineOptions,
+    event_counter: Option<&AtomicU64>,
 ) -> Result<PipelineReport, PipelineError>
 where
     S: futures_core::Stream<Item = Result<RawSignal, SourceError>> + Unpin,
@@ -327,6 +364,7 @@ where
         let mut events = 0;
         let mut diagnostics = 0;
         let mut raw_observations = 0;
+        let mut sources = BTreeMap::<String, PipelineSourceReport>::new();
         while let Some(raw) = raw_rx.recv().await {
             let selections = router.select_all(&raw);
             if selections.is_empty() {
@@ -339,6 +377,7 @@ where
 
             let source = raw.source.clone();
             let kind = raw.kind.clone();
+            let source_bucket = source_bucket(&source);
             let mut normalized = Vec::with_capacity(selections.len());
             let mut requested_retention = RawRetentionPolicy::DiscardAfterNormalize;
             let mut retention_requester = "pipeline";
@@ -349,6 +388,11 @@ where
                     .normalizer()
                     .normalize(&context, raw.clone())
                     .await?;
+                let outcome_events = outcome.events().len();
+                if let Some(counter) = event_counter {
+                    counter.fetch_add(outcome_events as u64, Ordering::Relaxed);
+                }
+                events += outcome_events;
                 if outcome.raw_retention_policy() == RawRetentionPolicy::Preserve {
                     requested_retention = RawRetentionPolicy::Preserve;
                     retention_requester = descriptor.name();
@@ -386,15 +430,23 @@ where
                             raw_observation: raw_observation.as_ref(),
                         },
                     );
+                    let source_report = sources.entry(source_bucket.to_owned()).or_default();
+                    if matches!(
+                        event.attributes.get(&AttributeKey::from_static(L7_CAPTURE)),
+                        Some(hiloop_core::event::AttributeValue::Bool(false))
+                    ) {
+                        source_report.metadata_only_events += 1;
+                    } else {
+                        source_report.full_events += 1;
+                    }
                     event_tx
                         .send(event)
                         .await
                         .map_err(|_| PipelineError::ChannelClosed { stage: "event" })?;
-                    events += 1;
                 }
             }
         }
-        Ok::<_, PipelineError>((events, diagnostics, raw_observations))
+        Ok::<_, PipelineError>((events, diagnostics, raw_observations, sources))
     };
 
     let export_stage = async {
@@ -487,7 +539,7 @@ where
     if let Some(raw_store) = raw_store {
         raw_store.flush().await?;
     }
-    let (events, diagnostics, raw_observations) =
+    let (events, diagnostics, raw_observations, sources) =
         normalize_report.expect("normalize stage completed");
 
     Ok(PipelineReport {
@@ -496,7 +548,18 @@ where
         diagnostics,
         raw_observations,
         export_batches: export_batches.expect("export stage completed"),
+        sources,
     })
+}
+
+fn source_bucket(source: &str) -> &'static str {
+    match source {
+        EXEC_SOURCE => EXEC_SOURCE,
+        STDIO_SOURCE => STDIO_SOURCE,
+        PROXY_SOURCE => PROXY_SOURCE,
+        OTLP_SOURCE => OTLP_SOURCE,
+        _ => "other",
+    }
 }
 
 struct NormalizationStamp<'a> {
@@ -549,11 +612,20 @@ fn stamp_normalization_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_source_buckets_match_the_real_producer_names() {
+        assert_eq!(source_bucket(EXEC_SOURCE), EXEC_SOURCE);
+        assert_eq!(source_bucket(STDIO_SOURCE), STDIO_SOURCE);
+        assert_eq!(source_bucket(PROXY_SOURCE), PROXY_SOURCE);
+        assert_eq!(source_bucket(OTLP_SOURCE), OTLP_SOURCE);
+        assert_eq!(source_bucket("customer-defined"), "other");
+    }
     use crate::{
         exporters::testing::sample_log_event,
         seams::{
             ExportError, NormalizationOutcome, ObservationContext, ProcessContext, RawSignal,
-            testing::MemoryRawStore,
+            RawStoreError, testing::MemoryRawStore,
         },
         stdio::StdioLogNormalizer,
     };
@@ -607,10 +679,63 @@ mod tests {
     #[derive(Debug)]
     struct FailingExporter;
 
+    #[derive(Debug, Clone, Copy)]
+    struct ManyEventsNormalizer {
+        preserve_raw: bool,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FailingRawStore;
+
     #[async_trait]
     impl Exporter for FailingExporter {
         async fn export(&self, _events: &[Event]) -> Result<(), ExportError> {
             Err(ExportError::other("failing", "intentional failure"))
+        }
+    }
+
+    #[async_trait]
+    impl Normalizer for ManyEventsNormalizer {
+        fn descriptor(&self) -> NormalizerDescriptor {
+            NormalizerDescriptor::new("many-events", "1", "hiloop.event.v1")
+        }
+
+        fn supports(&self, _raw: &RawSignal) -> crate::seams::NormalizerSupport {
+            crate::seams::NormalizerSupport::Exact
+        }
+
+        async fn normalize(
+            &self,
+            context: &NormalizationContext,
+            raw: RawSignal,
+        ) -> Result<NormalizationOutcome, NormalizeError> {
+            let events = (0..8)
+                .map(|_| {
+                    Event::new(
+                        context.run_context(),
+                        raw.observed_at,
+                        SignalType::Log,
+                        EventName::new("test.many").expect("event name"),
+                    )
+                })
+                .collect();
+            let outcome = NormalizationOutcome::from_events(events);
+            Ok(if self.preserve_raw {
+                outcome.with_raw_retention(RawRetentionPolicy::Preserve)
+            } else {
+                outcome
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RawStore for FailingRawStore {
+        async fn store(
+            &self,
+            _context: &NormalizationContext,
+            _raw: &RawSignal,
+        ) -> Result<RawObservationRef, RawStoreError> {
+            Err(RawStoreError::other("fixture", "store failed"))
         }
     }
 
@@ -714,6 +839,13 @@ mod tests {
                 diagnostics: 0,
                 raw_observations: 0,
                 export_batches: 1,
+                sources: BTreeMap::from([(
+                    "stdio".to_owned(),
+                    PipelineSourceReport {
+                        full_events: 1,
+                        metadata_only_events: 0,
+                    },
+                )]),
             }
         );
         let events = exporter.events();
@@ -1025,6 +1157,62 @@ mod tests {
         drop(tx);
     }
 
+    #[tokio::test]
+    async fn normalized_multi_event_tail_is_counted_before_export_backpressure() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let raw = RawSignal::new(
+            "fixture",
+            "many",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::new(),
+        );
+        let result = Pipeline::new(
+            RunContext::new_local_root(),
+            &ManyEventsNormalizer {
+                preserve_raw: false,
+            },
+            &FailingExporter,
+        )
+        .event_counter(Arc::clone(&counter))
+        .options(PipelineOptions::new(1, 2, 1).expect("pipeline options"))
+        .run(futures_util::stream::iter([Ok(raw)]))
+        .await;
+
+        assert!(matches!(result, Err(PipelineError::Export(_))));
+        assert_eq!(counter.load(Ordering::Relaxed), 8);
+    }
+
+    #[tokio::test]
+    async fn normalized_events_are_counted_before_raw_retention_failure() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let raw = RawSignal::new(
+            "fixture",
+            "many",
+            Hlc {
+                wall_ns: 1,
+                logical: 0,
+            },
+            Bytes::new(),
+        );
+        let exporter = RecordingExporter::default();
+        let result = Pipeline::new(
+            RunContext::new_local_root(),
+            &ManyEventsNormalizer { preserve_raw: true },
+            &exporter,
+        )
+        .event_counter(Arc::clone(&counter))
+        .raw_store(&FailingRawStore)
+        .options(PipelineOptions::new(1, 2, 1).expect("pipeline options"))
+        .run(futures_util::stream::iter([Ok(raw)]))
+        .await;
+
+        assert!(matches!(result, Err(PipelineError::RawStore(_))));
+        assert_eq!(counter.load(Ordering::Relaxed), 8);
+    }
+
     #[test]
     fn pipeline_options_reject_zero_capacity() {
         assert!(PipelineOptions::new(0, 1, 1).is_err());
@@ -1180,6 +1368,7 @@ mod tests {
                 diagnostics: 0,
                 raw_observations: 0,
                 export_batches: 0,
+                sources: BTreeMap::new(),
             }
         );
         assert!(exporter.flushed());

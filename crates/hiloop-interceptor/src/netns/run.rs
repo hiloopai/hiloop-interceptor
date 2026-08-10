@@ -4,7 +4,11 @@ use std::{fmt, path::PathBuf, process::ExitCode, sync::Arc};
 
 use async_trait::async_trait;
 use hiloop_core::{
-    capture::{CapturePolicy, CapturePreflight, NetCaptureMode, SelectedNetCaptureMode},
+    capture::{
+        CaptureBlobDelivery, CaptureCompletionReport, CaptureEventDelivery, CaptureEvidenceTrust,
+        CapturePolicy, CapturePreflight, CaptureSourceDegradation, CaptureSourceReport,
+        CaptureSourcesReport, NetCaptureMode, SelectedNetCaptureMode,
+    },
     event::Event,
     identity::{Hlc, RunContext},
 };
@@ -312,8 +316,16 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         None => None,
     };
     let (exporter, spool) = build_exporter(options, gateway_credential.as_ref()).await?;
-    let relay = EventRelayServer::bind(&event_socket, Arc::clone(&exporter))
-        .context("bind transparent-run event relay")?;
+    let gateway_token = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
+    let workload_token = format!("{}{}", ulid::Ulid::new(), ulid::Ulid::new());
+    let relay = EventRelayServer::bind(
+        &event_socket,
+        Arc::clone(&exporter),
+        gateway_token.clone(),
+        workload_token.clone(),
+    )
+    .context("bind transparent-run event relay")?;
+    let relay_capture = relay.capture_report();
     let (relay_shutdown_tx, relay_shutdown_rx) = tokio::sync::oneshot::channel();
     let relay_task = tokio::spawn(relay.serve(async move {
         let _ = relay_shutdown_rx.await;
@@ -324,8 +336,9 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         event_socket.clone(),
         ca_bundle.clone(),
         blob_dir.clone(),
+        gateway_token,
     );
-    let workload = WorkloadConfig::from_options(options, event_socket, ca_bundle);
+    let workload = WorkloadConfig::from_options(options, event_socket, ca_bundle, workload_token);
     let request = ProvisionRequest::new(
         workload.workload_command(&runner.helper_path, options.command())?,
         gateway.worker_command(&runner.helper_path)?,
@@ -352,6 +365,9 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         Ok(result) => result.context("serve transparent-run event relay"),
         Err(error) => Err(error).context("join transparent-run event relay"),
     };
+    let network_observations = relay_capture.network().await;
+    let relay_events = relay_capture.events().await;
+    let inner_completion = relay_capture.take_completion().await;
     let mut result = supervisor.finish_wait(wait_result).await;
     let blob_outcome = drain_blobs(options, &blob_dir, gateway_credential.as_ref()).await;
     let blobs_complete = blob_outcome
@@ -364,37 +380,120 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
         );
     }
 
-    // The capture-health record ships BEFORE the final event-spool drain on purpose: spool
-    // redelivery is strictly in arrival order, so this record reaching the gateway certifies
-    // that everything spooled before it landed too (the supervisor lane's ordering contract).
-    if blob_outcome.is_some() || spool.is_some() {
-        let spool_report = match &spool {
-            Some(spool) => Some(spool.report().await),
-            None => None,
-        };
-        let health_event = capture_drain_event(
-            &NormalizationContext::new(options.context().clone())
-                .with_attributes(options.attributes().clone()),
-            hiloop_core::identity::HlcClock::new().tick(),
-            blob_outcome.as_ref(),
-            spool_report,
-            gateway_credential
-                .as_ref()
-                .map(GatewayCredential::refreshes),
-        );
-        if let Err(warning) = export_run_health(exporter.as_ref(), health_event).await {
-            eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
+    // Settle the ordinary spool before projecting one canonical completion record to every
+    // sink. Completion closes that data prefix; only its dedicated terminal lane may retry.
+    let spool_report = match &spool {
+        Some(spool) => Some(spool.drain(options.blob_drain_retry()).await),
+        None => None,
+    };
+    let network = if relay_result.is_err() || result.is_err() {
+        CaptureSourceReport::configured_unavailable(
+            CaptureEvidenceTrust::PlatformObserved,
+            CaptureSourceDegradation::RuntimeFailed,
+        )
+    } else {
+        CaptureSourceReport::from_event_counts(
+            CaptureEvidenceTrust::PlatformObserved,
+            network_observations.full,
+            network_observations.metadata_only,
+            CaptureSourceDegradation::OpaqueNetworkTraffic,
+        )
+    };
+    let fatal_events = result
+        .as_ref()
+        .err()
+        .map(SupervisedRunError::fatal_event_delivery)
+        .unwrap_or_default();
+    let events = transparent_event_delivery(spool_report, relay_events, fatal_events);
+    let missing_inner = CaptureSourceReport::configured_unavailable(
+        CaptureEvidenceTrust::PlatformObserved,
+        CaptureSourceDegradation::RuntimeFailed,
+    );
+    let sources = match inner_completion.as_ref() {
+        Some((inner, _)) => CaptureSourcesReport::new(
+            inner.sources().process().clone(),
+            inner.sources().stdio().clone(),
+            network,
+            inner.sources().otlp().clone(),
+        ),
+        None => CaptureSourcesReport::new(
+            missing_inner.clone(),
+            missing_inner,
+            network,
+            CaptureSourceReport::configured_unavailable(
+                CaptureEvidenceTrust::WorkloadReported,
+                CaptureSourceDegradation::RuntimeFailed,
+            ),
+        ),
+    };
+    let mut terminal_errors = Vec::new();
+    if let Some((inner, _)) = &inner_completion
+        && let Some(error) = inner.error()
+    {
+        terminal_errors.push(error.to_owned());
+    }
+    if inner_completion.is_none() {
+        terminal_errors.push("captured workload produced no completion report".to_owned());
+    }
+    if let Err(error) = &relay_result {
+        terminal_errors.push(error.to_string());
+    }
+    if let Err(error) = &result {
+        terminal_errors.push(error.to_string());
+    }
+    if let Some(error) = blob_outcome
+        .as_ref()
+        .and_then(|outcome| outcome.error.as_ref())
+    {
+        terminal_errors.push(error.to_string());
+    }
+    let report = CaptureCompletionReport::new(
+        sources,
+        events,
+        blob_outcome.as_ref().map(|outcome| CaptureBlobDelivery {
+            found: outcome.report.found as u64,
+            landed: outcome.report.landed as u64,
+            missing: outcome.report.missing as u64,
+            oversize: outcome.report.oversize_skipped as u64,
+            missing_bytes: outcome.report.missing_bytes,
+        }),
+        gateway_credential
+            .as_ref()
+            .map(GatewayCredential::refreshes),
+        (!terminal_errors.is_empty()).then(|| terminal_errors.join("; ")),
+    )
+    .expect("transparent capture completion accounting is valid");
+    let mut health_event = capture_drain_event(
+        &NormalizationContext::new(options.context().clone())
+            .with_attributes(options.attributes().clone()),
+        hiloop_core::identity::HlcClock::new().tick(),
+        &report,
+    );
+    if let Some((_, inner_event)) = inner_completion {
+        for (key, value) in inner_event.attributes {
+            if key.as_str().starts_with("process.")
+                || key.as_str() == crate::seams::provenance_keys::EXECUTION_ID
+            {
+                health_event.attributes.insert(key, value);
+            }
         }
+    }
+    if let Err(warning) = export_run_completion(exporter.as_ref(), health_event, &report).await {
+        eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
     }
 
     let flush_result = flush_after_supervision(&mut result, exporter.as_ref()).await;
 
     if let Some(spool) = spool {
         let report = spool.drain(options.blob_drain_retry()).await;
-        if report.pending_events > 0 || report.dropped_events > 0 || report.rejected_events > 0 {
+        if !report.is_clean() {
             eprintln!(
-                "hiloop-interceptor: warning: transparent capture event drain incomplete: {} pending, {} dropped, {} rejected",
-                report.pending_events, report.dropped_events, report.rejected_events
+                "hiloop-interceptor: warning: transparent capture event drain incomplete: {} pending, {} dropped, {} rejected, completion pending={}, completion rejected={}",
+                report.pending_events,
+                report.dropped_events,
+                report.rejected_events,
+                report.completion_pending,
+                report.completion_rejected,
             );
         }
     }
@@ -420,6 +519,43 @@ async fn run_system(runner: &SystemNetnsRun, options: &RunOptions) -> anyhow::Re
 }
 
 #[cfg(target_os = "linux")]
+fn transparent_event_delivery(
+    spool: Option<crate::spool::SpoolReport>,
+    relay: crate::netns::event_relay::RelayEventDelivery,
+    fatal: CaptureEventDelivery,
+) -> CaptureEventDelivery {
+    let producer_observed = relay
+        .observed
+        .saturating_add(fatal.observed)
+        .saturating_add(1); // capture.transport is exported directly by the host.
+    match spool {
+        Some(spool) => {
+            let spool_observed = spool
+                .delivered_events
+                .saturating_add(spool.pending_events as u64)
+                .saturating_add(spool.dropped_events)
+                .saturating_add(spool.rejected_events);
+            let pre_spool_dropped = producer_observed.saturating_sub(spool_observed);
+            CaptureEventDelivery {
+                observed: spool_observed.saturating_add(pre_spool_dropped),
+                spooled: spool.spooled_events,
+                landed: spool.delivered_events,
+                dropped: spool.dropped_events.saturating_add(pre_spool_dropped),
+                rejected: spool.rejected_events,
+                pending: spool.pending_events as u64,
+            }
+        }
+        None => CaptureEventDelivery {
+            observed: producer_observed,
+            landed: relay.landed.saturating_add(fatal.landed).saturating_add(1),
+            dropped: relay.dropped.saturating_add(fatal.dropped),
+            rejected: relay.rejected.saturating_add(fatal.rejected),
+            ..CaptureEventDelivery::default()
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
 async fn flush_after_supervision(
     result: &mut Result<SubstrateExit, SupervisedRunError>,
     exporter: &dyn Exporter,
@@ -430,10 +566,14 @@ async fn flush_after_supervision(
 }
 
 #[cfg(target_os = "linux")]
-async fn export_run_health(exporter: &dyn Exporter, event: Event) -> anyhow::Result<()> {
+async fn export_run_completion(
+    exporter: &dyn Exporter,
+    event: Event,
+    report: &CaptureCompletionReport,
+) -> anyhow::Result<()> {
     match tokio::time::timeout(
         CAPTURE_HEALTH_EXPORT_TIMEOUT,
-        exporter.export(std::slice::from_ref(&event)),
+        exporter.export_completion(&event, report),
     )
     .await
     {
@@ -563,12 +703,23 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use hiloop_core::{event::Event, identity::RunContext};
+    use hiloop_core::{
+        capture::{
+            CaptureCompletionReport, CaptureEventDelivery, CaptureEvidenceTrust,
+            CaptureSourceReport, CaptureSourcesReport,
+        },
+        event::Event,
+        identity::RunContext,
+    };
 
-    use super::{export_run_health, flush_after_supervision};
+    use super::{export_run_completion, flush_after_supervision, transparent_event_delivery};
     use crate::{
-        netns::{FatalRunSupervisor, ProvisionError, SubstrateExit, SupervisedRunError},
+        netns::{
+            FatalRunSupervisor, ProvisionError, SubstrateExit, SupervisedRunError,
+            event_relay::RelayEventDelivery,
+        },
         seams::{ExportError, Exporter},
+        spool::SpoolReport,
     };
 
     #[derive(Debug, Default)]
@@ -620,13 +771,31 @@ mod tests {
                 "fixture crash",
             )))
             .await;
-        let health = Event::new(
+        let report = CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::configured_unavailable(
+                    CaptureEvidenceTrust::PlatformObserved,
+                    hiloop_core::capture::CaptureSourceDegradation::RuntimeFailed,
+                ),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            ),
+            CaptureEventDelivery {
+                observed: 2,
+                landed: 2,
+                ..CaptureEventDelivery::default()
+            },
+            None,
+            None,
+            Some("dataplane failed".to_owned()),
+        )
+        .expect("valid completion");
+        let health = report.to_event(
             &RunContext::new_local_root(),
             hiloop_core::identity::HlcClock::new().tick(),
-            hiloop_core::event::SignalType::Net,
-            hiloop_core::event::EventName::from_static("capture-health"),
         );
-        export_run_health(fatal_exporter.as_ref(), health)
+        export_run_completion(fatal_exporter.as_ref(), health, &report)
             .await
             .expect("capture health exports without flushing");
 
@@ -645,7 +814,7 @@ mod tests {
                     .iter()
                     .map(|event| event.name.as_str())
                     .collect::<Vec<_>>(),
-                ["fixture.relay-tail", "capture.fatal", "capture-health"]
+                ["fixture.relay-tail", "capture.fatal", "capture.drain"]
             );
             assert!(matches!(
                 &fatal,
@@ -659,6 +828,45 @@ mod tests {
             .await
             .expect("normal completion flushes at the composer boundary");
         assert_eq!(normal_exporter.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn spooled_completion_counts_canceled_pre_admission_events_as_dropped() {
+        let events = transparent_event_delivery(
+            Some(SpoolReport {
+                delivered_events: 1,
+                ..SpoolReport::default()
+            }),
+            RelayEventDelivery {
+                observed: 1,
+                dropped: 1,
+                ..RelayEventDelivery::default()
+            },
+            CaptureEventDelivery::default(),
+        );
+
+        assert_eq!(
+            events,
+            CaptureEventDelivery {
+                observed: 2,
+                landed: 1,
+                dropped: 1,
+                ..CaptureEventDelivery::default()
+            }
+        );
+        CaptureCompletionReport::new(
+            CaptureSourcesReport::new(
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved),
+                CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported),
+            ),
+            events,
+            None,
+            None,
+            Some("fixture cancellation".to_owned()),
+        )
+        .expect("balanced spooled completion accounting");
     }
 
     #[tokio::test]

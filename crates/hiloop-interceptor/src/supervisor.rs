@@ -17,7 +17,10 @@ use crate::{
     grpc_export::GrpcIngestExporter,
     netns::NetworkCapture,
     otlp::{OtlpReceiver, OtlpTraceNormalizer},
-    pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL, PipelineOptions},
+    pipeline::{
+        DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL, PipelineOptions, PipelineReport,
+        PipelineSourceReport,
+    },
     proxy::{ProxyNormalizer, ProxySource, ProxySourceConfig},
     raw::JsonlRawStore,
     redact::RedactionPolicy,
@@ -32,7 +35,11 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use hiloop_core::{
-    capture::{CAPTURE_OTLP_MAX_EXPORT_BATCH_SIZE, capture_otlp_queue_override},
+    capture::{
+        CAPTURE_OTLP_MAX_EXPORT_BATCH_SIZE, CaptureBlobDelivery, CaptureCompletionReport,
+        CaptureEventDelivery, CaptureEvidenceTrust, CaptureSourceDegradation, CaptureSourceReport,
+        CaptureSourcesReport, capture_otlp_queue_override,
+    },
     event::{AttributeKey, AttributeValue, Attributes, Event, EventName, SignalType},
     identity::{Hlc, RunContext},
 };
@@ -44,7 +51,10 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::{ExitCode, ExitStatus, Stdio},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     task::Poll,
     time::{Duration, Instant},
 };
@@ -73,24 +83,6 @@ pub(crate) const CAPTURE_HEALTH_EXPORT_TIMEOUT: Duration = Duration::from_secs(1
 /// warm channel are instant — and the child never ran, so trading extra seconds on the failure
 /// path for the record actually landing is the right side of the budget.
 const SPAWN_FAILURE_EXPORT_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// Event name of the run-end capture-health record.
-const CAPTURE_DRAIN_EVENT: &str = "capture.drain";
-
-/// Attribute keys of the `capture.drain` health record.
-mod capture_keys {
-    pub(super) const FOUND: &str = "capture.blobs.found";
-    pub(super) const LANDED: &str = "capture.blobs.landed";
-    pub(super) const MISSING: &str = "capture.blobs.missing";
-    pub(super) const OVERSIZE: &str = "capture.blobs.oversize";
-    pub(super) const MISSING_BYTES: &str = "capture.blobs.missing_bytes";
-    pub(super) const EVENTS_DROPPED: &str = "capture.events.dropped";
-    pub(super) const EVENTS_REJECTED: &str = "capture.events.rejected";
-    pub(super) const EVENTS_PENDING: &str = "capture.events.pending";
-    pub(super) const AUTH_REFRESHES: &str = "capture.auth.refreshes";
-    pub(super) const COMPLETE: &str = "capture.complete";
-    pub(super) const ERROR: &str = "capture.error";
-}
 
 /// Locations of the OS public-root CA bundle, most-common first. The wrapped child
 /// would normally trust these; the interception bundle must *preserve* that trust,
@@ -751,6 +743,81 @@ struct CapturedRun {
     drain_warnings: Vec<anyhow::Error>,
 }
 
+struct DeliveryAccountingExporter<'a, E: ?Sized> {
+    inner: &'a E,
+    events: Mutex<CaptureEventDelivery>,
+}
+
+impl<'a, E: ?Sized> DeliveryAccountingExporter<'a, E> {
+    fn new(inner: &'a E) -> Self {
+        Self {
+            inner,
+            events: Mutex::new(CaptureEventDelivery::default()),
+        }
+    }
+
+    fn events(&self) -> CaptureEventDelivery {
+        *self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn reconcile_normalized(&self, normalized: u64) {
+        let mut delivery = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unattempted = normalized.saturating_sub(delivery.observed);
+        delivery.observed = delivery.observed.saturating_add(unattempted);
+        delivery.dropped = delivery.dropped.saturating_add(unattempted);
+    }
+}
+
+#[async_trait::async_trait]
+impl<E: Exporter + ?Sized> Exporter for DeliveryAccountingExporter<'_, E> {
+    async fn export(&self, events: &[Event]) -> Result<(), crate::seams::ExportError> {
+        let count = events.len() as u64;
+        {
+            let mut delivery = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            delivery.observed = delivery.observed.saturating_add(count);
+            delivery.dropped = delivery.dropped.saturating_add(count);
+        }
+        let result = self.inner.export(events).await;
+        let mut delivery = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &result {
+            Ok(()) => {
+                delivery.dropped = delivery.dropped.saturating_sub(count);
+                delivery.landed = delivery.landed.saturating_add(count);
+            }
+            Err(crate::seams::ExportError::Rejected { .. }) => {
+                delivery.dropped = delivery.dropped.saturating_sub(count);
+                delivery.rejected = delivery.rejected.saturating_add(count);
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    async fn flush(&self) -> Result<(), crate::seams::ExportError> {
+        self.inner.flush().await
+    }
+
+    async fn export_completion(
+        &self,
+        event: &Event,
+        report: &CaptureCompletionReport,
+    ) -> Result<(), crate::seams::ExportError> {
+        self.inner.export_completion(event, report).await
+    }
+}
+
 impl CapturedRun {
     /// Report drain warnings on stderr and yield the child's exit code.
     fn into_exit_code(self) -> ExitCode {
@@ -771,6 +838,8 @@ async fn run_captured<E>(
 where
     E: Exporter,
 {
+    let delivery_accounting = DeliveryAccountingExporter::new(exporter);
+    let exporter = &delivery_accounting;
     let clock = Arc::new(hiloop_core::identity::HlcClock::new());
 
     // Bind capture servers before spawning so the child env can point at them.
@@ -886,11 +955,54 @@ where
         Ok(child) => child,
         Err(error) => {
             let event = spawn_failure_event(options, clock.tick(), &error);
-            if let Err(warning) = export_supervisor_record(
+            let spawn_delivery_error = export_supervisor_record(
                 exporter,
                 event,
                 "spawn-failure",
                 SPAWN_FAILURE_EXPORT_TIMEOUT,
+            )
+            .await
+            .err();
+            if let Some(warning) = &spawn_delivery_error {
+                eprintln!("hiloop-interceptor: warning: telemetry capture incomplete: {warning:#}");
+            }
+            let spool_report = match event_spool {
+                Some(spool) => Some(spool.drain(&options.blob_drain_retry).await),
+                None => None,
+            };
+            let events = completion_event_delivery(spool_report, delivery_accounting.events());
+            let report = CaptureCompletionReport::new(
+                CaptureSourcesReport::new(
+                    CaptureSourceReport::attached_full(CaptureEvidenceTrust::PlatformObserved, 1),
+                    CaptureSourceReport::attached_no_data(CaptureEvidenceTrust::PlatformObserved),
+                    if options.network_capture.uses_proxy() {
+                        CaptureSourceReport::attached_no_data(
+                            CaptureEvidenceTrust::PlatformObserved,
+                        )
+                    } else {
+                        CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::PlatformObserved)
+                    },
+                    if options.otlp {
+                        CaptureSourceReport::attached_no_data(
+                            CaptureEvidenceTrust::WorkloadReported,
+                        )
+                    } else {
+                        CaptureSourceReport::off_by_policy(CaptureEvidenceTrust::WorkloadReported)
+                    },
+                ),
+                events,
+                None,
+                gateway_credential.map(GatewayCredential::refreshes),
+                spawn_delivery_error.map(|error| format!("{error:#}")),
+            )
+            .expect("spawn-failure completion accounting is valid");
+            let context = NormalizationContext::new(options.context.clone())
+                .with_attributes(options.attributes.clone());
+            if let Err(warning) = export_completion_record(
+                exporter,
+                capture_drain_event(&context, clock.tick(), &report),
+                &report,
+                CAPTURE_HEALTH_EXPORT_TIMEOUT,
             )
             .await
             {
@@ -933,7 +1045,9 @@ where
         options_pipeline =
             options_pipeline.with_raw_retention_override(RawRetentionPolicy::Preserve);
     }
-    let capture_session = CaptureSession::start(options_pipeline);
+    let normalized_events = Arc::new(AtomicU64::new(0));
+    let capture_session =
+        CaptureSession::start(options_pipeline).with_event_counter(Arc::clone(&normalized_events));
     let capture_control = capture_session.control();
     let signal_tx = capture_control
         .signal_sender()
@@ -1123,40 +1237,70 @@ where
     };
     let otlp_task = async {
         if let Some(server) = otlp_server {
-            let _ = server.await;
+            server.await.map_err(anyhow::Error::new)?;
         }
+        Ok::<(), anyhow::Error>(())
     };
     let proxy_task = async {
-        // Capture is best effort: a proxy failure can be diagnosed with --verbose, but is not fatal
-        // to the child.
-        if let Some(task) = proxy_server
-            && let Err(error) = task.await
-            && options.verbose_diagnostics
-        {
-            eprintln!("hiloop-interceptor: proxy capture failed: {error}");
+        if let Some(task) = proxy_server {
+            task.await.map_err(anyhow::Error::new)?;
         }
+        Ok::<(), anyhow::Error>(())
     };
 
-    let (status_result, stdin_result, stdout_result, stderr_result, (), (), pipeline_result) =
-        Box::pin(async {
-            tokio::join!(
-                child_and_shutdown,
-                stdin_capture,
-                stdout_capture,
-                stderr_capture,
-                otlp_task,
-                proxy_task,
-                async { pipeline.await.context("stdio event pipeline failed") },
-            )
-        })
-        .await;
+    let (
+        status_result,
+        stdin_result,
+        stdout_result,
+        stderr_result,
+        otlp_result,
+        proxy_result,
+        pipeline_result,
+    ) = Box::pin(async {
+        tokio::join!(
+            child_and_shutdown,
+            stdin_capture,
+            stdout_capture,
+            stderr_capture,
+            otlp_task,
+            proxy_task,
+            async { pipeline.await.context("stdio event pipeline failed") },
+        )
+    })
+    .await;
 
     let status = status_result?;
 
+    delivery_accounting.reconcile_normalized(normalized_events.load(Ordering::Relaxed));
+
     // The child has exited: capture/export is best effort from here, so drain failures
     // become warnings instead of clobbering the child's exit code (exit-code transparency).
+    let pipeline_failed = pipeline_result.is_err();
+    let otlp_failed = otlp_result.is_err();
+    let proxy_failed = proxy_result.is_err();
+    let stdio_failed = stdin_result.is_err() || stdout_result.is_err() || stderr_result.is_err();
+    let mut terminal_errors = Vec::<String>::new();
+    if let Err(error) = &otlp_result {
+        terminal_errors.push(format!("{error:#}"));
+    }
+    if let Err(error) = &proxy_result {
+        terminal_errors.push(format!("{error:#}"));
+    }
+    for result in [&stdin_result, &stdout_result, &stderr_result] {
+        if let Err(error) = result {
+            terminal_errors.push(format!("{error:#}"));
+        }
+    }
+    let (pipeline_report, pipeline_warning) = match pipeline_result {
+        Ok(report) => (Some(report), None),
+        Err(error) => {
+            terminal_errors.push(format!("{error:#}"));
+            (None, Some(error))
+        }
+    };
     let mut drain_warnings: Vec<anyhow::Error> = [
-        pipeline_result.map(|_| ()),
+        otlp_result.context("OTLP capture source failed"),
+        proxy_result.context("network capture source failed"),
         stdin_result.context("failed to capture child stdin"),
         stdout_result.context("failed to capture child stdout"),
         stderr_result.context("failed to capture child stderr"),
@@ -1164,6 +1308,7 @@ where
     .into_iter()
     .filter_map(Result::err)
     .collect();
+    drain_warnings.extend(pipeline_warning);
 
     // Run-end blob drain, best-effort like the rest of the drain. The authoritative
     // final pass re-probes every digest against the gateway and retries with bounded
@@ -1171,7 +1316,6 @@ where
     // incomplete drain keeps the scratch store: deleting it would destroy the only
     // bytes behind already-exported payload_ref digests.
     let mut blob_outcome: Option<BlobDrainOutcome> = None;
-    let mut blob_drain_failed = false;
     if let Some(task) = drain_task {
         match task.await {
             Ok(drainer) => {
@@ -1190,41 +1334,49 @@ where
                 blob_outcome = Some(outcome);
             }
             Err(join_error) => {
-                blob_drain_failed = true;
+                terminal_errors.push(join_error.to_string());
                 drain_warnings
                     .push(anyhow::Error::new(join_error).context("blob drain task failed"));
             }
         }
     }
 
-    // The capture-health record ships once per drained run so a run whose payload
-    // bodies or events never landed is *queryably* incomplete — and a captured run
-    // with no `capture.drain` event at all is one whose wrapper died before draining.
-    // It ships BEFORE the final event-spool drain on purpose: spool redelivery is
-    // strictly in arrival order, so a `capture.drain` event that reaches the gateway
-    // certifies that everything spooled before it landed too.
-    if !blob_drain_failed && (blob_outcome.is_some() || event_spool.is_some()) {
-        let spool_report = match event_spool {
-            Some(spool) => Some(spool.report().await),
-            None => None,
-        };
-        let health_event = capture_drain_event(
-            &health_context,
-            clock.tick(),
-            blob_outcome.as_ref(),
-            spool_report,
-            gateway_credential.map(GatewayCredential::refreshes),
-        );
-        if let Err(warning) = export_supervisor_record(
-            exporter,
-            health_event,
-            "capture-health",
-            CAPTURE_HEALTH_EXPORT_TIMEOUT,
-        )
-        .await
-        {
-            drain_warnings.push(warning);
-        }
+    // Settle the ordinary spool before projecting one canonical completion record to
+    // every sink. The terminal lane closes the event prefix, so later retries cannot
+    // change the accounting carried by this event.
+    let spool_report = match event_spool {
+        Some(spool) => Some(spool.drain(&options.blob_drain_retry).await),
+        None => None,
+    };
+    if let Some(error) = blob_outcome
+        .as_ref()
+        .and_then(|outcome| outcome.error.as_ref())
+    {
+        terminal_errors.push(format!("{error:#}"));
+    }
+    let report = completion_report(CompletionReportInput {
+        options,
+        pipeline_report: pipeline_report.as_ref(),
+        pipeline_failed,
+        stdio_failed,
+        otlp_failed,
+        proxy_failed,
+        blob_outcome: blob_outcome.as_ref(),
+        spool_report,
+        direct_delivery: delivery_accounting.events(),
+        auth_refreshes: gateway_credential.map(GatewayCredential::refreshes),
+        error: (!terminal_errors.is_empty()).then(|| terminal_errors.join("; ")),
+    });
+    let health_event = capture_drain_event(&health_context, clock.tick(), &report);
+    if let Err(warning) = export_completion_record(
+        exporter,
+        health_event,
+        &report,
+        CAPTURE_HEALTH_EXPORT_TIMEOUT,
+    )
+    .await
+    {
+        drain_warnings.push(warning);
     }
 
     if let Some(outcome) = blob_outcome
@@ -1242,9 +1394,8 @@ where
         drain_warnings.push(warning);
     }
 
-    // Run-end event drain: the spooled backlog gets its final chance within the same
-    // bounded budget as the blob drain; whatever remains undelivered is reported with
-    // counts instead of being dropped silently.
+    // The data prefix is frozen once completion is admitted. This final pass retries
+    // only the terminal record when the ordinary prefix settled cleanly.
     if let Some(spool) = event_spool {
         let report = spool.drain(&options.blob_drain_retry).await;
         if let Some(warning) = spool_problem(&report, spool.last_failure().await) {
@@ -1298,95 +1449,144 @@ fn drain_problem(outcome: BlobDrainOutcome) -> Option<anyhow::Error> {
     None
 }
 
-/// Build the run-end capture-health event: one `log`-signal record per captured run
-/// stating whether everything captured landed on the gateway — payload blobs (when a
-/// blob drain ran) and exported events (when a gRPC export spool ran) — stamped
-/// through the same provenance seam as the run's captured events (run identity,
-/// static attributes, wrapper and process identity). `capture.complete` is the
-/// conjunction: every uploadable blob landed AND no exported event was dropped. The
-/// event-spool counters are loss counters — events still awaiting redelivery do not
-/// count against completeness, because redelivery is strictly in order: this record
-/// reaching the gateway certifies everything spooled before it landed too.
-/// `capture.auth.refreshes` (when a gateway credential exists) counts mid-run
-/// credential rotations, so an access token that expired during the run is queryable
-/// from the trace instead of living only in stderr.
+/// Stamp the shared capture-completion Event-v1 projection with this process's provenance.
 pub(crate) fn capture_drain_event(
     context: &NormalizationContext,
     ts: Hlc,
-    blob_outcome: Option<&BlobDrainOutcome>,
-    spool_report: Option<SpoolReport>,
-    auth_refreshes: Option<u64>,
+    report: &CaptureCompletionReport,
 ) -> Event {
-    let event = Event::new(
-        context.run_context(),
-        ts,
-        SignalType::Log,
-        EventName::from_static(CAPTURE_DRAIN_EVENT),
-    );
-    let mut event = context.stamp_provenance(event);
-    let mut complete = true;
-    if let Some(outcome) = blob_outcome {
-        let report = outcome.report;
-        complete &= outcome.is_complete();
-        event = event
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::FOUND),
-                count_attr(report.found),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::LANDED),
-                count_attr(report.landed),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::MISSING),
-                count_attr(report.missing),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::OVERSIZE),
-                count_attr(report.oversize_skipped),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::MISSING_BYTES),
-                i64::try_from(report.missing_bytes).unwrap_or(i64::MAX),
-            );
-        if let Some(error) = &outcome.error {
-            event = event.with_attribute(
-                AttributeKey::from_static(capture_keys::ERROR),
-                error.to_string(),
-            );
-        }
-    }
-    if let Some(report) = spool_report {
-        complete &= report.is_lossless_so_far();
-        event = event
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::EVENTS_DROPPED),
-                i64::try_from(report.dropped_events).unwrap_or(i64::MAX),
-            )
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::EVENTS_REJECTED),
-                i64::try_from(report.rejected_events).unwrap_or(i64::MAX),
-            )
-            // The backlog at mint time, mainly for the local (JSONL) copy of this
-            // record: on the gateway copy a non-zero value documents late delivery,
-            // never loss — the record queues behind its backlog, so it can only
-            // arrive after everything it counted.
-            .with_attribute(
-                AttributeKey::from_static(capture_keys::EVENTS_PENDING),
-                count_attr(report.pending_events),
-            );
-    }
-    if let Some(refreshes) = auth_refreshes {
-        event = event.with_attribute(
-            AttributeKey::from_static(capture_keys::AUTH_REFRESHES),
-            i64::try_from(refreshes).unwrap_or(i64::MAX),
-        );
-    }
-    event.with_attribute(AttributeKey::from_static(capture_keys::COMPLETE), complete)
+    context.stamp_provenance(report.to_event(context.run_context(), ts))
 }
 
-fn count_attr(value: usize) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
+fn source_report(
+    report: Option<&PipelineReport>,
+    source: &str,
+    trust: CaptureEvidenceTrust,
+    configured: bool,
+    failed: bool,
+) -> CaptureSourceReport {
+    if !configured {
+        return CaptureSourceReport::off_by_policy(trust);
+    }
+    if failed {
+        return CaptureSourceReport::configured_unavailable(
+            trust,
+            CaptureSourceDegradation::RuntimeFailed,
+        );
+    }
+    let Some(source) = report.and_then(|report| report.sources.get(source)) else {
+        return CaptureSourceReport::attached_no_data(trust);
+    };
+    source_observations(trust, source)
+}
+
+fn source_observations(
+    trust: CaptureEvidenceTrust,
+    report: &PipelineSourceReport,
+) -> CaptureSourceReport {
+    CaptureSourceReport::from_event_counts(
+        trust,
+        report.full_events as u64,
+        report.metadata_only_events as u64,
+        CaptureSourceDegradation::OpaqueNetworkTraffic,
+    )
+}
+
+struct CompletionReportInput<'a> {
+    options: &'a RunOptions,
+    pipeline_report: Option<&'a PipelineReport>,
+    pipeline_failed: bool,
+    stdio_failed: bool,
+    otlp_failed: bool,
+    proxy_failed: bool,
+    blob_outcome: Option<&'a BlobDrainOutcome>,
+    spool_report: Option<SpoolReport>,
+    direct_delivery: CaptureEventDelivery,
+    auth_refreshes: Option<u64>,
+    error: Option<String>,
+}
+
+fn completion_report(input: CompletionReportInput<'_>) -> CaptureCompletionReport {
+    let CompletionReportInput {
+        options,
+        pipeline_report,
+        pipeline_failed,
+        stdio_failed,
+        otlp_failed,
+        proxy_failed,
+        blob_outcome,
+        spool_report,
+        direct_delivery,
+        auth_refreshes,
+        error,
+    } = input;
+    let events = completion_event_delivery(spool_report, direct_delivery);
+    CaptureCompletionReport::new(
+        CaptureSourcesReport::new(
+            source_report(
+                pipeline_report,
+                crate::exec_events::EXEC_SOURCE,
+                CaptureEvidenceTrust::PlatformObserved,
+                true,
+                pipeline_failed,
+            ),
+            source_report(
+                pipeline_report,
+                crate::stdio::STDIO_SOURCE,
+                CaptureEvidenceTrust::PlatformObserved,
+                true,
+                pipeline_failed || stdio_failed,
+            ),
+            source_report(
+                pipeline_report,
+                crate::proxy::PROXY_SOURCE,
+                CaptureEvidenceTrust::PlatformObserved,
+                options.network_capture.uses_proxy(),
+                pipeline_failed || proxy_failed,
+            ),
+            source_report(
+                pipeline_report,
+                crate::otlp::OTLP_SOURCE,
+                CaptureEvidenceTrust::WorkloadReported,
+                options.otlp,
+                pipeline_failed || otlp_failed,
+            ),
+        ),
+        events,
+        blob_outcome.map(|outcome| CaptureBlobDelivery {
+            found: outcome.report.found as u64,
+            landed: outcome.report.landed as u64,
+            missing: outcome.report.missing as u64,
+            oversize: outcome.report.oversize_skipped as u64,
+            missing_bytes: outcome.report.missing_bytes,
+        }),
+        auth_refreshes,
+        error,
+    )
+    .expect("capture completion accounting is valid")
+}
+
+fn completion_event_delivery(
+    spool: Option<SpoolReport>,
+    direct: CaptureEventDelivery,
+) -> CaptureEventDelivery {
+    let Some(spool) = spool else {
+        return direct;
+    };
+    let spool_observed = spool
+        .delivered_events
+        .saturating_add(spool.dropped_events)
+        .saturating_add(spool.rejected_events)
+        .saturating_add(spool.pending_events as u64);
+    let pre_spool_dropped = direct.observed.saturating_sub(spool_observed);
+    CaptureEventDelivery {
+        observed: spool_observed.saturating_add(pre_spool_dropped),
+        spooled: spool.spooled_events,
+        landed: spool.delivered_events,
+        dropped: spool.dropped_events.saturating_add(pre_spool_dropped),
+        rejected: spool.rejected_events,
+        pending: spool.pending_events as u64,
+    }
 }
 
 /// Render event-spool loss/backlog as the run's export warning, or `None` when the
@@ -1413,6 +1613,12 @@ fn spool_problem(report: &SpoolReport, last_failure: Option<String>) -> Option<a
             "{} event(s) were dropped after the gateway permanently rejected their batch",
             report.rejected_events
         ));
+    }
+    if report.completion_pending {
+        parts.push("the capture completion record is still pending".to_owned());
+    }
+    if report.completion_rejected {
+        parts.push("the gateway permanently rejected the capture completion record".to_owned());
     }
     let message = parts.join("; ");
     Some(match last_failure {
@@ -1466,6 +1672,32 @@ pub(crate) async fn export_supervisor_record<E: Exporter>(
     {
         Ok(result) => result,
         Err(_elapsed) => bail!("{what} export timed out after {}s", deadline.as_secs()),
+    }
+}
+
+async fn export_completion_record<E: Exporter>(
+    exporter: &E,
+    event: Event,
+    report: &CaptureCompletionReport,
+    deadline: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(deadline, async {
+        exporter
+            .export_completion(&event, report)
+            .await
+            .context("failed to export the capture-health event")?;
+        exporter
+            .flush()
+            .await
+            .context("failed to flush the capture-health event")
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => bail!(
+            "capture-health export timed out after {}s",
+            deadline.as_secs()
+        ),
     }
 }
 
@@ -2391,6 +2623,13 @@ mod tests {
     #[derive(Debug)]
     struct FailingExporter;
 
+    #[derive(Debug, Default)]
+    struct FailFirstExporter {
+        exports: std::sync::atomic::AtomicUsize,
+        completions: Mutex<Vec<Event>>,
+        first_delay: Duration,
+    }
+
     #[async_trait]
     impl Exporter for FailingExporter {
         async fn export(
@@ -2401,6 +2640,39 @@ mod tests {
                 "failing",
                 "intentional test failure",
             ))
+        }
+    }
+
+    #[async_trait]
+    impl Exporter for FailFirstExporter {
+        async fn export(
+            &self,
+            _events: &[Event],
+        ) -> std::result::Result<(), crate::seams::ExportError> {
+            if self
+                .exports
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::time::sleep(self.first_delay).await;
+                return Err(crate::seams::ExportError::unavailable(
+                    "fixture",
+                    "first export failed",
+                ));
+            }
+            Ok(())
+        }
+
+        async fn export_completion(
+            &self,
+            event: &Event,
+            _report: &CaptureCompletionReport,
+        ) -> std::result::Result<(), crate::seams::ExportError> {
+            self.completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event.clone());
+            Ok(())
         }
     }
 
@@ -2793,18 +3065,29 @@ mod tests {
             .with_attributes(options.attributes.clone())
             .with_process(child_process_context(&options, Some(1234)));
 
+        let report = completion_report(CompletionReportInput {
+            options: &options,
+            pipeline_report: None,
+            pipeline_failed: false,
+            stdio_failed: false,
+            otlp_failed: false,
+            proxy_failed: false,
+            blob_outcome: Some(&BlobDrainOutcome {
+                report: crate::blob_drain::BlobDrainReport::default(),
+                error: None,
+            }),
+            spool_report: Some(SpoolReport::default()),
+            direct_delivery: CaptureEventDelivery::default(),
+            auth_refreshes: Some(0),
+            error: None,
+        });
         let event = capture_drain_event(
             &context,
             Hlc {
                 wall_ns: 7,
                 logical: 0,
             },
-            Some(&BlobDrainOutcome {
-                report: crate::blob_drain::BlobDrainReport::default(),
-                error: None,
-            }),
-            Some(SpoolReport::default()),
-            Some(0),
+            &report,
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
@@ -2838,20 +3121,33 @@ mod tests {
         let context = NormalizationContext::new(options.context.clone())
             .with_attributes(options.attributes.clone());
 
+        let report = completion_report(CompletionReportInput {
+            options: &options,
+            pipeline_report: None,
+            pipeline_failed: false,
+            stdio_failed: false,
+            otlp_failed: false,
+            proxy_failed: false,
+            blob_outcome: None,
+            spool_report: Some(SpoolReport {
+                spooled_events: 5,
+                pending_events: 3,
+                pending_bytes: 512,
+                dropped_events: 2,
+                rejected_events: 1,
+                ..SpoolReport::default()
+            }),
+            direct_delivery: CaptureEventDelivery::default(),
+            auth_refreshes: Some(1),
+            error: None,
+        });
         let event = capture_drain_event(
             &context,
             Hlc {
                 wall_ns: 7,
                 logical: 0,
             },
-            None,
-            Some(SpoolReport {
-                pending_events: 3,
-                pending_bytes: 512,
-                dropped_events: 2,
-                rejected_events: 1,
-            }),
-            Some(1),
+            &report,
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
@@ -2879,20 +3175,33 @@ mod tests {
             error: None,
         };
 
+        let report = completion_report(CompletionReportInput {
+            options: &options,
+            pipeline_report: None,
+            pipeline_failed: false,
+            stdio_failed: false,
+            otlp_failed: false,
+            proxy_failed: false,
+            blob_outcome: Some(&clean_blobs),
+            spool_report: Some(SpoolReport {
+                spooled_events: 1,
+                pending_events: 0,
+                pending_bytes: 0,
+                dropped_events: 1,
+                rejected_events: 0,
+                ..SpoolReport::default()
+            }),
+            direct_delivery: CaptureEventDelivery::default(),
+            auth_refreshes: None,
+            error: None,
+        });
         let event = capture_drain_event(
             &context,
             Hlc {
                 wall_ns: 7,
                 logical: 0,
             },
-            Some(&clean_blobs),
-            Some(SpoolReport {
-                pending_events: 0,
-                pending_bytes: 0,
-                dropped_events: 1,
-                rejected_events: 0,
-            }),
-            None,
+            &report,
         );
 
         let value = serde_json::to_value(&event).expect("serialize event");
@@ -2910,6 +3219,39 @@ mod tests {
     }
 
     #[test]
+    fn stdio_pump_failure_marks_the_source_unavailable() {
+        let options = base_options(vec!["true".to_owned()]);
+        let report = completion_report(CompletionReportInput {
+            options: &options,
+            pipeline_report: None,
+            pipeline_failed: false,
+            stdio_failed: true,
+            otlp_failed: false,
+            proxy_failed: false,
+            blob_outcome: None,
+            spool_report: None,
+            direct_delivery: CaptureEventDelivery::default(),
+            auth_refreshes: None,
+            error: Some("stdout capture stopped".to_owned()),
+        });
+        let event = capture_drain_event(
+            &NormalizationContext::new(options.context.clone()),
+            Hlc {
+                wall_ns: 8,
+                logical: 0,
+            },
+            &report,
+        );
+        let value = serde_json::to_value(event).expect("completion json");
+
+        assert_eq!(
+            value["attributes"]["capture.source.stdio.state"],
+            "configured_unavailable"
+        );
+        assert_eq!(value["attributes"]["capture.complete"], false);
+    }
+
+    #[test]
     fn spool_problem_is_silent_for_a_clean_spool() {
         assert!(spool_problem(&SpoolReport::default(), None).is_none());
     }
@@ -2921,6 +3263,7 @@ mod tests {
             pending_bytes: 2048,
             dropped_events: 3,
             rejected_events: 2,
+            ..SpoolReport::default()
         };
 
         let warning =
@@ -3004,6 +3347,75 @@ mod tests {
                 .is_none(),
             "a child that never spawned has no pid"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_export_failure_is_reported_as_dropped_in_the_completion_receipt() {
+        let options = base_options(vec![
+            "/definitely/not/a/hiloop-test-command".to_owned(),
+            "arg".to_owned(),
+        ]);
+        let exporter = FailFirstExporter::default();
+
+        let result = Box::pin(run_captured(&options, &exporter, None, None, None)).await;
+        assert!(
+            result.is_err(),
+            "missing command fails after capture completion"
+        );
+
+        let completions = exporter
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(completions.len(), 1);
+        let value = serde_json::to_value(&completions[0]).expect("completion event json");
+        assert_eq!(value["attributes"]["capture.events.observed"], 1);
+        assert_eq!(value["attributes"]["capture.events.landed"], 0);
+        assert_eq!(value["attributes"]["capture.events.dropped"], 1);
+        assert_eq!(value["attributes"]["capture.complete"], false);
+        assert!(
+            value["attributes"]["capture.error"]
+                .as_str()
+                .is_some_and(|error| error.contains("first export failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_export_failure_preserves_partial_delivery_accounting() {
+        let options = base_options(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "i=0; while [ \"$i\" -lt 300 ]; do printf 'captured output\\n'; i=$((i+1)); done"
+                .to_owned(),
+        ]);
+        let exporter = FailFirstExporter {
+            first_delay: Duration::from_millis(50),
+            ..FailFirstExporter::default()
+        };
+
+        Box::pin(run_captured(&options, &exporter, None, None, None))
+            .await
+            .expect("telemetry failure does not clobber child success");
+
+        let completions = exporter
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(completions.len(), 1);
+        let value = serde_json::to_value(&completions[0]).expect("completion event json");
+        let observed = value["attributes"]["capture.events.observed"]
+            .as_u64()
+            .expect("observed count");
+        assert!(
+            observed > options.export_batch_size as u64,
+            "normalized events buffered behind the failed batch remain accounted"
+        );
+        assert_eq!(value["attributes"]["capture.events.landed"], 0);
+        assert_eq!(
+            value["attributes"]["capture.events.dropped"],
+            serde_json::Value::from(observed)
+        );
+        assert_eq!(value["attributes"]["capture.complete"], false);
     }
 
     #[test]
