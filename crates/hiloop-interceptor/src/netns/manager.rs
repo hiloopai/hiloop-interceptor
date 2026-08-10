@@ -93,7 +93,6 @@ pub(super) fn dispatch_from_args() -> Option<io::Result<ExitCode>> {
         Some(CRASHING_WORKER_PROBE_ROLE) => Some(crashing_worker_probe_entrypoint()),
         #[cfg(feature = "test-support")]
         Some(DETACHED_WORKLOAD_PROBE_ROLE) => Some(detached_workload_probe_entrypoint()),
-        #[cfg(feature = "test-support")]
         _ => None,
     }
 }
