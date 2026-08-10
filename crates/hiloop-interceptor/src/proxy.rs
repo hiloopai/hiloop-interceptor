@@ -1900,8 +1900,8 @@ fn metadata_only_telemetry_target(uri: &hudsucker::hyper::Uri) -> String {
 }
 
 /// Canonicalize a request's destination authority — the CONNECT authority for a
-/// CONNECT, otherwise the URI host or `Host` header. `None` when no host is present or
-/// it fails canonicalization.
+/// CONNECT, otherwise the URI authority or `Host` header. `None` when no host is
+/// present or it fails canonicalization.
 fn canonical_authority(request: &Request<Body>) -> Option<Destination> {
     let raw = if request.method() == Method::CONNECT {
         request
@@ -1923,8 +1923,8 @@ fn request_host(
     uri: &hudsucker::hyper::Uri,
     headers: &hudsucker::hyper::HeaderMap,
 ) -> Option<String> {
-    uri.host()
-        .map(ToOwned::to_owned)
+    uri.authority()
+        .map(|authority| authority.as_str().to_owned())
         .or_else(|| header_str(headers, &HOST))
 }
 

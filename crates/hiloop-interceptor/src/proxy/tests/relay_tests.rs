@@ -500,6 +500,50 @@ async fn connect_tunnel_without_host(
     tcp
 }
 
+async fn h1_request_through_proxy(
+    proxy_addr: SocketAddr,
+    proxy_ca: &str,
+    authority: &str,
+    target: &str,
+    host: &str,
+) -> Vec<u8> {
+    use hudsucker::rustls::pki_types::ServerName;
+    use hudsucker::rustls::pki_types::pem::PemObject as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let tcp = connect_tunnel(proxy_addr, authority).await;
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(proxy_ca.as_bytes()).expect("proxy CA der"))
+        .expect("trust proxy CA");
+    let mut config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("client versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(
+        authority
+            .split(':')
+            .next()
+            .expect("authority host")
+            .to_owned(),
+    )
+    .expect("server name");
+    let mut tls = connector.connect(server_name, tcp).await.expect("MITM TLS");
+    tls.write_all(format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .expect("send HTTP/1 request");
+    let mut response = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !response.ends_with(b"\r\n\r\n") {
+        assert!(tls.read(&mut byte).await.expect("HTTP/1 response") > 0);
+        response.push(byte[0]);
+    }
+    response
+}
+
 async fn client_hello(server_name: &str, send_sni: bool) -> Vec<u8> {
     use hudsucker::rustls::pki_types::ServerName;
     use tokio::io::AsyncReadExt as _;
@@ -592,7 +636,6 @@ async fn fragmented_tls_and_unknown_prefaces_never_reach_an_upstream() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let (relay_addr, mut relay_accepts) = blackhole_relay().await;
-    let (proxy_addr, _ca, _dir) = strict_proxy(relay_addr, "api.example.com").await;
 
     let origin_host = "api.localhost";
     let (origin_addr, mut origin_accepts) = named_loopback_observer(origin_host).await;
@@ -639,7 +682,7 @@ async fn fragmented_tls_and_unknown_prefaces_never_reach_an_upstream() {
         "selected origin receives no raw fallback connection"
     );
 
-    let mut unknown = connect_tunnel(proxy_addr, "api.example.com:443").await;
+    let mut unknown = connect_tunnel_without_host(fragment_proxy, &authority).await;
     unknown
         .write_all(b"SSH-2.0-arbitrary\r\n")
         .await
@@ -649,7 +692,13 @@ async fn fragmented_tls_and_unknown_prefaces_never_reach_an_upstream() {
         .await
         .expect("unknown connection closes")
         .expect("read close");
-    assert!(relay_accepts.try_recv().is_err(), "no upstream connection");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), origin_accepts.recv())
+            .await
+            .is_err(),
+        "selected origin receives no unknown-preface fallback connection"
+    );
+    assert!(relay_accepts.try_recv().is_err(), "no relay connection");
 }
 
 #[tokio::test]
@@ -683,22 +732,80 @@ async fn missing_or_mismatched_client_hello_sni_fails_before_upstream() {
     );
 
     for (name, send_sni) in [("other.example.com", true), ("api.example.com", false)] {
-        let tcp = connect_tunnel(proxy_addr, "api.example.com:443").await;
-        let mut config =
-            ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
-                .with_safe_default_protocol_versions()
-                .expect("client versions")
-                .with_root_certificates(roots.clone())
-                .with_no_client_auth();
-        config.enable_sni = send_sni;
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let name = ServerName::try_from(name.to_owned()).expect("server name");
-        let result = tokio::time::timeout(Duration::from_secs(1), connector.connect(name, tcp))
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut tcp = connect_tunnel(proxy_addr, "api.example.com:443").await;
+        tcp.write_all(&client_hello(name, send_sni).await)
             .await
-            .expect("TLS rejection deadline");
-        assert!(result.is_err(), "invalid SNI must fail TLS");
+            .expect("send invalid ClientHello");
+        tcp.shutdown().await.expect("finish invalid ClientHello");
+        let mut server_bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), tcp.read_to_end(&mut server_bytes))
+            .await
+            .expect("TLS rejection deadline")
+            .expect("read TLS rejection");
+        assert!(
+            server_bytes.is_empty(),
+            "invalid SNI is rejected before any certificate flight"
+        );
     }
     assert!(relay_accepts.try_recv().is_err(), "no upstream connection");
+}
+
+#[tokio::test]
+async fn http1_absolute_form_must_agree_with_the_selected_connect_authority() {
+    let relay_ca = ProxyCa::generate().expect("relay CA");
+    let (relay_addr, mut observed) = spawn_h2_relay(&relay_ca).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_file = dir.path().join("proof");
+    tokio::fs::write(&proof_file, b"proof")
+        .await
+        .expect("proof");
+    let relay = FixedTlsRelayConfig::new(
+        relay_addr,
+        "secret-egress.test",
+        vec![ca_trust_anchor(&relay_ca)],
+        proof_file,
+        [BoundHttpsSelector::new("api.example.com").expect("selector")],
+    )
+    .expect("relay config");
+    let (proxy_addr, proxy_ca, _signals, _store) = spawn_bound_proxy(relay).await;
+
+    for target in [
+        "https://other.example/private",
+        "https://api.example.com:444/private",
+    ] {
+        let response = h1_request_through_proxy(
+            proxy_addr,
+            &proxy_ca,
+            "api.example.com:443",
+            target,
+            "api.example.com:443",
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 403"), "target: {target}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), observed.recv())
+                .await
+                .is_err(),
+            "denied absolute target never reaches the relay: {target}"
+        );
+    }
+
+    let response = h1_request_through_proxy(
+        proxy_addr,
+        &proxy_ca,
+        "api.example.com:443",
+        "https://api.example.com:443/allowed",
+        "api.example.com:443",
+    )
+    .await;
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+    let request = observed.recv().await.expect("matching relay request");
+    assert_eq!(
+        request.uri.to_string(),
+        "https://api.example.com:443/allowed"
+    );
 }
 
 async fn response_blackhole_relay(relay_ca: &ProxyCa) -> (SocketAddr, mpsc::Receiver<()>) {
@@ -729,12 +836,17 @@ async fn response_blackhole_relay(relay_ca: &ProxyCa) -> (SocketAddr, mpsc::Rece
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
                 };
-                let service = hyper::service::service_fn(move |_request| {
+                let service = hyper::service::service_fn(move |request| {
                     let request_tx = request_tx.clone();
                     async move {
+                        let body = request.into_body();
                         let _ = request_tx.send(()).await;
-                        std::future::pending::<Result<Response<Body>, std::convert::Infallible>>()
-                            .await
+                        let response = std::future::pending::<
+                            Result<Response<Body>, std::convert::Infallible>,
+                        >()
+                        .await;
+                        drop(body);
+                        response
                     }
                 });
                 let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
@@ -868,7 +980,7 @@ async fn private_http2_trailers_are_scrubbed_on_the_relay_wire() {
     assert_eq!(trailers["x-safe-trailer"], "preserved");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn slow_progressing_upload_may_receive_headers_after_request_eof() {
     use hudsucker::hyper::body::Frame;
 
@@ -911,14 +1023,17 @@ async fn slow_progressing_upload_may_receive_headers_after_request_eof() {
             )))
             .await
             .expect("progress frame");
-        data.recv().await.expect("relay observed progress");
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::timeout(Duration::from_secs(3), data.recv())
+            .await
+            .expect("relay progress deadline")
+            .expect("relay observed progress");
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
     drop(frames_tx);
     assert_eq!(
-        response
+        tokio::time::timeout(Duration::from_secs(3), response)
             .await
+            .expect("response deadline")
             .expect("request task")
             .expect("response")
             .status(),
@@ -988,6 +1103,65 @@ async fn relay_response_header_blackhole_has_a_fixed_deadline() {
         crate::bound_connect::RELAY_RESPONSE_HEADER_TIMEOUT + Duration::from_millis(1),
     )
     .await;
+    assert_eq!(
+        response
+            .await
+            .expect("request task")
+            .expect("proxy response")
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn relay_that_stops_polling_a_large_upload_hits_the_body_idle_deadline() {
+    let relay_ca = ProxyCa::generate().expect("relay CA");
+    let (relay_addr, mut requests) = response_blackhole_relay(&relay_ca).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_file = dir.path().join("proof");
+    tokio::fs::write(&proof_file, b"proof")
+        .await
+        .expect("proof");
+    let relay = FixedTlsRelayConfig::new(
+        relay_addr,
+        "secret-egress.test",
+        vec![ca_trust_anchor(&relay_ca)],
+        proof_file,
+        [BoundHttpsSelector::new("api.example.com").expect("selector")],
+    )
+    .expect("relay config");
+    let (proxy_addr, proxy_ca, _signals, _store) = spawn_bound_proxy(relay).await;
+    let mut sender = h2_client_through_proxy(proxy_addr, &proxy_ca, "api.example.com:443").await;
+    let body = Body::from(Bytes::from(vec![0_u8; 4 * 1024 * 1024]));
+    let response = tokio::spawn(async move {
+        sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://api.example.com/stalled-upload")
+                    .body(body)
+                    .expect("request"),
+            )
+            .await
+    });
+    requests.recv().await.expect("relay request headers");
+    tokio::task::yield_now().await;
+    assert!(
+        !response.is_finished(),
+        "relay holds the request body without polling it"
+    );
+    tokio::time::advance(
+        crate::bound_connect::RELAY_REQUEST_BODY_IDLE_TIMEOUT
+            .checked_sub(Duration::from_millis(1))
+            .expect("idle deadline exceeds one millisecond"),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    assert!(
+        !response.is_finished(),
+        "large upload remains pending before the idle deadline"
+    );
+    tokio::time::advance(Duration::from_millis(2)).await;
     assert_eq!(
         response
             .await
