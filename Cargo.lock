@@ -1053,7 +1053,6 @@ dependencies = [
  "url",
  "webpki-roots 1.0.8",
  "x509-parser",
- "zeroize",
 ]
 
 [[package]]

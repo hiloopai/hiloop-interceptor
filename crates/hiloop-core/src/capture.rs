@@ -125,14 +125,12 @@ string_enum! {
 }
 
 string_enum! {
-    /// Capture policy implied by bindings and egress policy.
+    /// Capture policy implied by egress policy.
     pub enum CapturePolicy {
-        /// No bindings and allow-all egress permit observable degradation.
+        /// Allow-all egress permits observable degradation.
         Observe => "observe",
         /// Restrictive egress requires inspectable application identity.
         PolicyStrict => "policy_strict",
-        /// Any secret binding requires fail-closed inspection.
-        SecretStrict => "secret_strict",
     }
 }
 
@@ -221,22 +219,8 @@ string_enum! {
 }
 
 string_enum! {
-    /// Closed fatal causes that terminate a strict run.
+    /// Closed fatal causes that terminate a run.
     pub enum CaptureFatalReason {
-        /// A bound TLS client rejected the interception certificate.
-        SecretBindUnterminatable => "secret_bind_unterminatable",
-        /// Available routing identity could map to a bound secret ambiguously.
-        SecretRouteAmbiguous => "secret_route_ambiguous",
-        /// The dialed destination was not authorized for the bound host.
-        SecretDestinationMismatch => "secret_destination_mismatch",
-        /// A bound run attempted an application passthrough path.
-        SecretPassthroughForbidden => "secret_passthrough_forbidden",
-        /// SNI and request authority did not identify the same bound route.
-        SecretRouteIdentityMismatch => "secret_route_identity_mismatch",
-        /// The bound route used cleartext transport.
-        SecretTransportInsecure => "secret_transport_insecure",
-        /// The bound route used an application transport that cannot inject.
-        SecretTransportUnsupported => "secret_transport_unsupported",
         /// The gateway dataplane failed after the child started.
         DataplaneFailed => "dataplane_failed",
     }
@@ -356,7 +340,6 @@ impl Event {
         reason: TlsInterceptionFailedReason,
         flow: &TlsFlowIdentity,
         retry_required: bool,
-        secret_bound: bool,
     ) -> Self {
         with_tls_flow(
             Self::new(
@@ -366,8 +349,7 @@ impl Event {
                 EventName::from_static("tls.interception_failed"),
             )
             .with_attribute(AttributeKey::from_static(REASON), reason.to_string())
-            .with_attribute(AttributeKey::from_static("retry_required"), retry_required)
-            .with_attribute(AttributeKey::from_static("secret_bound"), secret_bound),
+            .with_attribute(AttributeKey::from_static("retry_required"), retry_required),
             flow,
         )
     }
@@ -471,43 +453,15 @@ impl Event {
         event
     }
 
-    /// Build the durable fatal cause for a strict run.
-    pub fn capture_fatal(
-        context: &RunContext,
-        ts: Hlc,
-        reason: CaptureFatalReason,
-        flow: Option<TlsFlowIdentity>,
-    ) -> Self {
-        let event = Self::new(
+    /// Build the durable fatal cause for a failed dataplane.
+    pub fn capture_fatal(context: &RunContext, ts: Hlc, reason: CaptureFatalReason) -> Self {
+        Self::new(
             context,
             ts,
             SignalType::Net,
             EventName::from_static("capture.fatal"),
         )
-        .with_attribute(AttributeKey::from_static(REASON), reason.to_string());
-        match flow {
-            Some(flow) => with_tls_flow(event, &flow),
-            None => event,
-        }
-    }
-
-    /// Build a strict-run fatal cause for a non-TLS transport destination.
-    pub fn capture_fatal_for_destination(
-        context: &RunContext,
-        ts: Hlc,
-        reason: CaptureFatalReason,
-        destination: OriginalDestination,
-    ) -> Self {
-        with_destination(
-            Self::new(
-                context,
-                ts,
-                SignalType::Net,
-                EventName::from_static("capture.fatal"),
-            )
-            .with_attribute(AttributeKey::from_static(REASON), reason.to_string()),
-            destination,
-        )
+        .with_attribute(AttributeKey::from_static(REASON), reason.to_string())
     }
 }
 

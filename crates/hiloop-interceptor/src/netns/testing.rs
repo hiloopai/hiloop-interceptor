@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use hiloop_core::capture::CaptureTransportDegradationReason;
 
 use super::{
-    FatalReport, NetnsRun, NetworkProvisioner, NetworkSession, PreflightReport, ProvisionError,
+    NetnsRun, NetworkProvisioner, NetworkSession, PreflightReport, ProvisionError,
     ProvisionRequest, StartupStage, SubstrateExit, SubstrateInfo, SystemNetworkProvisioner,
 };
 use crate::supervisor::RunOptions;
@@ -164,8 +164,6 @@ pub enum FakeSessionOutcome {
         /// Deterministic combined cleanup diagnostic.
         diagnostic: String,
     },
-    /// A gateway fatal signal whose ordered cleanup completes before it reaches the supervisor.
-    Fatal(FatalReport),
 }
 
 /// Cloneable inspection handle for a [`FakeNetworkProvisioner`].
@@ -379,7 +377,6 @@ impl NetworkSession for FakeNetworkSession {
         self.complete_cleanup();
         match outcome {
             FakeSessionOutcome::Exit(exit) => Ok(exit),
-            FakeSessionOutcome::Fatal(report) => Err(ProvisionError::fatal(report)),
             FakeSessionOutcome::DataplaneFailure {
                 component,
                 diagnostic,
@@ -397,7 +394,6 @@ impl NetworkSession for FakeNetworkSession {
         self.complete_cleanup();
         match outcome {
             FakeSessionOutcome::Exit(_) => Ok(()),
-            FakeSessionOutcome::Fatal(report) => Err(ProvisionError::fatal(report)),
             FakeSessionOutcome::DataplaneFailure {
                 component,
                 diagnostic,

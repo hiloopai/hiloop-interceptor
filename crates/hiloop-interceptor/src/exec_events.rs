@@ -75,21 +75,20 @@ const I64_KEYS: [&str; 2] = [keys::PROCESS_EXIT_CODE, keys::PROCESS_DURATION_MS]
 
 /// Resolve the captured `(name, value)` pairs for the allowlisted environment
 /// variables, scrubbing each value through the run's capture-side redaction —
-/// the same pattern and known-secret-literal passes applied to captured bodies
-/// — before it can land in an attribute. An unset variable yields no pair (its
+/// the same pattern pass applied to captured bodies — before it can land in an
+/// attribute. An unset variable yields no pair (its
 /// name still appears in `process.env_allowlist`); a non-UTF-8 value is
 /// captured lossily rather than dropped.
 pub(crate) fn captured_env_values(
     env_allowlist: &[String],
     lookup: impl Fn(&str) -> Option<OsString>,
     redaction: RedactionPolicy,
-    secret_literals: &[&[u8]],
 ) -> Vec<(String, String)> {
     env_allowlist
         .iter()
         .filter_map(|name| {
             let value = lookup(name)?.to_string_lossy().into_owned();
-            let scrubbed = redaction.redact_body_with_literals(Bytes::from(value), secret_literals);
+            let scrubbed = redaction.redact_body(Bytes::from(value));
             Some((
                 name.clone(),
                 String::from_utf8_lossy(&scrubbed).into_owned(),
@@ -476,7 +475,7 @@ mod tests {
         let allowlist = ["LEARNING_RATE".to_owned(), "UNSET_VAR".to_owned()];
         let lookup = fake_env(&[("LEARNING_RATE", "0.001"), ("OFF_LIST", "ignored")]);
 
-        let values = captured_env_values(&allowlist, lookup, RedactionPolicy::enabled(), &[]);
+        let values = captured_env_values(&allowlist, lookup, RedactionPolicy::enabled());
 
         assert_eq!(
             values,
@@ -490,34 +489,11 @@ mod tests {
         let allowlist = ["ACCIDENTAL_KEY".to_owned()];
         let lookup = fake_env(&[("ACCIDENTAL_KEY", "sk-live-abc123")]);
 
-        let values = captured_env_values(&allowlist, lookup, RedactionPolicy::enabled(), &[]);
+        let values = captured_env_values(&allowlist, lookup, RedactionPolicy::enabled());
 
         assert_eq!(
             values,
             vec![("ACCIDENTAL_KEY".to_owned(), "[REDACTED]".to_owned())]
-        );
-    }
-
-    #[test]
-    fn captured_values_scrub_known_secret_literals_even_with_redaction_disabled() {
-        let allowlist = ["BROKER_TOKEN".to_owned(), "PLAIN".to_owned()];
-        let lookup = fake_env(&[("BROKER_TOKEN", "opaque-token-xyz"), ("PLAIN", "sk-live-1")]);
-
-        let values = captured_env_values(
-            &allowlist,
-            lookup,
-            RedactionPolicy::disabled(),
-            &[b"opaque-token-xyz"],
-        );
-
-        assert_eq!(
-            values,
-            vec![
-                ("BROKER_TOKEN".to_owned(), "[REDACTED]".to_owned()),
-                ("PLAIN".to_owned(), "sk-live-1".to_owned()),
-            ],
-            "literals are scrubbed regardless of the toggle; pattern redaction honors it, \
-             matching captured-body behavior"
         );
     }
 
@@ -531,7 +507,7 @@ mod tests {
             (name == "BINARY").then(|| OsString::from_vec(vec![b'o', b'k', 0xFF, b'!']))
         };
 
-        let values = captured_env_values(&allowlist, lookup, RedactionPolicy::enabled(), &[]);
+        let values = captured_env_values(&allowlist, lookup, RedactionPolicy::enabled());
 
         assert_eq!(
             values,

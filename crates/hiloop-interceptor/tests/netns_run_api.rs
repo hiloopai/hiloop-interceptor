@@ -3,16 +3,13 @@
 use std::{net::Ipv6Addr, num::NonZeroU16, path::PathBuf, sync::Arc, time::Duration};
 
 use hiloop_core::{
-    capture::{
-        CaptureFatalReason, CapturePolicy, CapturePreflight, CaptureTransportDegradationReason,
-        NetCaptureMode, OriginalDestination,
-    },
+    capture::{CapturePolicy, CapturePreflight, CaptureTransportDegradationReason, NetCaptureMode},
     identity::{Hlc, RunContext},
 };
 use hiloop_interceptor::{
     NetnsRun, NetworkCapture, RunOptions, SystemNetnsRun,
     netns::{
-        FatalReport, FragmentedUdpBehavior, PreflightReport, SubstrateExit, SubstrateInfo,
+        FragmentedUdpBehavior, PreflightReport, SubstrateExit, SubstrateInfo,
         SystemNetworkProvisioner,
         testing::{
             FakeNetnsRun, FakeNetnsRunCall, FakeNetworkProvisioner, FakeProvisionerCall,
@@ -128,10 +125,10 @@ fn selection_event_preserves_auto_fallback_inputs_and_strict_none_state() {
 
     let (fake, _) = FakeNetnsRun::failing(failed.clone(), "must not run");
     let strict = NetworkCapture::netns(NetCaptureMode::Netns, failed, Arc::new(fake))
-        .transport_event(&context, timestamp, CapturePolicy::SecretStrict);
+        .transport_event(&context, timestamp, CapturePolicy::PolicyStrict);
     let strict = serde_json::to_value(strict).expect("strict event");
     assert_eq!(strict["attributes"]["selected"], "none");
-    assert_eq!(strict["attributes"]["capture_policy"], "secret_strict");
+    assert_eq!(strict["attributes"]["capture_policy"], "policy_strict");
 }
 
 #[cfg(target_os = "linux")]
@@ -293,17 +290,16 @@ async fn system_composer_records_the_capture_drain_health_event() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn system_composer_preserves_close_first_fatal_order_and_durable_reason() {
+async fn system_composer_preserves_close_first_dataplane_failure_order() {
     let temp = tempfile::tempdir().expect("tempdir");
     let events = temp.path().join("fatal.jsonl");
-    let destination =
-        OriginalDestination::new("203.0.113.10".parse().expect("IP"), 443).expect("destination");
-    let report =
-        FatalReport::destination(CaptureFatalReason::SecretTransportUnsupported, destination);
     let (provisioner, handle) = FakeNetworkProvisioner::scripted(
         PreflightReport::passed(true),
         info(),
-        FakeSessionOutcome::Fatal(report),
+        FakeSessionOutcome::DataplaneFailure {
+            component: "gateway_worker",
+            diagnostic: "fixture crash".to_owned(),
+        },
     );
     let runner = Arc::new(SystemNetnsRun::with_provisioner(
         Arc::new(provisioner),
@@ -323,7 +319,7 @@ async fn system_composer_preserves_close_first_fatal_order_and_durable_reason() 
     );
 
     let error = run(&options).await.expect_err("fatal result");
-    assert!(error.to_string().contains("secret_transport_unsupported"));
+    assert!(error.to_string().contains("dataplane_failed"));
     assert_eq!(
         &handle.calls()[2..],
         [
@@ -342,7 +338,7 @@ async fn system_composer_preserves_close_first_fatal_order_and_durable_reason() 
     )
     .expect("event JSON");
     assert_eq!(last["name"], "capture.fatal");
-    assert_eq!(last["attributes"]["reason"], "secret_transport_unsupported");
+    assert_eq!(last["attributes"]["reason"], "dataplane_failed");
 }
 
 #[cfg(target_os = "linux")]

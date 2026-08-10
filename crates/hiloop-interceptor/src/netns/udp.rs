@@ -12,8 +12,8 @@ use std::{
 use async_trait::async_trait;
 use hiloop_core::{
     capture::{
-        ByteCounts, CaptureContractError, CaptureFatalReason, NetPassthroughReason,
-        OriginalDestination, TransportProtocol,
+        ByteCounts, CaptureContractError, NetPassthroughReason, OriginalDestination,
+        TransportProtocol,
     },
     event::Event,
     identity::{Hlc, RunContext},
@@ -25,7 +25,6 @@ use tokio::{
 };
 
 use crate::egress::EgressPolicy;
-use crate::netns::FatalReport;
 
 /// Run-level handling for opaque non-DNS UDP, including QUIC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,15 +33,11 @@ pub enum UdpFlowDisposition {
     Forward,
     /// Reject the flow because restrictive policy has no trustworthy application identity.
     DenyIdentityUnavailable,
-    /// Close the relay and surface a strict-run fatal cause before forwarding.
-    Fatal(CaptureFatalReason),
 }
 
 /// Select the only permitted non-DNS UDP behavior for a run.
-pub fn udp_flow_disposition(has_secret_binding: bool, policy: &EgressPolicy) -> UdpFlowDisposition {
-    if has_secret_binding {
-        UdpFlowDisposition::Fatal(CaptureFatalReason::SecretTransportUnsupported)
-    } else if policy.is_allow_all() {
+pub fn udp_flow_disposition(policy: &EgressPolicy) -> UdpFlowDisposition {
+    if policy.is_allow_all() {
         UdpFlowDisposition::Forward
     } else {
         UdpFlowDisposition::DenyIdentityUnavailable
@@ -182,14 +177,13 @@ impl std::fmt::Debug for UdpFlowRelay {
 impl UdpFlowRelay {
     /// Construct a relay whose policy is fixed for the run before any flow begins.
     pub fn new(
-        has_secret_binding: bool,
         policy: &EgressPolicy,
         idle_timeout: Duration,
         child_sink: Arc<dyn UdpChildSink>,
         summary_tx: mpsc::Sender<UdpFlowSummary>,
     ) -> Self {
         Self {
-            disposition: udp_flow_disposition(has_secret_binding, policy),
+            disposition: udp_flow_disposition(policy),
             idle_timeout,
             child_sink,
             summary_tx,
@@ -200,7 +194,7 @@ impl UdpFlowRelay {
 
     /// Forward one opaque datagram after applying the run-level policy matrix.
     ///
-    /// Policy denial and binding fatality return before an upstream socket is created.
+    /// Policy denial returns before an upstream socket is created.
     pub async fn forward(&self, key: UdpFlowKey, payload: &[u8]) -> Result<(), UdpRelayError> {
         match self.disposition {
             UdpFlowDisposition::Forward => {}
@@ -209,10 +203,6 @@ impl UdpFlowRelay {
                     UdpFlowDisposition::DenyIdentityUnavailable,
                     key,
                 ));
-            }
-            fatal @ UdpFlowDisposition::Fatal(_) => {
-                self.close().await;
-                return Err(UdpRelayError::Policy(fatal, key));
             }
         }
         if self.closed.load(Ordering::Acquire) {
@@ -361,15 +351,6 @@ impl UdpRelayError {
             _ => None,
         }
     }
-
-    /// Build the typed report sent through the fatal controller for a binding run.
-    pub fn fatal_report(&self) -> Result<Option<FatalReport>, CaptureContractError> {
-        let Self::Policy(UdpFlowDisposition::Fatal(reason), key) = self else {
-            return Ok(None);
-        };
-        let destination = OriginalDestination::new(key.destination.ip(), key.destination.port())?;
-        Ok(Some(FatalReport::destination(*reason, destination)))
-    }
 }
 
 #[cfg(test)]
@@ -381,7 +362,6 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use hiloop_core::capture::CaptureFatalReason;
     use hiloop_core::identity::{Hlc, RunContext};
     use serde_json::json;
     use tokio::sync::{Mutex, mpsc};
@@ -400,20 +380,12 @@ mod tests {
                 .expect("restrictive policy");
 
         assert_eq!(
-            udp_flow_disposition(false, &allow_all),
+            udp_flow_disposition(&allow_all),
             UdpFlowDisposition::Forward
         );
         assert_eq!(
-            udp_flow_disposition(false, &restrictive),
+            udp_flow_disposition(&restrictive),
             UdpFlowDisposition::DenyIdentityUnavailable
-        );
-        assert_eq!(
-            udp_flow_disposition(true, &allow_all),
-            UdpFlowDisposition::Fatal(CaptureFatalReason::SecretTransportUnsupported)
-        );
-        assert_eq!(
-            udp_flow_disposition(true, &restrictive),
-            UdpFlowDisposition::Fatal(CaptureFatalReason::SecretTransportUnsupported)
         );
     }
 
@@ -423,7 +395,6 @@ mod tests {
         let sink = Arc::new(ChannelChildSink(Mutex::new(child_tx)));
         let (summary_tx, mut summary_rx) = mpsc::channel(4);
         let relay = UdpFlowRelay::new(
-            false,
             &EgressPolicy::default(),
             Duration::from_millis(20),
             sink,
@@ -491,29 +462,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_and_binding_fatal_flows_open_no_upstream_socket() {
+    async fn denied_flows_open_no_upstream_socket() {
         let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
         let key = UdpFlowKey::new("169.254.254.2:40000".parse().expect("client"), destination)
             .expect("matching flow families");
         let restrictive = EgressPolicy::new(EgressMode::Deny, [], ["127.0.0.1/32".to_owned()])
             .expect("restrictive policy");
 
-        for (bindings, policy, expected) in [
-            (
-                false,
-                &restrictive,
-                UdpFlowDisposition::DenyIdentityUnavailable,
-            ),
-            (
-                true,
-                &EgressPolicy::default(),
-                UdpFlowDisposition::Fatal(CaptureFatalReason::SecretTransportUnsupported),
-            ),
-        ] {
+        for (policy, expected) in [(&restrictive, UdpFlowDisposition::DenyIdentityUnavailable)] {
             let (child_tx, _child_rx) = mpsc::channel(1);
             let (summary_tx, _summary_rx) = mpsc::channel(1);
             let relay = UdpFlowRelay::new(
-                bindings,
                 policy,
                 Duration::from_secs(1),
                 Arc::new(ChannelChildSink(Mutex::new(child_tx))),
@@ -525,27 +484,6 @@ mod tests {
                 .expect_err("flow must fail closed");
             assert_eq!(error.disposition(), Some(expected));
             assert_eq!(relay.open_flow_count().await, 0);
-            let fatal = error.fatal_report().expect("typed fatal report");
-            assert_eq!(fatal.is_some(), bindings);
-            if let Some(fatal) = fatal {
-                let fatal = fatal.event(
-                    &RunContext::new_local_root(),
-                    Hlc {
-                        wall_ns: 1,
-                        logical: 0,
-                    },
-                );
-                let fatal = serde_json::to_value(fatal).expect("serialize fatal event");
-                assert_eq!(fatal["name"], json!("capture.fatal"));
-                assert_eq!(
-                    fatal["attributes"]["reason"],
-                    json!("secret_transport_unsupported")
-                );
-                assert_eq!(
-                    fatal["attributes"]["original_destination.ip"],
-                    json!("127.0.0.1")
-                );
-            }
         }
     }
 

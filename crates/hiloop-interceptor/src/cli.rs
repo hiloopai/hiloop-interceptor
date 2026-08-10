@@ -9,7 +9,6 @@ use hiloop_interceptor::anomaly::{
 use hiloop_interceptor::egress::{EgressMode, EgressPolicy};
 use hiloop_interceptor::pipeline::{DEFAULT_EXPORT_BATCH_SIZE, DEFAULT_EXPORT_FLUSH_INTERVAL_MS};
 use hiloop_interceptor::proxy::DEFAULT_MAX_CAPTURE_BYTES;
-use hiloop_interceptor::secret::{BrokerConfig, SecretBinding};
 use hiloop_interceptor::{GrpcExportOptions, NetworkCapture, RedactionPolicy, RunOptions, run};
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
@@ -168,28 +167,6 @@ struct RunArgs {
     #[arg(long = "anomaly-suspicious-content-type")]
     anomaly_suspicious_content_type: Vec<String>,
 
-    /// Bind a named secret to a destination host and header (repeatable), as
-    /// `name=<name>,placeholder=<token>,host=<host>,header=<header>[,scheme=<scheme>]`.
-    /// On a request to the bound host the proxy resolves the secret from the broker and
-    /// writes `<scheme> <value>` into the header. Requires `--secret-broker-url`.
-    #[arg(long = "secret-binding", value_parser = parse_secret_binding)]
-    secret_binding: Vec<SecretBinding>,
-
-    /// Credential broker endpoint the proxy resolves secret bindings from. The broker
-    /// token is read from `HILOOP_SECRET_BROKER_TOKEN` (never a flag, to keep it out of
-    /// argv). Required when `--secret-binding` is set.
-    #[arg(long = "secret-broker-url", env = "HILOOP_SECRET_BROKER_URL")]
-    secret_broker_url: Option<String>,
-
-    /// Bearer token authenticating the proxy to the credential broker. Read only from
-    /// the environment to keep it out of argv.
-    #[arg(
-        long = "secret-broker-token",
-        env = "HILOOP_SECRET_BROKER_TOKEN",
-        hide = true
-    )]
-    secret_broker_token: Option<String>,
-
     /// Stream captured events to a telemetry gateway over gRPC, e.g.
     /// `https://telemetry.example.com:443`. Composes with `--events-jsonl`. With `--proxy`,
     /// captured payload blobs are uploaded to the same gateway at run end (only content the
@@ -297,7 +274,7 @@ impl RunArgs {
             self.anomaly_suspicious_content_type,
         )?;
 
-        let mut options = RunOptions::new(
+        let options = RunOptions::new(
             context,
             self.command,
             self.events_jsonl,
@@ -320,19 +297,6 @@ impl RunArgs {
         .with_verbose_diagnostics(self.verbose)
         .with_env_allowlist(self.env_allowlist);
 
-        if !self.secret_binding.is_empty() {
-            let url = self
-                .secret_broker_url
-                .ok_or_else(|| anyhow::anyhow!("--secret-binding requires --secret-broker-url"))?;
-            let token = self.secret_broker_token.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--secret-binding requires a broker token in HILOOP_SECRET_BROKER_TOKEN"
-                )
-            })?;
-            options =
-                options.with_secret_bindings(self.secret_binding, BrokerConfig { url, token });
-        }
-
         Ok(options)
     }
 }
@@ -351,49 +315,6 @@ impl From<EgressModeArg> for EgressMode {
             EgressModeArg::Deny => EgressMode::Deny,
         }
     }
-}
-
-/// Parse a `--secret-binding` value of the form
-/// `name=<name>,placeholder=<token>,host=<host>,header=<header>[,scheme=<scheme>]`.
-///
-/// Fields are comma-separated, so **field values may not contain a comma** — a comma in
-/// a value would be parsed as a field separator and silently truncate. Each field must
-/// be a single `key=value` pair, each key may appear at most once, and an empty value is
-/// rejected; any of these produces a clear error rather than a quietly mangled binding.
-fn parse_secret_binding(raw: &str) -> Result<SecretBinding, String> {
-    let mut name = None;
-    let mut placeholder = None;
-    let mut host = None;
-    let mut header = None;
-    let mut scheme = None;
-    for field in raw.split(',') {
-        let (key, value) = field.split_once('=').ok_or_else(|| {
-            format!("expected `key=value`, got `{field}` (values may not contain a comma)")
-        })?;
-        let key = key.trim();
-        if value.is_empty() {
-            return Err(format!("secret-binding field `{key}` has an empty value"));
-        }
-        let slot = match key {
-            "name" => &mut name,
-            "placeholder" => &mut placeholder,
-            "host" => &mut host,
-            "header" => &mut header,
-            "scheme" => &mut scheme,
-            other => return Err(format!("unknown secret-binding field `{other}`")),
-        };
-        if slot.is_some() {
-            return Err(format!("duplicate secret-binding field `{key}`"));
-        }
-        *slot = Some(value.to_owned());
-    }
-    Ok(SecretBinding {
-        name: name.ok_or("secret-binding is missing `name`")?,
-        env_placeholder: placeholder.ok_or("secret-binding is missing `placeholder`")?,
-        host: host.ok_or("secret-binding is missing `host`")?,
-        header: header.ok_or("secret-binding is missing `header`")?,
-        scheme: scheme.unwrap_or_default(),
-    })
 }
 
 /// Parse and validate `--anomaly-base64-ratio`: a finite fraction within `0.0..=1.0`.
@@ -485,6 +406,49 @@ fn resolve_max_capture_bytes(flag: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
+
+    #[test]
+    fn run_help_excludes_retired_secret_broker_flags() {
+        let mut command = Cli::command();
+        let run = command.find_subcommand_mut("run").expect("run subcommand");
+        let help = run.render_long_help().to_string();
+
+        for retired in [
+            "--secret-binding",
+            "--secret-broker-url",
+            "--secret-broker-token",
+            "HILOOP_SECRET_BROKER_URL",
+            "HILOOP_SECRET_BROKER_TOKEN",
+        ] {
+            assert!(
+                !help.contains(retired),
+                "retired broker input `{retired}` remains in run help:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_parser_rejects_retired_secret_broker_flags() {
+        for retired in [
+            "--secret-binding",
+            "--secret-broker-url",
+            "--secret-broker-token",
+        ] {
+            let parsed = Cli::try_parse_from([
+                "hiloop-interceptor",
+                "run",
+                retired,
+                "retired-value",
+                "--",
+                "true",
+            ]);
+            assert!(
+                parsed.is_err(),
+                "retired broker flag `{retired}` still parses"
+            );
+        }
+    }
 
     #[test]
     fn omitted_cap_uses_finite_default() {
@@ -515,58 +479,6 @@ mod tests {
             resolve_max_capture_bytes(args.max_capture_bytes),
             Some(DEFAULT_MAX_CAPTURE_BYTES)
         );
-    }
-
-    #[test]
-    fn secret_binding_parses_all_fields() {
-        let binding = parse_secret_binding(
-            "name=openai,placeholder=hil-secret://openai,host=api.openai.com,header=authorization,scheme=Bearer",
-        )
-        .expect("parse");
-        assert_eq!(binding.name, "openai");
-        assert_eq!(binding.env_placeholder, "hil-secret://openai");
-        assert_eq!(binding.host, "api.openai.com");
-        assert_eq!(binding.header, "authorization");
-        assert_eq!(binding.scheme, "Bearer");
-    }
-
-    #[test]
-    fn secret_binding_scheme_is_optional() {
-        let binding = parse_secret_binding("name=k,placeholder=p,host=h.com,header=x-api-key")
-            .expect("parse");
-        assert_eq!(binding.scheme, "");
-    }
-
-    #[test]
-    fn secret_binding_rejects_missing_field_and_bad_syntax() {
-        assert!(parse_secret_binding("name=k,host=h.com,header=a").is_err());
-        assert!(parse_secret_binding("not-a-pair").is_err());
-        assert!(parse_secret_binding("name=k,bogus=x,placeholder=p,host=h,header=a").is_err());
-    }
-
-    #[test]
-    fn secret_binding_rejects_comma_in_value() {
-        // A value containing a comma would be split as a separate field; that field has
-        // no `=`, so it is rejected with a clear error rather than silently truncating.
-        let err = parse_secret_binding(
-            "name=k,placeholder=hil-secret://x,host=h.com,header=a,scheme=foo,bar",
-        )
-        .expect_err("comma in value must error");
-        assert!(err.contains("values may not contain a comma"), "got: {err}");
-    }
-
-    #[test]
-    fn secret_binding_rejects_duplicate_field() {
-        let err = parse_secret_binding("name=k,name=evil,placeholder=p,host=h.com,header=a")
-            .expect_err("duplicate key must error");
-        assert!(err.contains("duplicate"), "got: {err}");
-    }
-
-    #[test]
-    fn secret_binding_rejects_empty_value() {
-        let err = parse_secret_binding("name=,placeholder=p,host=h.com,header=a")
-            .expect_err("empty value must error");
-        assert!(err.contains("empty value"), "got: {err}");
     }
 
     #[test]

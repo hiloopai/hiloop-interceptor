@@ -58,7 +58,6 @@ fn tls_interception_failed_event_shape_is_locked() {
         TlsInterceptionFailedReason::ClientTrustRejected,
         &tls_flow(),
         true,
-        false,
     );
 
     assert_event_contract(
@@ -70,7 +69,6 @@ fn tls_interception_failed_event_shape_is_locked() {
             "original_destination.port": 443,
             "reason": "client_trust_rejected",
             "retry_required": true,
-            "secret_bound": false,
             "server_name": "api.example.com",
         }),
     );
@@ -159,42 +157,13 @@ fn capture_transport_event_shape_is_locked() {
 
 #[test]
 fn capture_fatal_event_shape_is_locked() {
-    let event = Event::capture_fatal(
-        &context(),
-        timestamp(),
-        CaptureFatalReason::SecretBindUnterminatable,
-        Some(tls_flow()),
-    );
+    let event = Event::capture_fatal(&context(), timestamp(), CaptureFatalReason::DataplaneFailed);
 
     assert_event_contract(
         &event,
         "capture.fatal",
         &json!({
-            "client_hello_fingerprint": "ja4:t13d1516h2",
-            "original_destination.ip": "203.0.113.10",
-            "original_destination.port": 443,
-            "reason": "secret_bind_unterminatable",
-            "server_name": "api.example.com",
-        }),
-    );
-}
-
-#[test]
-fn udp_capture_fatal_event_shape_is_locked() {
-    let event = Event::capture_fatal_for_destination(
-        &context(),
-        timestamp(),
-        CaptureFatalReason::SecretTransportUnsupported,
-        destination(),
-    );
-
-    assert_event_contract(
-        &event,
-        "capture.fatal",
-        &json!({
-            "original_destination.ip": "203.0.113.10",
-            "original_destination.port": 443,
-            "reason": "secret_transport_unsupported",
+            "reason": "dataplane_failed",
         }),
     );
 }
@@ -208,14 +177,8 @@ fn capture_event_constructors_cannot_embed_sensitive_payloads() {
             TlsInterceptionFailedReason::InternalError,
             &tls_flow(),
             false,
-            true,
         ),
-        Event::capture_fatal(
-            &context(),
-            timestamp(),
-            CaptureFatalReason::DataplaneFailed,
-            Some(tls_flow()),
-        ),
+        Event::capture_fatal(&context(), timestamp(), CaptureFatalReason::DataplaneFailed),
     ];
 
     for event in events {
@@ -270,13 +233,8 @@ fn closed_capture_enum_values_are_locked() {
         ["netns", "proxy", "off", "none"]
     );
     assert_eq!(
-        [
-            CapturePolicy::Observe,
-            CapturePolicy::PolicyStrict,
-            CapturePolicy::SecretStrict,
-        ]
-        .map(|policy| policy.to_string()),
-        ["observe", "policy_strict", "secret_strict"]
+        [CapturePolicy::Observe, CapturePolicy::PolicyStrict].map(|policy| policy.to_string()),
+        ["observe", "policy_strict"]
     );
     assert_eq!(
         [
@@ -358,26 +316,7 @@ fn closed_capture_enum_values_are_locked() {
         ]
     );
     assert_eq!(
-        [
-            CaptureFatalReason::SecretBindUnterminatable,
-            CaptureFatalReason::SecretRouteAmbiguous,
-            CaptureFatalReason::SecretDestinationMismatch,
-            CaptureFatalReason::SecretPassthroughForbidden,
-            CaptureFatalReason::SecretRouteIdentityMismatch,
-            CaptureFatalReason::SecretTransportInsecure,
-            CaptureFatalReason::SecretTransportUnsupported,
-            CaptureFatalReason::DataplaneFailed,
-        ]
-        .map(|reason| reason.to_string()),
-        [
-            "secret_bind_unterminatable",
-            "secret_route_ambiguous",
-            "secret_destination_mismatch",
-            "secret_passthrough_forbidden",
-            "secret_route_identity_mismatch",
-            "secret_transport_insecure",
-            "secret_transport_unsupported",
-            "dataplane_failed",
-        ]
+        [CaptureFatalReason::DataplaneFailed].map(|reason| reason.to_string()),
+        ["dataplane_failed"]
     );
 }
