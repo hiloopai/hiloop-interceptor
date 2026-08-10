@@ -32,7 +32,7 @@ use hyper_util::{
     },
     rt::{TokioExecutor, TokioIo},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
@@ -250,7 +250,7 @@ impl AnomalyConfigWire {
 }
 
 pub(super) fn gateway_worker_entrypoint() -> io::Result<ExitCode> {
-    let config: GatewayConfig = decode_environment(GATEWAY_CONFIG_ENV)?;
+    let config: GatewayConfig = take_bootstrap_config(GATEWAY_CONFIG_ENV)?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -258,7 +258,7 @@ pub(super) fn gateway_worker_entrypoint() -> io::Result<ExitCode> {
 }
 
 pub(super) fn captured_workload_entrypoint() -> io::Result<ExitCode> {
-    let config = take_workload_config()?;
+    let config: WorkloadConfig = take_bootstrap_config(WORKLOAD_CONFIG_ENV)?;
     let command = std::env::args().skip(2).collect::<Vec<_>>();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -301,11 +301,11 @@ pub(super) fn captured_workload_entrypoint() -> io::Result<ExitCode> {
     unsafe_code,
     reason = "the fresh re-exec helper is single-threaded and removes its private bootstrap value before constructing a runtime or child"
 )]
-fn take_workload_config() -> io::Result<WorkloadConfig> {
-    let config = decode_environment(WORKLOAD_CONFIG_ENV)?;
+fn take_bootstrap_config<T: DeserializeOwned>(name: &'static str) -> io::Result<T> {
+    let config = decode_environment(name)?;
     // SAFETY: dispatch_internal_helper runs before the embedding binary constructs any runtime;
-    // this dedicated workload helper has not started a thread and performs no concurrent env access.
-    unsafe { std::env::remove_var(WORKLOAD_CONFIG_ENV) };
+    // the dedicated helpers have not started a thread and perform no concurrent env access.
+    unsafe { std::env::remove_var(name) };
     Ok(config)
 }
 
