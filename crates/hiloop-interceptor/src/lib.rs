@@ -20,6 +20,7 @@ pub mod pipeline;
 pub mod proxy;
 pub mod raw;
 pub mod redact;
+pub mod relay;
 pub mod seams;
 pub mod session;
 pub mod spool;

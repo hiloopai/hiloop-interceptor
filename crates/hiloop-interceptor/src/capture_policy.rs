@@ -12,6 +12,7 @@ pub(crate) enum CaptureDisposition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SensitiveExchange {
     OAuthToken,
+    BoundSecret,
 }
 
 pub(crate) fn capture_disposition(
@@ -43,6 +44,7 @@ impl SensitiveExchange {
     pub(crate) const fn omission_reason(self) -> &'static str {
         match self {
             Self::OAuthToken => "oauth_token_exchange",
+            Self::BoundSecret => "bound_secret_exchange",
         }
     }
 }
