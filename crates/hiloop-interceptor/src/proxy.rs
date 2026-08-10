@@ -5,8 +5,9 @@
 //! harness's HTTPS traffic is decrypted, captured, and fork-stamped regardless
 //! of whether the harness cooperates. Each request and response becomes one raw
 //! signal; [`ProxyNormalizer`] turns it into a `net` event (or `llm` for known
-//! LLM API hosts), and full bodies are streamed to a content-addressed blob store
-//! (the [`crate::blob`] seam) so the event carries only a `payload_ref`. See
+//! LLM API hosts). Ordinary bodies are streamed to a content-addressed blob store
+//! (the [`crate::blob`] seam) so the event carries only a `payload_ref`; supported
+//! OAuth token exchanges emit body-free metadata instead. See
 //! `docs/CAPTURE.md`.
 //!
 //! Bodies are forwarded as a streaming tee in both directions: each frame is passed
@@ -66,6 +67,7 @@ use thiserror::Error;
 
 use crate::anomaly::{AnomalyConfig, AnomalyFlag, BodyScan};
 use crate::blob::BlobStore;
+use crate::capture_policy::{CaptureDisposition, capture_disposition};
 use crate::egress::{CanonicalHost, Destination, EgressPolicy, canonicalize_host};
 use crate::redact::RedactionPolicy;
 use crate::seams::{
@@ -107,6 +109,7 @@ const GEN_AI_REQUEST_MODEL_ATTR: &str = "gen_ai.request.model";
 const GEN_AI_RESPONSE_MODEL_ATTR: &str = "gen_ai.response.model";
 const TOOL_CALL_ATTR: &str = "tool_call";
 const TRUNCATED_ATTR: &str = "http.capture.truncated";
+const BODY_OMITTED_ATTR: &str = "http.capture.body_omitted";
 /// Body bytes observed on the wire for the request leg — pre-cap, pre-redaction —
 /// so a truncated capture still records the true transfer size. (The `body_size`
 /// attributes report the *stored* captured copy: post-cap, post-redaction.)
@@ -602,6 +605,9 @@ pub(crate) struct CaptureHandler {
     exchange_method: Option<String>,
     /// Normalized target of the current exchange's request, for the same purpose.
     exchange_target: Option<String>,
+    /// Body-storage disposition selected once from the exact request endpoint and
+    /// carried onto the matching response.
+    exchange_disposition: CaptureDisposition,
     /// Set when a policy short-circuit (anomaly block) ends the exchange after its
     /// request event, so the Drop-emitted terminal abort names the real reason.
     abort_reason: Option<&'static str>,
@@ -631,6 +637,7 @@ impl CaptureHandler {
             exchange_host: None,
             exchange_method: None,
             exchange_target: None,
+            exchange_disposition: CaptureDisposition::Full,
             abort_reason: None,
         }
     }
@@ -716,9 +723,10 @@ impl CaptureHandler {
     ///
     /// - a body that has already ended (`is_end_stream`): collecting it cannot block,
     ///   and the forwarded body keeps its exact wire shape;
-    /// - block-on-match anomaly mode: rejecting a request *before* the origin sees it
-    ///   requires inspecting the whole body pre-forward — store-and-forward is that
-    ///   contract, a tee streaming prefixes upstream would defeat the block.
+    /// - a full-capture body under block-on-match anomaly mode: rejecting a request
+    ///   *before* the origin sees it requires inspecting the whole body pre-forward —
+    ///   store-and-forward is that contract, a tee streaming prefixes upstream would
+    ///   defeat the block. Metadata-only exchanges skip body inspection and keep streaming.
     async fn capture_request(&mut self, request: Request<Body>) -> RequestOrResponse {
         use hudsucker::hyper::body::Body as _;
 
@@ -729,10 +737,15 @@ impl CaptureHandler {
 
         let content_type = header_str(&parts.headers, &CONTENT_TYPE);
         let method = parts.method.as_str().to_owned();
-        let target = telemetry_target(&parts.uri);
+        let host = request_host(&parts.uri, &parts.headers).map(|host| telemetry_host(&host));
+        let disposition = capture_disposition(&method, host.as_deref(), parts.uri.path());
+        self.exchange_disposition = disposition;
+        let target = match disposition {
+            CaptureDisposition::Full => telemetry_target(&parts.uri),
+            CaptureDisposition::MetadataOnly(_) => metadata_only_telemetry_target(&parts.uri),
+        };
         self.exchange_method = Some(method.clone());
         self.exchange_target = Some(target.clone());
-        let host = request_host(&parts.uri, &parts.headers).map(|host| telemetry_host(&host));
         self.exchange_host.clone_from(&host);
 
         let mut attributes = vec![
@@ -750,7 +763,9 @@ impl CaptureHandler {
             attributes.push(("http.request.content_type", content_type.clone()));
         }
 
-        if self.anomaly.blocks_on_match() || body.is_end_stream() {
+        let buffers_for_anomaly =
+            matches!(disposition, CaptureDisposition::Full) && self.anomaly.blocks_on_match();
+        if buffers_for_anomaly || body.is_end_stream() {
             return self
                 .capture_request_buffered(parts, body, attributes, content_type)
                 .await;
@@ -758,11 +773,13 @@ impl CaptureHandler {
 
         // The scan observes every forwarded byte — past the capture cap — so a capped
         // capture cannot hide a large upload from (audit-mode) anomaly evaluation.
-        let inspection = self.anomaly.is_enabled().then(|| RequestBodyInspection {
-            config: Arc::clone(&self.anomaly),
-            method,
-            scan: BodyScan::default(),
-        });
+        let inspection = matches!(disposition, CaptureDisposition::Full)
+            .then(|| RequestBodyInspection {
+                config: Arc::clone(&self.anomaly),
+                method,
+                scan: BodyScan::default(),
+            })
+            .filter(|_| self.anomaly.is_enabled());
         let teed = self.tee_body(REQUEST_TEE, attributes, content_type, inspection, body);
         Request::from_parts(parts, teed).into()
     }
@@ -785,6 +802,19 @@ impl CaptureHandler {
         content_type: Option<String>,
     ) -> RequestOrResponse {
         let (bytes, mut truncated) = collect_body(body).await;
+
+        if let CaptureDisposition::MetadataOnly(sensitive) = self.exchange_disposition {
+            let raw = metadata_only_signal(
+                &self.clock,
+                REQUEST_TEE,
+                attributes,
+                sensitive.omission_reason(),
+                bytes.len() as u64,
+                truncated,
+            );
+            let _ = self.sink.send(raw).await;
+            return Request::from_parts(parts, Body::from(bytes)).into();
+        }
 
         // Capture at most `cap` bytes, but always forward the full body upstream.
         let captured = match self.max_capture_bytes {
@@ -954,7 +984,7 @@ impl CaptureHandler {
         let _ = self.sink.try_send(raw);
     }
 
-    /// Redact a captured body with the configured pattern policy.
+    /// Redact a captured body with the configured credential policy.
     fn redact_capture(&self, body: Bytes) -> Bytes {
         self.redaction.redact_body(body)
     }
@@ -1017,6 +1047,7 @@ impl CaptureHandler {
             capture_budget: Arc::clone(&self.capture_budget),
             capture_permit: None,
             max_capture_bytes: self.max_capture_bytes,
+            disposition: self.exchange_disposition,
             truncated: false,
             redaction: self.redaction,
             capped: false,
@@ -1137,6 +1168,7 @@ struct TeeState {
     capture_permit: Option<OwnedSemaphorePermit>,
     /// Cap on captured bytes; `None` is unlimited. Forwarding is unaffected.
     max_capture_bytes: Option<u64>,
+    disposition: CaptureDisposition,
     /// Set when capture was cut short (cap hit or upstream error).
     truncated: bool,
     /// Scrubs secrets from the buffered capture before it reaches the blob; the
@@ -1163,6 +1195,9 @@ impl TeeState {
         // bounded, the true transfer size is not. The anomaly scan likewise observes
         // every byte, so the cap cannot hide a large upload from detection.
         self.wire_bytes = self.wire_bytes.saturating_add(data.len() as u64);
+        if matches!(self.disposition, CaptureDisposition::MetadataOnly(_)) {
+            return;
+        }
         if let Some(inspection) = &mut self.inspection {
             inspection.scan.observe(data);
         }
@@ -1210,6 +1245,7 @@ impl TeeState {
             blob_store: self.blob_store.as_ref(),
             captured: std::mem::take(&mut self.captured),
             redaction: self.redaction,
+            disposition: self.disposition,
             media_type: self.media_type.take(),
             truncated: truncated || self.truncated || self.capped,
             inspection: self.inspection.take(),
@@ -1245,6 +1281,7 @@ impl Drop for TeeState {
         let captured = std::mem::take(&mut self.captured);
         let capture_permit = self.capture_permit.take();
         let redaction = self.redaction;
+        let disposition = self.disposition;
         let media_type = self.media_type.take();
         let inspection = self.inspection.take();
         let sink = self.sink.clone();
@@ -1257,6 +1294,7 @@ impl Drop for TeeState {
                 blob_store: blob_store.as_ref(),
                 captured,
                 redaction,
+                disposition,
                 media_type,
                 truncated: true,
                 inspection,
@@ -1277,6 +1315,7 @@ struct FinalizeTee<'a> {
     blob_store: &'a dyn BlobStore,
     captured: Vec<u8>,
     redaction: RedactionPolicy,
+    disposition: CaptureDisposition,
     media_type: Option<String>,
     truncated: bool,
     /// Request-tee anomaly scan to evaluate and stamp; `None` on response tees.
@@ -1299,11 +1338,23 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         blob_store,
         captured,
         redaction,
+        disposition,
         media_type,
         truncated,
         inspection,
         wire_bytes,
     } = args;
+
+    if let CaptureDisposition::MetadataOnly(sensitive) = disposition {
+        return metadata_only_signal(
+            clock,
+            channel,
+            attributes,
+            sensitive.omission_reason(),
+            wire_bytes,
+            truncated,
+        );
+    }
 
     let captured = Bytes::from(captured);
     let stored = redaction.redact_body(captured);
@@ -1342,6 +1393,27 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
     }
     if let Some(payload_ref) = payload_ref {
         raw = raw.with_payload_ref(payload_ref);
+    }
+    raw
+}
+
+fn metadata_only_signal(
+    clock: &HlcClock,
+    channel: TeeChannel,
+    attributes: Vec<(&'static str, String)>,
+    omission_reason: &'static str,
+    wire_bytes: u64,
+    truncated: bool,
+) -> RawSignal {
+    let mut raw = RawSignal::new(PROXY_SOURCE, channel.kind, clock.tick(), Bytes::new())
+        .with_attribute(channel.size_attr, "0")
+        .with_attribute(channel.wire_size_attr, wire_bytes.to_string())
+        .with_attribute(BODY_OMITTED_ATTR, omission_reason);
+    if truncated {
+        raw = raw.with_attribute(TRUNCATED_ATTR, "true");
+    }
+    for (key, value) in attributes {
+        raw = raw.with_attribute(key, value);
     }
     raw
 }
@@ -1509,6 +1581,26 @@ fn telemetry_target(uri: &hudsucker::hyper::Uri) -> String {
         .unwrap_or(authority.as_str());
     let path = uri.path_and_query().map_or("", |pq| pq.as_str());
     format!("{scheme}://{host}{path}")
+}
+
+fn metadata_only_telemetry_target(uri: &hudsucker::hyper::Uri) -> String {
+    let path = uri.path();
+    let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) else {
+        return path.to_owned();
+    };
+    let default_port = match scheme {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    };
+    let authority = match (default_port, uri.port_u16()) {
+        (Some(default), Some(port)) if default == port => authority
+            .as_str()
+            .strip_suffix(&format!(":{port}"))
+            .unwrap_or(authority.as_str()),
+        _ => authority.as_str(),
+    };
+    format!("{scheme}://{authority}{path}")
 }
 
 /// Canonicalize a request's destination authority — the CONNECT authority for a
@@ -3215,9 +3307,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_exchange_forwards_bytes_but_never_stores_request_or_response_bodies() {
+        const REQUEST: &[u8] = b"grant_type=refresh_token&refresh_token=REQUEST_CANARY";
+        const RESPONSE_A: &[u8] = br#"{"access_token":"ACCESS_CANARY","refresh_token":"REFRESH_"#;
+        const RESPONSE_B: &[u8] = br#"CANARY","id_token":"ID_CANARY"}"#;
+
+        let (mut handler, mut rx, store) = handler_with(None, RedactionPolicy::disabled());
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://platform.claude.com/v1/oauth/token?code=QUERY_CANARY")
+            .body(streaming_body(&[REQUEST]))
+            .expect("request");
+
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        assert_eq!(drain_body(forwarded.into_body()).await.concat(), REQUEST);
+        let request_signal = rx.recv().await.expect("request signal").expect("raw");
+
+        let response = Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "application/json")
+            .body(streaming_body(&[RESPONSE_A, RESPONSE_B]))
+            .expect("response");
+        let forwarded = handler.on_response(response);
+        assert_eq!(
+            drain_body(forwarded.into_body()).await.concat(),
+            [RESPONSE_A, RESPONSE_B].concat()
+        );
+        let response_signal = rx.recv().await.expect("response signal").expect("raw");
+
+        for (signal, wire_size) in [
+            (&request_signal, REQUEST.len()),
+            (&response_signal, RESPONSE_A.len() + RESPONSE_B.len()),
+        ] {
+            assert!(signal.body.is_empty());
+            assert!(signal.payload_ref().is_none());
+            assert_eq!(
+                signal.attributes.get(BODY_OMITTED_ATTR).map(String::as_str),
+                Some("oauth_token_exchange")
+            );
+            let size_attr = if signal.kind == REQUEST_KIND {
+                "http.request.body_size"
+            } else {
+                "http.response.body_size"
+            };
+            assert_eq!(
+                signal.attributes.get(size_attr).map(String::as_str),
+                Some("0")
+            );
+            let wire_attr = if signal.kind == REQUEST_KIND {
+                REQUEST_WIRE_SIZE_ATTR
+            } else {
+                RESPONSE_WIRE_SIZE_ATTR
+            };
+            assert_eq!(
+                signal.attributes.get(wire_attr),
+                Some(&wire_size.to_string())
+            );
+            assert!(
+                signal
+                    .attributes
+                    .values()
+                    .all(|value| !value.contains("CANARY")),
+                "no OAuth canary reaches event attributes"
+            );
+        }
+        assert_eq!(
+            request_signal
+                .attributes
+                .get("http.target")
+                .map(String::as_str),
+            Some("https://platform.claude.com/v1/oauth/token")
+        );
+        assert!(
+            store.blobs().is_empty(),
+            "no OAuth body reaches blob storage"
+        );
+        let context = NormalizationContext::new(RunContext::new_local_root());
+        for signal in [request_signal, response_signal] {
+            let events = ProxyNormalizer
+                .normalize(&context, signal)
+                .await
+                .expect("normalize metadata-only exchange")
+                .into_events();
+            let exported = serde_json::to_vec(&events).expect("serialize exported event shape");
+            assert!(
+                !exported
+                    .windows(b"CANARY".len())
+                    .any(|window| window == b"CANARY"),
+                "no OAuth canary reaches exported telemetry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_oauth_response_emits_metadata_without_partial_body_storage() {
+        let (mut handler, mut rx, store) = handler();
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://auth.openai.com/oauth/token")
+            .body(Body::empty())
+            .expect("request");
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        drain_body(forwarded.into_body()).await;
+        let _request_signal = rx.recv().await.expect("request signal").expect("raw");
+
+        let response = Response::builder()
+            .status(200)
+            .body(streaming_body(&[b"opaque-gzip-prefix", b"secret-tail"]))
+            .expect("response");
+        let teed = handler.on_response(response);
+        let mut stream = BodyStream::new(teed.into_body());
+        let first = stream
+            .next()
+            .await
+            .expect("frame")
+            .expect("ok")
+            .into_data()
+            .expect("data");
+        assert_eq!(first.as_ref(), b"opaque-gzip-prefix");
+        drop(stream);
+
+        let signal = rx.recv().await.expect("response signal").expect("raw");
+        assert!(signal.body.is_empty());
+        assert!(signal.payload_ref().is_none());
+        assert_eq!(
+            signal.attributes.get(BODY_OMITTED_ATTR).map(String::as_str),
+            Some("oauth_token_exchange")
+        );
+        assert_eq!(
+            signal.attributes.get(TRUNCATED_ATTR).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(store.blobs().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn oauth_omission_precedes_capture_caps_redaction_and_anomaly_inspection() {
+        let anomaly = Arc::new(
+            AnomalyConfig::enabled()
+                .with_max_upload_bytes(1)
+                .with_block_on_match(true),
+        );
+        let (mut handler, mut rx, store) = handler_with_anomaly(
+            Some(0),
+            RedactionPolicy::disabled(),
+            Arc::new(EgressPolicy::default()),
+            anomaly,
+        );
+        let body = Bytes::from_static(b"opaque-auth-material-that-would-trigger-upload-policy");
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://auth.openai.com/api/accounts/deviceauth/token")
+            .body(Body::from(body.clone()))
+            .expect("request");
+
+        let forwarded = expect_forwarded(handler.on_request(request).await);
+        assert_eq!(drain_body(forwarded.into_body()).await.concat(), body);
+        let signal = rx.recv().await.expect("request signal").expect("raw");
+        assert_eq!(
+            signal.attributes.get(BODY_OMITTED_ATTR).map(String::as_str),
+            Some("oauth_token_exchange")
+        );
+        assert!(!signal.attributes.contains_key(FLAGGED_ATTR));
+        assert!(!signal.attributes.contains_key(BLOCKED_ATTR));
+        assert!(!signal.attributes.contains_key(TRUNCATED_ATTR));
+        assert!(signal.payload_ref().is_none());
+        assert!(store.blobs().is_empty());
+    }
+
+    #[tokio::test]
     async fn request_body_secret_is_redacted_in_capture_but_forwarded_intact() {
         let (mut handler, mut rx, store) = handler_with(None, RedactionPolicy::enabled());
-        let secret = b"Authorization: Bearer supersecret";
+        let secret = b"Authorization: Bearer supersecret-token-here";
         let request = Request::builder()
             .method("POST")
             .uri("http://example.com/v1/thing")
@@ -3273,12 +3534,18 @@ mod tests {
             vec![("http.status_code", "200".to_owned())],
             None,
             None,
-            streaming_body(&[b"token=sk-abc123 ", b"and AKIA0123456789ABCDEF"]),
+            streaming_body(&[
+                b"token=sk-abc1234567890xyzABCDEF ",
+                b"and AKIA0123456789ABCDEF",
+            ]),
         );
 
         // The client still receives the original, unredacted bytes.
         let chunks = drain_body(teed).await;
-        assert_eq!(chunks.concat(), b"token=sk-abc123 and AKIA0123456789ABCDEF");
+        assert_eq!(
+            chunks.concat(),
+            b"token=sk-abc1234567890xyzABCDEF and AKIA0123456789ABCDEF"
+        );
 
         let signal = rx.recv().await.expect("signal").expect("raw");
         let scrubbed = b"token=[REDACTED] and [REDACTED]";
@@ -3680,6 +3947,38 @@ mod tests {
         )
         .await
         .expect("on_request must not wait for request-body EOF (streaming deadlock)");
+        let _forwarded = expect_forwarded(outcome);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oauth_request_streams_even_when_anomaly_blocking_is_enabled() {
+        let anomaly = Arc::new(
+            AnomalyConfig::enabled()
+                .with_max_upload_bytes(1)
+                .with_block_on_match(true),
+        );
+        let (mut handler, _rx, _store) = handler_with_anomaly(
+            None,
+            RedactionPolicy::enabled(),
+            Arc::new(EgressPolicy::default()),
+            anomaly,
+        );
+        let (frame_tx, body) = channel_body();
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://auth.openai.com/oauth/token")
+            .body(body)
+            .expect("request");
+        frame_tx
+            .try_send(Bytes::from_static(b"refresh_token=synthetic"))
+            .expect("send first frame");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.on_request(request),
+        )
+        .await
+        .expect("metadata-only OAuth must bypass store-and-forward anomaly inspection");
         let _forwarded = expect_forwarded(outcome);
     }
 

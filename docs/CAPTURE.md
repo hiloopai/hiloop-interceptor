@@ -201,11 +201,20 @@ copy in a buffer (rather than streaming it frame-by-frame into the blob) is the 
 cost of correct cross-frame redaction; the cap bounds the buffer, and forwarding to the peer still
 streams a frame at a time.
 
-**Capture-side redaction (shipped, on by default).** Before a captured request/response body is
-persisted (events or blob store), credential patterns — bearer tokens, `sk-…` / `hil_…` keys, AWS
-access-key ids — are replaced with `[REDACTED]` (`crate::redact`). Redaction rewrites only the
-captured copy, never the bytes forwarded to the origin, and is best-effort (only known patterns;
-bytes beyond the capture cap are never captured or scanned). Disable per run with `--no-redact`.
+**Sensitive auth omission and capture-side redaction (shipped).** Exact supported Claude and Codex
+OAuth token exchanges are classified from method, canonical host, and path before any body DATA is
+captured. Their request and response bytes still stream unchanged, but telemetry stores only the
+method, query-free target, status, content metadata, wire-byte counts, exchange id, and
+`http.capture.body_omitted=oauth_token_exchange`; it never creates a body blob or inline fallback.
+This omission remains active with `--no-redact` because opaque refresh tokens cannot be reliably
+recognized from their bytes.
+
+All other captured bodies are redacted on by default using `leakguard`'s credential detectors plus
+Hiloop's own token format. The enabled set covers provider/platform keys, JWTs, URL credentials,
+private keys, and common service tokens; broad PII and generic-entropy detectors stay disabled to
+preserve useful telemetry. Matches become `[REDACTED]` only in the captured copy, never in bytes
+forwarded to the origin. This pass is best-effort: unrecognized opaque values and bytes beyond the
+capture cap are not scrubbed. Disable it per run with `--no-redact`.
 
 **Request/response correlation (shipped).** Each non-`CONNECT` exchange gets a minted ULID
 `http.exchange_id` stamped on both its request and response events. (It was originally a

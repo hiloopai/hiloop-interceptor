@@ -6,14 +6,18 @@ directional performance budgets and promotion rules live in [`TESTING.md`](TESTI
 
 ## Implemented
 
-`crates/hiloop-interceptor/benches/stdio_path.rs` (Criterion, `harness = false`) records the two
-synchronous CPU costs on the default capture path, run with `cargo bench -p hiloop-interceptor`:
+`crates/hiloop-interceptor/benches/stdio_path.rs` (Criterion, `harness = false`) records synchronous
+CPU costs on the default capture path, run with `cargo bench -p hiloop-interceptor`:
 
 - `line_framer/{16,256,4096}` — `LineFramer::push` throughput over a ~64 KiB buffer of fixed-length
   lines (covers part of `stdio_normalizer` and `stdio_e2e_binary` below). Early local readings show
   short lines bottlenecked on the per-record `Vec` allocation, which is the first optimization
   candidate if the events/s budget needs it.
 - `event_serialize_json` — `serde_json` cost per event (the CPU half of `jsonl_exporter`).
+- `credential_redaction/body/{clean_1k,clean_64k,clean_default_cap_8m,credential_64k}` — the OSS
+  credential detector pass over representative clean model JSON, the default 8 MiB capture
+  ceiling, and a body containing one synthetic provider key. Input generation is outside the timed
+  region; clean bodies return their original `Bytes` without allocating an output copy.
 
 These are recorded, not gated. The async end-to-end benchmarks below (`pipeline_memory_exporter`,
 `stdio_e2e_binary`, `backpressure_slow_exporter`) are still to come, as is iai-callgrind and Bencher
