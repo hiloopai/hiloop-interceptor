@@ -37,7 +37,7 @@ tokio-rustls = "0.26"
 url = "2.5"
 # CIDR membership matching (IPv4 + IPv6) for egress policy. Pure Rust, MSRV-lenient.
 ipnet = "2"
-leakguard = "0.8.0"
+leakguard = { version = "0.8.0", features = ["parallel"] }
 nix = { version = "0.31", default-features = false, features = ["net", "process", "signal", "term", "uio"] }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 proptest = "1"

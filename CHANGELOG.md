@@ -16,6 +16,13 @@ minor releases may include breaking changes to the CLI, its flags, and the event
 
 ### Changed
 
+- Captured HTTP body credential scanning now runs on separate bounded small- and large-body blocking
+  lanes instead of Tokio's async workers. Four small slots prevent maximum-size captures from
+  queueing ahead of small exchanges; two large slots avoid oversubscribing leakguard's
+  detector-parallel workers. Traffic keeps streaming while its telemetry copy is scanned;
+  scan-task failure records metadata only rather than storing an unscanned body. Generic scanning
+  remains enabled by default and explicitly optional through `--no-redact`; exact OAuth token
+  exchanges remain metadata-only in either mode.
 - **Breaking (event schema):** the process provenance attribute `process.argv` is renamed to
   `process.command_args`, the OpenTelemetry semantic-convention name for the same fact. The value is
   unchanged (the full argv JSON-encoded into a string attribute, including `argv[0]`). Events
