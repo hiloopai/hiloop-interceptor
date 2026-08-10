@@ -71,7 +71,7 @@ use crate::capture_policy::{CaptureDisposition, SensitiveExchange, capture_dispo
 use crate::egress::{CanonicalHost, Destination, EgressPolicy, canonicalize_host};
 use crate::redact::RedactionPolicy;
 use crate::relay::{
-    FixedTlsRelayConfig, RelayConfigError, RelayRoute, RelayRoutingConnector,
+    FixedTlsRelayConfig, RelayConfigError, RelayRoute, RelayRoutingConnector, SecretEgressDenial,
     connect_has_ambiguous_authority, is_ca_certificate,
 };
 use crate::seams::{
@@ -98,6 +98,10 @@ const REQUEST_KIND: &str = "http.request";
 const RESPONSE_KIND: &str = "http.response";
 const EGRESS_DENIED_KIND: &str = "egress.denied";
 const SECRET_EGRESS_DENIED_KIND: &str = "secret.egress.denied";
+const SECRET_EGRESS_DENIAL_ATTR: &str = "secret.egress.denial";
+const SECRET_EGRESS_CLASS_ATTR: &str = "secret.egress.class";
+const SECRET_EGRESS_BOUND_CLASS: &str = "bound";
+const HTTP_STATUS_CLASS_ATTR: &str = "http.status_class";
 /// Terminal event for an exchange that ended without a response: it shares the
 /// request's `http.exchange_id` and names why the exchange never completed
 /// ([`ABORT_REASON_ATTR`]), so a captured request can never dangle ambiguously.
@@ -484,10 +488,16 @@ impl ProxySourceConfig {
     }
 
     /// Route exact bound HTTPS destinations through one proof-bound fixed TLS relay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayConfigError`] if the relay TLS connector cannot be built from
+    /// the validated endpoint, identity, and trust roots.
     pub fn with_bound_https_relay(
         mut self,
         relay: FixedTlsRelayConfig,
     ) -> Result<Self, RelayConfigError> {
+        relay.validate_connector()?;
         self.bound_https_relay = Some(relay);
         Ok(self)
     }
@@ -681,7 +691,7 @@ impl CaptureHandler {
                         || relay.request_mentions_bound_host(&request)
                 })
             {
-                self.emit_secret_egress_denied_without_host("websocket_or_nested_connect");
+                self.emit_secret_egress_denied_without_host(SecretEgressDenial::NestedConnect);
                 return forbidden().into();
             }
             match canonical_authority(&request) {
@@ -691,7 +701,10 @@ impl CaptureHandler {
                             || (relay.route_connect(&destination) == RelayRoute::Bound
                                 && connect_has_ambiguous_authority(&request, &destination))
                     }) {
-                        self.emit_secret_egress_denied(&destination, "invalid_connect_authority");
+                        self.emit_secret_egress_denied(
+                            &destination,
+                            SecretEgressDenial::InvalidConnectAuthority,
+                        );
                         return forbidden().into();
                     }
                     if let Some(denied) = self.enforce_egress(&destination, "connect") {
@@ -728,7 +741,7 @@ impl CaptureHandler {
                             relay.route_connect(destination) == RelayRoute::Bound
                         })
             }) {
-                self.emit_secret_egress_denied_without_host("ambiguous_authority");
+                self.emit_secret_egress_denied_without_host(SecretEgressDenial::AmbiguousAuthority);
                 return forbidden().into();
             }
             if self.egress.is_allow_all() {
@@ -759,11 +772,17 @@ impl CaptureHandler {
                     return self.prepare_bound_request(request, &destination).await;
                 }
                 RelayRoute::Denied => {
-                    self.emit_secret_egress_denied(&destination, "invalid_destination");
+                    self.emit_secret_egress_denied(
+                        &destination,
+                        SecretEgressDenial::InvalidDestination,
+                    );
                     return forbidden().into();
                 }
                 RelayRoute::Direct if relay.request_mentions_bound_host(&request) => {
-                    self.emit_secret_egress_denied(&destination, "ambiguous_authority");
+                    self.emit_secret_egress_denied(
+                        &destination,
+                        SecretEgressDenial::AmbiguousAuthority,
+                    );
                     return forbidden().into();
                 }
                 RelayRoute::Direct => {}
@@ -785,7 +804,7 @@ impl CaptureHandler {
             .prepare_request(&mut request, self.connect_destination.as_ref(), destination)
             .await;
         if let Err(denial) = prepared {
-            self.emit_secret_egress_denied(destination, denial.cause());
+            self.emit_secret_egress_denied(destination, denial);
             return if denial.proof_unavailable() {
                 bad_gateway().into()
             } else {
@@ -797,26 +816,26 @@ impl CaptureHandler {
         self.capture_request(request).await
     }
 
-    fn emit_secret_egress_denied(&self, destination: &Destination, cause: &'static str) {
+    fn emit_secret_egress_denied(&self, destination: &Destination, denial: SecretEgressDenial) {
         let raw = RawSignal::new(
             PROXY_SOURCE,
             SECRET_EGRESS_DENIED_KIND,
             self.clock.tick(),
             Bytes::new(),
         )
-        .with_attribute("secret.egress.denial", cause)
+        .with_attribute(SECRET_EGRESS_DENIAL_ATTR, denial.as_str())
         .with_attribute("http.host", destination.host_str());
         let _ = self.sink.try_send(raw);
     }
 
-    fn emit_secret_egress_denied_without_host(&self, cause: &'static str) {
+    fn emit_secret_egress_denied_without_host(&self, denial: SecretEgressDenial) {
         let raw = RawSignal::new(
             PROXY_SOURCE,
             SECRET_EGRESS_DENIED_KIND,
             self.clock.tick(),
             Bytes::new(),
         )
-        .with_attribute("secret.egress.denial", cause);
+        .with_attribute(SECRET_EGRESS_DENIAL_ATTR, denial.as_str());
         let _ = self.sink.try_send(raw);
     }
 
@@ -888,7 +907,10 @@ impl CaptureHandler {
             attributes.push(("http.host", host.clone()));
         }
         if bound {
-            attributes.push(("secret.egress.class", "bound".to_owned()));
+            attributes.push((
+                SECRET_EGRESS_CLASS_ATTR,
+                SECRET_EGRESS_BOUND_CLASS.to_owned(),
+            ));
         } else if let Some(content_type) = &content_type {
             attributes.push(("http.request.content_type", content_type.clone()));
         }
@@ -1161,8 +1183,11 @@ impl CaptureHandler {
             .flatten();
         let mut attributes = if bound {
             vec![
-                ("http.status_class", status_class(parts.status)),
-                ("secret.egress.class", "bound".to_owned()),
+                (HTTP_STATUS_CLASS_ATTR, status_class(parts.status)),
+                (
+                    SECRET_EGRESS_CLASS_ATTR,
+                    SECRET_EGRESS_BOUND_CLASS.to_owned(),
+                ),
             ]
         } else {
             vec![("http.status_code", parts.status.as_u16().to_string())]

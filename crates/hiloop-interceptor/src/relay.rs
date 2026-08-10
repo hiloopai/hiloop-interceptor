@@ -31,6 +31,9 @@ use tower_service::Service;
 use crate::egress::{CanonicalHost, Destination, canonicalize_host};
 
 pub(crate) const SECRET_PROOF_HEADER: &str = "x-hiloop-secret-proof";
+const HILOOP_PRIVATE_HEADER_PREFIX: &str = "x-hiloop-";
+const SEC_WEBSOCKET_KEY_HEADER: &str = "sec-websocket-key";
+const SEC_WEBSOCKET_VERSION_HEADER: &str = "sec-websocket-version";
 const MAX_PROOF_BYTES: usize = 16 * 1024;
 
 /// An exact DNS destination whose HTTPS port is always 443.
@@ -41,6 +44,11 @@ pub struct BoundHttpsSelector {
 
 impl BoundHttpsSelector {
     /// Validate and canonicalize an exact DNS host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayConfigError::Selector`] unless `host` is one exact DNS name
+    /// without a port, wildcard, IP literal, or single-label spelling.
     pub fn new(host: impl Into<String>) -> Result<Self, RelayConfigError> {
         let host = host.into();
         let destination = canonicalize_host(&host).map_err(|_| RelayConfigError::Selector {
@@ -89,6 +97,11 @@ struct RelayUpstream {
 
 impl FixedTlsRelayConfig {
     /// Build the closed relay capability used by one capture sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayConfigError`] when the endpoint, TLS identity or roots, proof
+    /// path, or exact selector set violates the closed relay contract.
     pub fn new(
         endpoint: SocketAddr,
         server_name: impl Into<String>,
@@ -193,6 +206,17 @@ impl FixedTlsRelayConfig {
             .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
     }
 
+    pub(crate) fn validate_connector(&self) -> Result<(), RelayConfigError> {
+        self.transport_uri()?;
+        self.tls_client_config().map(drop)
+    }
+
+    fn transport_uri(&self) -> Result<Uri, RelayConfigError> {
+        format!("https://{}/", self.endpoint())
+            .parse()
+            .map_err(|_| RelayConfigError::Tls)
+    }
+
     pub(crate) async fn read_proof(&self) -> Result<HeaderValue, RelayProofError> {
         let file = tokio::fs::File::open(&self.proof_file)
             .await
@@ -228,23 +252,23 @@ impl FixedTlsRelayConfig {
         request: &mut Request<B>,
         connect_destination: Option<&Destination>,
         destination: &Destination,
-    ) -> Result<(), RelayDenial> {
+    ) -> Result<(), SecretEgressDenial> {
         if connect_destination
             .is_none_or(|connect| self.route_connect(connect) != RelayRoute::Bound)
             || request_has_ambiguous_authority(request, destination)
             || is_websocket_request(request)
         {
-            return Err(RelayDenial::AuthorityOrProtocolMismatch);
+            return Err(SecretEgressDenial::AuthorityOrProtocolMismatch);
         }
         let proof = self
             .read_proof()
             .await
-            .map_err(|_| RelayDenial::ProofUnavailable)?;
+            .map_err(|_| SecretEgressDenial::ProofUnavailable)?;
         request.headers_mut().remove(AUTHORIZATION);
         let private_headers = request
             .headers()
             .keys()
-            .filter(|name| name.as_str().starts_with("x-hiloop-"))
+            .filter(|name| name.as_str().starts_with(HILOOP_PRIVATE_HEADER_PREFIX))
             .cloned()
             .collect::<Vec<_>>();
         for name in private_headers {
@@ -273,9 +297,7 @@ impl RelayRoutingConnector {
 
 impl RelayUpstream {
     fn new(config: FixedTlsRelayConfig) -> Result<Self, RelayConfigError> {
-        let transport_uri = format!("https://{}/", config.endpoint())
-            .parse()
-            .map_err(|_| RelayConfigError::Tls)?;
+        let transport_uri = config.transport_uri()?;
         let connector = HttpsConnectorBuilder::new()
             .with_tls_config(config.tls_client_config()?)
             .https_only()
@@ -343,14 +365,22 @@ pub(crate) enum RelayRoute {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RelayDenial {
+pub(crate) enum SecretEgressDenial {
+    NestedConnect,
+    InvalidConnectAuthority,
+    AmbiguousAuthority,
+    InvalidDestination,
     AuthorityOrProtocolMismatch,
     ProofUnavailable,
 }
 
-impl RelayDenial {
-    pub(crate) const fn cause(self) -> &'static str {
+impl SecretEgressDenial {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::NestedConnect => "nested_connect",
+            Self::InvalidConnectAuthority => "invalid_connect_authority",
+            Self::AmbiguousAuthority => "ambiguous_authority",
+            Self::InvalidDestination => "invalid_destination",
             Self::AuthorityOrProtocolMismatch => "authority_or_protocol_mismatch",
             Self::ProofUnavailable => "proof_unavailable",
         }
@@ -437,8 +467,8 @@ fn header_authority_mismatch<B>(request: &Request<B>, destination: &Destination)
 
 fn is_websocket_request<B>(request: &Request<B>) -> bool {
     request.headers().contains_key(UPGRADE)
-        || request.headers().contains_key("sec-websocket-key")
-        || request.headers().contains_key("sec-websocket-version")
+        || request.headers().contains_key(SEC_WEBSOCKET_KEY_HEADER)
+        || request.headers().contains_key(SEC_WEBSOCKET_VERSION_HEADER)
         || request.headers().get_all(CONNECTION).iter().any(|value| {
             value.to_str().ok().is_some_and(|value| {
                 value
@@ -585,6 +615,29 @@ mod tests {
             ),
             Err(RelayConfigError::DuplicateSelector { .. })
         ));
+    }
+
+    #[test]
+    fn secret_egress_denial_codes_are_stable() {
+        assert_eq!(
+            [
+                SecretEgressDenial::NestedConnect,
+                SecretEgressDenial::InvalidConnectAuthority,
+                SecretEgressDenial::AmbiguousAuthority,
+                SecretEgressDenial::InvalidDestination,
+                SecretEgressDenial::AuthorityOrProtocolMismatch,
+                SecretEgressDenial::ProofUnavailable,
+            ]
+            .map(SecretEgressDenial::as_str),
+            [
+                "nested_connect",
+                "invalid_connect_authority",
+                "ambiguous_authority",
+                "invalid_destination",
+                "authority_or_protocol_mismatch",
+                "proof_unavailable",
+            ]
+        );
     }
 
     #[tokio::test]
