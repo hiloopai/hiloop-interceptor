@@ -1,20 +1,17 @@
 //! Record-don't-gate benchmarks for the stdio capture hot path.
 //!
 //! These measure synchronous CPU costs on the default capture path: framing raw
-//! bytes into records, serializing a normalized event to JSONL, and scanning HTTP
-//! bodies for credentials. They avoid the async runtime so the numbers are stable
-//! and attributable. They are recorded for trend tracking, not asserted; see
-//! `docs/BENCHMARKING.md`.
+//! bytes into records and serializing a normalized event to JSONL. They avoid the
+//! async runtime so the numbers are stable and attributable. They are recorded for
+//! trend tracking, not asserted; see `docs/BENCHMARKING.md`.
 //!
 //! Run with `cargo bench -p hiloop-interceptor`.
 
 use std::hint::black_box;
 
-use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hiloop_core::event::{AttributeKey, Event, EventName, SignalType};
 use hiloop_core::identity::{Hlc, RunContext};
-use hiloop_interceptor::RedactionPolicy;
 use hiloop_interceptor::framing::LineFramer;
 
 const MAX_RECORD_BYTES: usize = 64 * 1024;
@@ -74,48 +71,5 @@ fn bench_event_serialize(c: &mut Criterion) {
     });
 }
 
-fn redaction_body(size: usize, credential: Option<&str>) -> Bytes {
-    let mut body = String::with_capacity(size + 128);
-    body.push_str(r#"{"model":"claude-sonnet","input":""#);
-    body.extend(std::iter::repeat_n(
-        'a',
-        size.saturating_sub(body.len() + 4),
-    ));
-    body.push_str("\"}");
-    if let Some(credential) = credential {
-        body.push_str(" credential=");
-        body.push_str(credential);
-    }
-    Bytes::from(body)
-}
-
-fn bench_credential_redaction(c: &mut Criterion) {
-    let policy = RedactionPolicy::enabled();
-    let mut group = c.benchmark_group("credential_redaction");
-    for (name, body) in [
-        ("clean_1k", redaction_body(1024, None)),
-        ("clean_64k", redaction_body(64 * 1024, None)),
-        (
-            "clean_default_cap_8m",
-            redaction_body(8 * 1024 * 1024, None),
-        ),
-        (
-            "credential_64k",
-            redaction_body(64 * 1024, Some("sk-abc1234567890xyzABCDEF")),
-        ),
-    ] {
-        group.throughput(Throughput::Bytes(body.len() as u64));
-        group.bench_with_input(BenchmarkId::new("body", name), &body, |b, body| {
-            b.iter(|| policy.redact_body(black_box(body.clone())));
-        });
-    }
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_line_framer,
-    bench_event_serialize,
-    bench_credential_redaction
-);
+criterion_group!(benches, bench_line_framer, bench_event_serialize);
 criterion_main!(benches);

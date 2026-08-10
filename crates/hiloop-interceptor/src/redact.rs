@@ -32,6 +32,10 @@ use leakguard::detectors::{
 };
 use leakguard::{FnDetector, Kind, Match, Redactor};
 
+mod async_scan;
+
+pub use async_scan::RedactionError;
+
 /// Replacement written in place of any redacted secret.
 pub const REDACTION_PLACEHOLDER: &str = "[REDACTED]";
 
@@ -153,6 +157,23 @@ impl RedactionPolicy {
         }
         redact_body(body)
     }
+
+    /// Redact a captured body without running detector CPU work on the async executor.
+    ///
+    /// Small and large bodies use separate blocking lanes (four small, two large) so
+    /// maximum-size captures cannot head-of-line block small exchanges or oversubscribe
+    /// detector-parallel workers. Leakguard automatically keeps smaller bodies serial.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedactionError`] if the blocking scan task panics or cannot complete.
+    pub async fn redact_body_async(self, body: Bytes) -> Result<Bytes, RedactionError> {
+        if !self.enabled || body.is_empty() {
+            return Ok(body);
+        }
+        let body_size = body.len();
+        async_scan::run_body_scan(body_size, move || redact_body_parallel(body)).await
+    }
 }
 
 /// Scrub every credential match from `body`, replacing each with
@@ -161,7 +182,15 @@ impl RedactionPolicy {
 /// the captured body. Returns the input untouched when nothing matches.
 #[must_use]
 pub fn redact_body(body: Bytes) -> Bytes {
-    let matches = body_matches(&body);
+    redact_body_with(body, ScanMode::Serial)
+}
+
+fn redact_body_parallel(body: Bytes) -> Bytes {
+    redact_body_with(body, ScanMode::Parallel)
+}
+
+fn redact_body_with(body: Bytes, mode: ScanMode) -> Bytes {
+    let matches = body_matches(&body, mode);
     if matches.is_empty() {
         return body;
     }
@@ -183,7 +212,13 @@ pub fn redact_body(body: Bytes) -> Bytes {
     Bytes::from(scrubbed)
 }
 
-fn body_matches(body: &[u8]) -> Vec<Match> {
+#[derive(Clone, Copy)]
+enum ScanMode {
+    Serial,
+    Parallel,
+}
+
+fn body_matches(body: &[u8], mode: ScanMode) -> Vec<Match> {
     let mut matches = Vec::new();
     let mut cursor = 0;
     while cursor < body.len() {
@@ -197,8 +232,12 @@ fn body_matches(body: &[u8]) -> Vec<Match> {
                 (valid, invalid_len)
             }
         };
+        let found = match mode {
+            ScanMode::Serial => BODY_REDACTOR.find(valid),
+            ScanMode::Parallel => BODY_REDACTOR.find_parallel(valid),
+        };
         matches.extend(
-            BODY_REDACTOR.find(valid).into_iter().map(|matched| {
+            found.into_iter().map(|matched| {
                 Match::new(matched.kind, cursor + matched.start, cursor + matched.end)
             }),
         );
@@ -236,6 +275,54 @@ mod tests {
         let out = RedactionPolicy::enabled()
             .redact_body(Bytes::from_static(b"Bearer supersecret-token-here"));
         assert_eq!(out.as_ref(), b"[REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn async_enabled_policy_redacts_body() {
+        let out = RedactionPolicy::enabled()
+            .redact_body_async(Bytes::from_static(b"Bearer supersecret-token-here"))
+            .await
+            .expect("body scan");
+        assert_eq!(out.as_ref(), b"[REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn async_parallel_path_matches_serial_across_binary_framing() {
+        let mut body = vec![b'a'; 600 * 1024];
+        let split = 300 * 1024;
+        let provider_key = b"sk-abc1234567890xyzABCDEF";
+        body[1023] = b' ';
+        body[1024..1024 + provider_key.len()].copy_from_slice(provider_key);
+        body[1024 + provider_key.len()] = b' ';
+        body[split] = 0xff;
+        let bearer = b"Bearer abc.def.ghi.long-token-value";
+        body[split + 1024..split + 1024 + bearer.len()].copy_from_slice(bearer);
+        let body = Bytes::from(body);
+
+        let expected = RedactionPolicy::enabled().redact_body(body.clone());
+        let actual = RedactionPolicy::enabled()
+            .redact_body_async(body)
+            .await
+            .expect("body scan");
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual
+                .windows(REDACTION_PLACEHOLDER.len())
+                .filter(|window| *window == REDACTION_PLACEHOLDER.as_bytes())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn async_disabled_policy_leaves_body_untouched() {
+        let body = Bytes::from_static(b"Bearer supersecret-token-here");
+        let out = RedactionPolicy::disabled()
+            .redact_body_async(body.clone())
+            .await
+            .expect("disabled scan");
+        assert_eq!(out, body);
     }
 
     #[test]

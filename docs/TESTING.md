@@ -124,6 +124,8 @@ Nightly tests should add workloads that are too slow or timing-sensitive for eve
 - memory high-water measurement during sustained capture;
 - repeated start/stop and nonzero-exit loops to detect leaked processes or file descriptors;
 - Criterion wall-clock benchmark recording.
+- credential-scan serial/parallel and bounded-concurrency recording at 1 KiB through the default
+  8 MiB body ceiling.
 
 ### Pre-Release
 

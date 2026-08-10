@@ -220,6 +220,17 @@ capture cap are not scrubbed. Binary bytes are preserved while adjacent valid UT
 scanned, so one framing byte cannot disable credential scrubbing for the rest of a body. Disable it
 per run with `--no-redact`.
 
+Credential scanning is in-process: it adds no service call, IPC, or network hop. Enabled body scans
+run on separate bounded small- and large-body blocking lanes rather than Tokio's async workers. Four
+small slots prevent maximum-size captures from queueing ahead of small exchanges; two large slots
+avoid oversubscribing leakguard's detector-parallel workers. Leakguard keeps small bodies serial.
+Streaming bytes still forward as they arrive, while the captured body's event/blob becomes
+available after the scan finishes. If a scan task fails, the exchange keeps flowing and telemetry
+fails closed to a metadata-only record with
+`http.capture.body_omitted=credential_scan_unavailable` rather than storing an unscanned body.
+Disabled generic scanning returns the captured body directly and does not affect the mandatory
+OAuth omission above.
+
 **Request/response correlation (shipped).** Each non-`CONNECT` exchange gets a minted ULID
 `http.exchange_id` stamped on both its request and response events. (It was originally a
 process-local counter; that restarted at zero in every wrapper invocation, so sibling invocations

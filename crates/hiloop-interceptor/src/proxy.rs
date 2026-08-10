@@ -110,6 +110,7 @@ const GEN_AI_RESPONSE_MODEL_ATTR: &str = "gen_ai.response.model";
 const TOOL_CALL_ATTR: &str = "tool_call";
 const TRUNCATED_ATTR: &str = "http.capture.truncated";
 const BODY_OMITTED_ATTR: &str = "http.capture.body_omitted";
+const REDACTION_UNAVAILABLE_OMISSION: &str = "credential_scan_unavailable";
 /// Body bytes observed on the wire for the request leg — pre-cap, pre-redaction —
 /// so a truncated capture still records the true transfer size. (The `body_size`
 /// attributes report the *stored* captured copy: post-cap, post-redaction.)
@@ -836,9 +837,6 @@ impl CaptureHandler {
             }
             _ => bytes.clone(),
         };
-        // Only the captured copy is redacted; the forwarded `bytes` are never touched.
-        let captured = self.redact_capture(captured);
-
         // Inspect the ORIGINAL body (full pre-truncation length, unredacted bytes) for
         // exfiltration-shaped anomalies, so a capture cap below a threshold cannot
         // truncate a large upload out of detection. Inspection is read-only; only the
@@ -850,16 +848,6 @@ impl CaptureHandler {
             .inspect(parts.method.as_str(), content_type.as_deref(), &bytes);
         let blocked = !flags.is_empty() && self.anomaly.blocks_on_match();
 
-        // The true transfer size, distinct from the stored (capped + redacted)
-        // `body_size`: reconstruction and traffic accounting survive truncation.
-        attributes.push((REQUEST_WIRE_SIZE_ATTR, bytes.len().to_string()));
-        append_llm_capture_attributes(
-            &mut attributes,
-            self.exchange_host.as_deref(),
-            content_type.as_deref(),
-            &captured,
-            LlmCaptureDirection::Request,
-        );
         if !flags.is_empty() {
             attributes.push((FLAGGED_ATTR, join_flag_names(&flags)));
         }
@@ -867,27 +855,55 @@ impl CaptureHandler {
             attributes.push((BLOCKED_ATTR, "true".to_owned()));
         }
 
-        // Offload the buffered body to the blob store; on any failure fall back to
-        // an inline body so the capture is never lost. The forwarded request keeps
-        // the buffered bytes either way.
-        let payload_ref =
-            match offload_bytes(self.blob_store.as_ref(), &captured, content_type.as_deref()).await
-            {
-                Ok(payload_ref) => Some(payload_ref),
-                Err(error) => {
-                    eprintln!("hiloop-interceptor: proxy request blob offload failed: {error}");
-                    None
-                }
-            };
-        let raw = build_raw(
-            &self.clock,
-            REQUEST_KIND,
-            "http.request.body_size",
-            attributes,
-            captured,
-            truncated,
-            payload_ref,
-        );
+        let raw = match self.redaction.redact_body_async(captured).await {
+            Ok(captured) => {
+                // The true transfer size, distinct from the stored (capped + redacted)
+                // `body_size`: reconstruction and traffic accounting survive truncation.
+                attributes.push((REQUEST_WIRE_SIZE_ATTR, bytes.len().to_string()));
+                append_llm_capture_attributes(
+                    &mut attributes,
+                    self.exchange_host.as_deref(),
+                    content_type.as_deref(),
+                    &captured,
+                    LlmCaptureDirection::Request,
+                );
+                // Offload the buffered body to the blob store; on any failure fall back to
+                // an inline body so the capture is never lost. The forwarded request keeps
+                // the buffered bytes either way.
+                let payload_ref = match offload_bytes(
+                    self.blob_store.as_ref(),
+                    &captured,
+                    content_type.as_deref(),
+                )
+                .await
+                {
+                    Ok(payload_ref) => Some(payload_ref),
+                    Err(error) => {
+                        eprintln!("hiloop-interceptor: proxy request blob offload failed: {error}");
+                        None
+                    }
+                };
+                build_raw(
+                    &self.clock,
+                    REQUEST_KIND,
+                    "http.request.body_size",
+                    attributes,
+                    captured,
+                    truncated,
+                    payload_ref,
+                )
+            }
+            Err(error) => {
+                eprintln!("hiloop-interceptor: proxy request credential scan failed: {error}");
+                credential_scan_unavailable_signal(
+                    &self.clock,
+                    REQUEST_TEE,
+                    attributes,
+                    bytes.len() as u64,
+                    truncated,
+                )
+            }
+        };
         let _ = self.sink.send(raw).await;
 
         if blocked {
@@ -994,11 +1010,6 @@ impl CaptureHandler {
         .with_attribute("egress.layer", layer)
         .with_attribute("egress.mode", self.egress.mode().to_string());
         let _ = self.sink.try_send(raw);
-    }
-
-    /// Redact a captured body with the configured credential policy.
-    fn redact_capture(&self, body: Bytes) -> Bytes {
-        self.redaction.redact_body(body)
     }
 
     pub(crate) fn on_response(&mut self, response: Response<Body>) -> Response<Body> {
@@ -1375,7 +1386,15 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
     }
 
     let captured = Bytes::from(captured);
-    let stored = redaction.redact_body(captured);
+    let stored = match redaction.redact_body_async(captured).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            eprintln!("hiloop-interceptor: proxy body credential scan failed: {error}");
+            return credential_scan_unavailable_signal(
+                clock, channel, attributes, wire_bytes, truncated,
+            );
+        }
+    };
     let host = attributes
         .iter()
         .find_map(|(key, value)| (*key == "http.host").then(|| value.clone()));
@@ -1429,6 +1448,23 @@ fn metadata_only_signal(
         raw = raw.with_attribute(key, value);
     }
     raw
+}
+
+fn credential_scan_unavailable_signal(
+    clock: &HlcClock,
+    channel: TeeChannel,
+    attributes: Vec<(&'static str, String)>,
+    wire_bytes: u64,
+    truncated: bool,
+) -> RawSignal {
+    metadata_only_signal(
+        clock,
+        channel,
+        attributes,
+        REDACTION_UNAVAILABLE_OMISSION,
+        wire_bytes,
+        truncated,
+    )
 }
 
 /// Builds a request signal: offloaded (empty body + `payload_ref`) when the blob
@@ -1954,6 +1990,43 @@ mod tests {
         fn assert_source<T: crate::seams::Source>() {}
 
         assert_source::<ProxySource>();
+    }
+
+    #[test]
+    fn credential_scan_failure_emits_only_a_content_free_omission_receipt() {
+        let signal = credential_scan_unavailable_signal(
+            &HlcClock::new(),
+            RESPONSE_TEE,
+            vec![("http.status_code", "200".to_owned())],
+            4096,
+            true,
+        );
+
+        assert_eq!(signal.kind, RESPONSE_KIND);
+        assert!(signal.body.is_empty());
+        assert!(signal.payload_ref().is_none());
+        assert_eq!(
+            signal.attributes.get(BODY_OMITTED_ATTR).map(String::as_str),
+            Some(REDACTION_UNAVAILABLE_OMISSION)
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get("http.response.body_size")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            signal
+                .attributes
+                .get(RESPONSE_WIRE_SIZE_ATTR)
+                .map(String::as_str),
+            Some("4096")
+        );
+        assert_eq!(
+            signal.attributes.get(TRUNCATED_ATTR).map(String::as_str),
+            Some("true")
+        );
     }
 
     fn handler() -> (
@@ -4005,7 +4078,7 @@ mod tests {
     /// the request leg: each client frame reaches the upstream side while the stream
     /// is still open, and the request signal fires only at body EOF with the full
     /// captured copy.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn streaming_request_is_forwarded_incrementally_and_captured_at_eof() {
         let timeout = std::time::Duration::from_secs(5);
         let (mut handler, mut rx, _store) = handler();
@@ -4093,7 +4166,7 @@ mod tests {
     /// upstream that dies before draining the request body must not lose the request
     /// capture — the tee finalizes with what was forwarded so far, marked truncated —
     /// and the exchange still reaches its terminal abort.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn upstream_drop_mid_request_stream_finalizes_a_truncated_capture() {
         let timeout = std::time::Duration::from_secs(5);
         let (mut handler, mut rx, _store) = handler();
