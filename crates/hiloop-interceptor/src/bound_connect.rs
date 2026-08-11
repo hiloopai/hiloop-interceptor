@@ -176,7 +176,11 @@ async fn forward_bound_request(
         }
     };
     match outcome {
-        Some(Ok(response)) => Ok(handler.on_response(response.map(Body::from))),
+        Some(Ok(response)) => {
+            let (parts, body) = response.map(Body::from).into_parts();
+            let body = supervise_response_body(body, body_state);
+            Ok(handler.on_response(Response::from_parts(parts, body)))
+        }
         Some(Err(error)) => Ok(handler.on_upstream_client_error(error).await),
         None => {
             eprintln!("hiloop-interceptor: bound secret relay request timed out");
@@ -215,9 +219,6 @@ fn request_body_with_progress(
                 match frame {
                     Ok(frame) => match frame.into_data() {
                         Ok(data) if data.is_empty() => {
-                            state_tx.send_replace(RequestBodyState::Progress(
-                                tokio::time::Instant::now(),
-                            ));
                             return Some((
                                 Ok(hudsucker::hyper::body::Frame::data(data)),
                                 (frames, pending, state_tx),
@@ -239,6 +240,110 @@ fn request_body_with_progress(
         },
     );
     (Body::from(StreamBody::new(frames)), state_rx)
+}
+
+fn supervise_response_body(
+    body: Body,
+    mut body_state: tokio::sync::watch::Receiver<RequestBodyState>,
+) -> Body {
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(1);
+    let (timeout_tx, timeout_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let mut frames = BodyStream::new(body);
+        let mut pending = None;
+        loop {
+            let state = *body_state.borrow_and_update();
+            if matches!(state, RequestBodyState::Complete) {
+                if let Some(frame) = pending.take()
+                    && frame_tx.send(frame).await.is_err()
+                {
+                    return;
+                }
+                while let Some(frame) = frames.next().await {
+                    if frame_tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+                return;
+            }
+            let RequestBodyState::Progress(at) = state else {
+                unreachable!("complete request bodies are handled above")
+            };
+            let deadline = at + RELAY_REQUEST_BODY_IDLE_TIMEOUT;
+            tokio::select! {
+                biased;
+                changed = body_state.changed() => {
+                    if changed.is_err() {
+                        while let Some(frame) = frames.next().await {
+                            if frame_tx.send(frame).await.is_err() {
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                }
+                permit = frame_tx.reserve(), if pending.is_some() => {
+                    let Ok(permit) = permit else {
+                        return;
+                    };
+                    permit.send(pending.take().expect("guarded response frame"));
+                }
+                frame = frames.next(), if pending.is_none() => {
+                    let Some(frame) = frame else {
+                        eprintln!("hiloop-interceptor: bound secret relay ended its response before upload completion");
+                        timeout_tx.send_replace(true);
+                        return;
+                    };
+                    pending = Some(frame);
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    eprintln!("hiloop-interceptor: bound secret relay upload timed out");
+                    timeout_tx.send_replace(true);
+                    return;
+                }
+            }
+        }
+    });
+    let frames = futures_util::stream::unfold(
+        (
+            tokio_stream::wrappers::ReceiverStream::new(frame_rx),
+            timeout_rx,
+            true,
+            false,
+        ),
+        |(mut frames, mut timeout, mut timeout_open, done)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                if *timeout.borrow_and_update() {
+                    let error = hudsucker::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "bound relay upload timed out",
+                    ));
+                    return Some((Err(error), (frames, timeout, timeout_open, true)));
+                }
+                if !timeout_open {
+                    return frames
+                        .next()
+                        .await
+                        .map(|frame| (frame, (frames, timeout, false, false)));
+                }
+                tokio::select! {
+                    biased;
+                    changed = timeout.changed() => {
+                        if changed.is_err() {
+                            timeout_open = false;
+                        }
+                    }
+                    frame = frames.next() => {
+                        return frame.map(|frame| (frame, (frames, timeout, timeout_open, false)));
+                    }
+                }
+            }
+        },
+    );
+    Body::from(StreamBody::new(frames))
 }
 
 fn forbidden() -> Response<Body> {
