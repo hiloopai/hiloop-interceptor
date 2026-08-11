@@ -67,9 +67,14 @@ use thiserror::Error;
 
 use crate::anomaly::{AnomalyConfig, AnomalyFlag, BodyScan};
 use crate::blob::BlobStore;
-use crate::capture_policy::{CaptureDisposition, capture_disposition};
+use crate::bound_connect::BoundConnectTransport;
+use crate::capture_policy::{CaptureDisposition, SensitiveExchange, capture_disposition};
 use crate::egress::{CanonicalHost, Destination, EgressPolicy, canonicalize_host};
 use crate::redact::RedactionPolicy;
+use crate::relay::{
+    FixedTlsRelayConfig, RelayConfigError, RelayRoute, RelayRoutingConnector, SecretEgressDenial,
+    connect_has_ambiguous_authority, is_ca_certificate, scrub_private_trailers,
+};
 use crate::seams::{
     NormalizationContext, NormalizationOutcome, NormalizeError, Normalizer, NormalizerDescriptor,
     NormalizerSupport, RawSignal, RawSignalSink, ShutdownSignal, Source, SourceError,
@@ -93,6 +98,11 @@ pub(crate) const PROXY_SOURCE: &str = "proxy";
 const REQUEST_KIND: &str = "http.request";
 const RESPONSE_KIND: &str = "http.response";
 const EGRESS_DENIED_KIND: &str = "egress.denied";
+const SECRET_EGRESS_DENIED_KIND: &str = "secret.egress.denied";
+const SECRET_EGRESS_DENIAL_ATTR: &str = "secret.egress.denial";
+const SECRET_EGRESS_CLASS_ATTR: &str = "secret.egress.class";
+const SECRET_EGRESS_BOUND_CLASS: &str = "bound";
+const HTTP_STATUS_CLASS_ATTR: &str = "http.status_class";
 /// Terminal event for an exchange that ended without a response: it shares the
 /// request's `http.exchange_id` and names why the exchange never completed
 /// ([`ABORT_REASON_ATTR`]), so a captured request can never dangle ambiguously.
@@ -158,7 +168,7 @@ pub enum ProxyError {
 /// The CA private key stays in memory inside the proxy authority; only the
 /// public cert PEM is exposed, to be written to a child-scoped trust bundle.
 pub struct ProxyCa {
-    authority: ProxyAuthority,
+    authority: Arc<ProxyAuthority>,
     cert_pem: String,
 }
 
@@ -186,7 +196,7 @@ impl ProxyCa {
         let issuer = Issuer::from_ca_cert_pem(&cert_pem, issuer_key)
             .map_err(|error| ProxyError::Ca(error.to_string()))?;
 
-        let authority = ProxyAuthority::new(issuer, aws_lc_rs::default_provider());
+        let authority = Arc::new(ProxyAuthority::new(issuer, aws_lc_rs::default_provider()));
         Ok(Self {
             authority,
             cert_pem,
@@ -208,12 +218,15 @@ impl ProxyCa {
     }
 }
 
-struct ProxyAuthority {
+pub(crate) struct ProxyAuthority {
     issuer: Issuer<'static, KeyPair>,
     private_key: PrivateKeyDer<'static>,
     cache: Mutex<HashMap<Authority, Arc<ServerConfig>>>,
     provider: Arc<CryptoProvider>,
 }
+
+#[derive(Clone)]
+struct SharedProxyAuthority(Arc<ProxyAuthority>);
 
 impl ProxyAuthority {
     fn new(issuer: Issuer<'static, KeyPair>, provider: CryptoProvider) -> Self {
@@ -295,6 +308,12 @@ impl CertificateAuthority for ProxyAuthority {
     }
 }
 
+impl CertificateAuthority for SharedProxyAuthority {
+    async fn gen_server_config(&self, authority: &Authority) -> Arc<ServerConfig> {
+        self.0.gen_server_config(authority).await
+    }
+}
+
 /// Trust anchors for the proxy's upstream TLS client: the compiled-in webpki public
 /// roots, unioned with `extra_trust_anchors`.
 ///
@@ -342,18 +361,6 @@ fn upstream_root_store(extra_trust_anchors: &[CertificateDer<'static>]) -> RootC
 /// `KeyUsage` extension is present, `keyCertSign`. Trust-anchor construction must
 /// check this itself — `RootCertStore::add` does not, and an anchor is trusted
 /// directly, so an end-entity certificate added there would verify itself.
-fn is_ca_certificate(anchor: &CertificateDer<'_>) -> bool {
-    let Ok((_, cert)) = x509_parser::parse_x509_certificate(anchor.as_ref()) else {
-        return false;
-    };
-    let key_cert_sign = match cert.key_usage() {
-        Ok(Some(key_usage)) => key_usage.value.key_cert_sign(),
-        Ok(None) => true,
-        Err(_) => false,
-    };
-    cert.is_ca() && key_cert_sign
-}
-
 /// Build the rustls config for the proxy's upstream TLS client from
 /// [`upstream_root_store`], on the same `aws-lc-rs` provider as the rest of the
 /// proxy.
@@ -405,20 +412,25 @@ impl ProxyServer {
             config.redaction,
             config.egress,
             config.anomaly,
-        );
+        )
+        .with_bound_https_relay(config.bound_https_relay.clone());
         // Mirrors hudsucker's `with_rustls_connector` (HTTPS-or-HTTP, http1+http2 ALPN
         // on the HTTP connector, the un-ALPN'd config on the websocket connector),
         // except the root store is [`upstream_root_store`] instead of webpki-only.
         let tls_config = upstream_client_config(&config.upstream_extra_trust_anchors)?;
-        let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config.clone())
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
+        let https_connector =
+            RelayRoutingConnector::new(tls_config.clone(), config.bound_https_relay.clone())
+                .map_err(|error| ProxyError::Server(error.to_string()))?;
+        let bound_connect = config.bound_https_relay.as_ref().map(|_| {
+            Arc::new(BoundConnectTransport::new(
+                Arc::clone(&ca.authority),
+                https_connector.clone(),
+            ))
+        });
+        let handler = handler.with_bound_connect(bound_connect);
         let proxy = Proxy::builder()
             .with_listener(self.listener)
-            .with_ca(ca.authority)
+            .with_ca(SharedProxyAuthority(ca.authority))
             .with_http_connector(https_connector)
             .with_websocket_connector(Connector::Rustls(Arc::new(tls_config)))
             .with_http_handler(handler)
@@ -440,6 +452,7 @@ pub struct ProxySourceConfig {
     egress: Arc<EgressPolicy>,
     anomaly: Arc<AnomalyConfig>,
     upstream_extra_trust_anchors: Vec<CertificateDer<'static>>,
+    bound_https_relay: Option<FixedTlsRelayConfig>,
 }
 
 impl ProxySourceConfig {
@@ -452,6 +465,7 @@ impl ProxySourceConfig {
             egress: Arc::new(EgressPolicy::default()),
             anomaly: Arc::new(AnomalyConfig::default()),
             upstream_extra_trust_anchors: Vec::new(),
+            bound_https_relay: None,
         }
     }
 
@@ -488,6 +502,21 @@ impl ProxySourceConfig {
     pub fn with_upstream_trust_anchors(mut self, anchors: Vec<CertificateDer<'static>>) -> Self {
         self.upstream_extra_trust_anchors = anchors;
         self
+    }
+
+    /// Route exact bound HTTPS destinations through one proof-bound fixed TLS relay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayConfigError`] if the relay TLS connector cannot be built from
+    /// the validated endpoint, identity, and trust roots.
+    pub fn with_bound_https_relay(
+        mut self,
+        relay: FixedTlsRelayConfig,
+    ) -> Result<Self, RelayConfigError> {
+        relay.validate_connector()?;
+        self.bound_https_relay = Some(relay);
+        Ok(self)
     }
 }
 
@@ -592,9 +621,12 @@ pub(crate) struct CaptureHandler {
     /// Request-body anomaly detection run over the original request body (not the
     /// truncated/redacted captured copy). Disabled by default (a no-op).
     anomaly: Arc<AnomalyConfig>,
+    bound_https_relay: Option<FixedTlsRelayConfig>,
+    bound_connect: Option<Arc<BoundConnectTransport>>,
     /// The canonicalized host from this clone's CONNECT (the SNI host), stashed so the
     /// decrypted request can reject a `Host`/`:authority` that disagrees with it.
     connect_host: Option<CanonicalHost>,
+    connect_destination: Option<Destination>,
     /// Exchange id for the request currently being handled by this clone,
     /// minted in `on_request` and read back in `on_response`.
     exchange_id: Option<String>,
@@ -633,7 +665,10 @@ impl CaptureHandler {
             redaction,
             egress,
             anomaly,
+            bound_https_relay: None,
+            bound_connect: None,
             connect_host: None,
+            connect_destination: None,
             exchange_id: None,
             exchange_host: None,
             exchange_method: None,
@@ -648,6 +683,16 @@ impl CaptureHandler {
         self
     }
 
+    fn with_bound_https_relay(mut self, relay: Option<FixedTlsRelayConfig>) -> Self {
+        self.bound_https_relay = relay;
+        self
+    }
+
+    fn with_bound_connect(mut self, transport: Option<Arc<BoundConnectTransport>>) -> Self {
+        self.bound_connect = transport;
+        self
+    }
+
     /// Enforces egress before capture: a CONNECT
     /// to a denied host short-circuits with `403` before any tunnel is established; a
     /// decrypted request to a denied host (or one whose `Host` disagrees with the
@@ -658,12 +703,39 @@ impl CaptureHandler {
         // interception. Capture nothing here, but enforce egress on the SNI host and
         // stash it so the decrypted request can detect a Host/SNI mismatch.
         if request.method() == Method::CONNECT {
+            if self.connect_destination.is_some()
+                && self.bound_https_relay.as_ref().is_some_and(|relay| {
+                    self.connect_destination
+                        .as_ref()
+                        .is_some_and(|destination| {
+                            relay.route_connect(destination) == RelayRoute::Bound
+                        })
+                        || canonical_authority(&request)
+                            .is_some_and(|destination| relay.contains_host(destination.host()))
+                        || relay.request_mentions_bound_host(&request)
+                })
+            {
+                self.emit_secret_egress_denied_without_host(SecretEgressDenial::NestedConnect);
+                return forbidden().into();
+            }
             match canonical_authority(&request) {
                 Some(destination) => {
+                    if self.bound_https_relay.as_ref().is_some_and(|relay| {
+                        relay.route_connect(&destination) == RelayRoute::Denied
+                            || (relay.route_connect(&destination) == RelayRoute::Bound
+                                && connect_has_ambiguous_authority(&request, &destination))
+                    }) {
+                        self.emit_secret_egress_denied(
+                            &destination,
+                            SecretEgressDenial::InvalidConnectAuthority,
+                        );
+                        return forbidden().into();
+                    }
                     if let Some(denied) = self.enforce_egress(&destination, "connect") {
                         return denied.into();
                     }
                     self.connect_host = Some(destination.host().clone());
+                    self.connect_destination = Some(destination);
                 }
                 None => {
                     // An un-parseable CONNECT authority can't be policed; under a
@@ -684,6 +756,18 @@ impl CaptureHandler {
         // (missing, or crafted to defeat the parser) must be DENIED, never forwarded —
         // otherwise an unparseable host would skip the deny-by-default policy entirely.
         let Some(destination) = destination else {
+            if self.bound_https_relay.as_ref().is_some_and(|relay| {
+                relay.request_mentions_bound_host(&request)
+                    || self
+                        .connect_destination
+                        .as_ref()
+                        .is_some_and(|destination| {
+                            relay.route_connect(destination) == RelayRoute::Bound
+                        })
+            }) {
+                self.emit_secret_egress_denied_without_host(SecretEgressDenial::AmbiguousAuthority);
+                return forbidden().into();
+            }
             if self.egress.is_allow_all() {
                 // No policy to enforce; capture and forward as before.
                 return self.capture_request(request).await;
@@ -706,7 +790,79 @@ impl CaptureHandler {
             return denied.into();
         }
 
+        if let Some(relay) = &self.bound_https_relay {
+            match relay.route_destination(request.uri().scheme_str(), &destination) {
+                RelayRoute::Bound => {
+                    return self.prepare_bound_request(request, &destination).await;
+                }
+                RelayRoute::Denied => {
+                    self.emit_secret_egress_denied(
+                        &destination,
+                        SecretEgressDenial::InvalidDestination,
+                    );
+                    return forbidden().into();
+                }
+                RelayRoute::Direct if relay.request_mentions_bound_host(&request) => {
+                    self.emit_secret_egress_denied(
+                        &destination,
+                        SecretEgressDenial::AmbiguousAuthority,
+                    );
+                    return forbidden().into();
+                }
+                RelayRoute::Direct => {}
+            }
+        }
+
         self.capture_request(request).await
+    }
+
+    async fn prepare_bound_request(
+        &mut self,
+        mut request: Request<Body>,
+        destination: &Destination,
+    ) -> RequestOrResponse {
+        let Some(relay) = &self.bound_https_relay else {
+            return forbidden().into();
+        };
+        let prepared = relay
+            .prepare_request(&mut request, self.connect_destination.as_ref(), destination)
+            .await;
+        if let Err(denial) = prepared {
+            self.emit_secret_egress_denied(destination, denial);
+            return if denial.proof_unavailable() {
+                bad_gateway().into()
+            } else {
+                forbidden().into()
+            };
+        }
+        let (parts, body) = request.into_parts();
+        let request = Request::from_parts(parts, scrub_private_trailers(body));
+        self.exchange_disposition =
+            CaptureDisposition::MetadataOnly(SensitiveExchange::BoundSecret);
+        self.capture_request(request).await
+    }
+
+    fn emit_secret_egress_denied(&self, destination: &Destination, denial: SecretEgressDenial) {
+        let raw = RawSignal::new(
+            PROXY_SOURCE,
+            SECRET_EGRESS_DENIED_KIND,
+            self.clock.tick(),
+            Bytes::new(),
+        )
+        .with_attribute(SECRET_EGRESS_DENIAL_ATTR, denial.as_str())
+        .with_attribute("http.host", destination.host_str());
+        let _ = self.sink.try_send(raw);
+    }
+
+    fn emit_secret_egress_denied_without_host(&self, denial: SecretEgressDenial) {
+        let raw = RawSignal::new(
+            PROXY_SOURCE,
+            SECRET_EGRESS_DENIED_KIND,
+            self.clock.tick(),
+            Bytes::new(),
+        )
+        .with_attribute(SECRET_EGRESS_DENIAL_ATTR, denial.as_str());
+        let _ = self.sink.try_send(raw);
     }
 
     /// Capture and forward a request after its egress checks pass.
@@ -737,35 +893,55 @@ impl CaptureHandler {
 
         let (parts, body) = request.into_parts();
 
-        let content_type = header_str(&parts.headers, &CONTENT_TYPE);
+        let bound = matches!(
+            self.exchange_disposition,
+            CaptureDisposition::MetadataOnly(SensitiveExchange::BoundSecret)
+        );
+        let content_type = (!bound)
+            .then(|| header_str(&parts.headers, &CONTENT_TYPE))
+            .flatten();
         let method = parts.method.as_str().to_owned();
         let host = request_host(&parts.uri, &parts.headers).map(|host| telemetry_host(&host));
-        let disposition = capture_disposition(&method, host.as_deref(), parts.uri.path());
+        let disposition = if bound {
+            CaptureDisposition::MetadataOnly(SensitiveExchange::BoundSecret)
+        } else {
+            capture_disposition(&method, host.as_deref(), parts.uri.path())
+        };
         self.exchange_disposition = disposition;
         let target = match disposition {
-            CaptureDisposition::Full => telemetry_target(&parts.uri),
-            CaptureDisposition::MetadataOnly(_) => metadata_only_telemetry_target(&parts.uri),
+            CaptureDisposition::Full => Some(telemetry_target(&parts.uri)),
+            CaptureDisposition::MetadataOnly(SensitiveExchange::OAuthToken) => {
+                Some(metadata_only_telemetry_target(&parts.uri))
+            }
+            CaptureDisposition::MetadataOnly(SensitiveExchange::BoundSecret) => None,
         };
         self.exchange_method = Some(method.clone());
-        self.exchange_target = Some(target.clone());
+        self.exchange_target.clone_from(&target);
         self.exchange_host.clone_from(&host);
 
         let mut attributes = vec![
             (EXCHANGE_ID_ATTR, exchange_id),
             ("http.method", method.clone()),
-            ("http.target", target),
         ];
-        if let Some(encoding) = header_str(&parts.headers, &CONTENT_ENCODING) {
+        if let Some(target) = target {
+            attributes.push(("http.target", target));
+        }
+        if !bound && let Some(encoding) = header_str(&parts.headers, &CONTENT_ENCODING) {
             attributes.push((REQUEST_CONTENT_ENCODING_ATTR, encoding));
         }
         if let Some(host) = &host {
             attributes.push(("http.host", host.clone()));
         }
-        if let Some(content_type) = &content_type {
+        if bound {
+            attributes.push((
+                SECRET_EGRESS_CLASS_ATTR,
+                SECRET_EGRESS_BOUND_CLASS.to_owned(),
+            ));
+        } else if let Some(content_type) = &content_type {
             attributes.push(("http.request.content_type", content_type.clone()));
         }
 
-        let buffers_for_anomaly = self.anomaly.blocks_on_match();
+        let buffers_for_anomaly = !bound && self.anomaly.blocks_on_match();
         if buffers_for_anomaly || body.is_end_stream() {
             return self
                 .capture_request_buffered(parts, body, attributes, content_type)
@@ -774,7 +950,7 @@ impl CaptureHandler {
 
         // The scan observes every forwarded byte — past the capture cap — so a capped
         // capture cannot hide a large upload from (audit-mode) anomaly evaluation.
-        let inspection = self.anomaly.is_enabled().then(|| RequestBodyInspection {
+        let inspection = (!bound && self.anomaly.is_enabled()).then(|| RequestBodyInspection {
             config: Arc::clone(&self.anomaly),
             method,
             scan: BodyScan::default(),
@@ -803,6 +979,11 @@ impl CaptureHandler {
         let (bytes, mut truncated) = collect_body(body).await;
 
         if let CaptureDisposition::MetadataOnly(sensitive) = self.exchange_disposition {
+            if sensitive == SensitiveExchange::BoundSecret {
+                let raw = bound_metadata_signal(&self.clock, REQUEST_TEE, attributes);
+                let _ = self.sink.send(raw).await;
+                return Request::from_parts(parts, Body::from(bytes)).into();
+            }
             let flags =
                 self.anomaly
                     .inspect(parts.method.as_str(), content_type.as_deref(), &bytes);
@@ -918,6 +1099,10 @@ impl CaptureHandler {
     /// Build the terminal `http.abort` signal for the currently open exchange (if
     /// any), consuming the exchange state so the terminal is emitted exactly once.
     fn take_abort_signal(&mut self, reason: &str, detail: Option<String>) -> Option<RawSignal> {
+        let bound = matches!(
+            self.exchange_disposition,
+            CaptureDisposition::MetadataOnly(SensitiveExchange::BoundSecret)
+        );
         let exchange_id = self.exchange_id.take()?;
         let mut raw = RawSignal::new(PROXY_SOURCE, ABORT_KIND, self.clock.tick(), Bytes::new())
             .with_attribute(EXCHANGE_ID_ATTR, exchange_id)
@@ -931,7 +1116,7 @@ impl CaptureHandler {
         if let Some(target) = self.exchange_target.take() {
             raw = raw.with_attribute("http.target", target);
         }
-        if let Some(detail) = detail {
+        if let Some(detail) = detail.filter(|_| !bound) {
             raw = raw.with_attribute(ABORT_DETAIL_ATTR, detail);
         }
         Some(raw)
@@ -941,7 +1126,7 @@ impl CaptureHandler {
     /// hudsucker calls `handle_error` instead of `handle_response` there, so
     /// without this the request event would dangle with no terminal record.
     /// Inherent (not the trait method) to stay testable without an `HttpContext`.
-    async fn on_upstream_error(&mut self, reason: &'static str, detail: String) {
+    pub(crate) async fn on_upstream_error(&mut self, reason: &'static str, detail: String) {
         if let Some(raw) = self.take_abort_signal(reason, Some(detail)) {
             let _ = self.sink.send(raw).await;
         }
@@ -1015,8 +1200,24 @@ impl CaptureHandler {
     pub(crate) fn on_response(&mut self, response: Response<Body>) -> Response<Body> {
         let (parts, body) = response.into_parts();
 
-        let content_type = header_str(&parts.headers, &CONTENT_TYPE);
-        let mut attributes = vec![("http.status_code", parts.status.as_u16().to_string())];
+        let bound = matches!(
+            self.exchange_disposition,
+            CaptureDisposition::MetadataOnly(SensitiveExchange::BoundSecret)
+        );
+        let content_type = (!bound)
+            .then(|| header_str(&parts.headers, &CONTENT_TYPE))
+            .flatten();
+        let mut attributes = if bound {
+            vec![
+                (HTTP_STATUS_CLASS_ATTR, status_class(parts.status)),
+                (
+                    SECRET_EGRESS_CLASS_ATTR,
+                    SECRET_EGRESS_BOUND_CLASS.to_owned(),
+                ),
+            ]
+        } else {
+            vec![("http.status_code", parts.status.as_u16().to_string())]
+        };
         if let Some(exchange_id) = self.exchange_id.take() {
             attributes.push((EXCHANGE_ID_ATTR, exchange_id));
         }
@@ -1026,7 +1227,7 @@ impl CaptureHandler {
         if let Some(content_type) = &content_type {
             attributes.push(("http.response.content_type", content_type.clone()));
         }
-        if let Some(encoding) = header_str(&parts.headers, &CONTENT_ENCODING) {
+        if !bound && let Some(encoding) = header_str(&parts.headers, &CONTENT_ENCODING) {
             attributes.push((RESPONSE_CONTENT_ENCODING_ATTR, encoding));
         }
 
@@ -1038,7 +1239,14 @@ impl CaptureHandler {
         &mut self,
         error: hudsucker::hyper_util::client::legacy::Error,
     ) -> Response<Body> {
-        eprintln!("hiloop-interceptor: proxy upstream request failed: {error:#}");
+        if matches!(
+            self.exchange_disposition,
+            CaptureDisposition::MetadataOnly(SensitiveExchange::BoundSecret)
+        ) {
+            eprintln!("hiloop-interceptor: bound secret relay request failed");
+        } else {
+            eprintln!("hiloop-interceptor: proxy upstream request failed: {error:#}");
+        }
         let reason = if error.is_connect() {
             "upstream_connect_error"
         } else {
@@ -1374,6 +1582,10 @@ async fn finalize_tee(args: FinalizeTee<'_>) -> RawSignal {
         attributes.push(flag);
     }
 
+    if let CaptureDisposition::MetadataOnly(SensitiveExchange::BoundSecret) = disposition {
+        return bound_metadata_signal(clock, channel, attributes);
+    }
+
     if let CaptureDisposition::MetadataOnly(sensitive) = disposition {
         return metadata_only_signal(
             clock,
@@ -1465,6 +1677,18 @@ fn credential_scan_unavailable_signal(
         wire_bytes,
         truncated,
     )
+}
+
+fn bound_metadata_signal(
+    clock: &HlcClock,
+    channel: TeeChannel,
+    attributes: Vec<(&'static str, String)>,
+) -> RawSignal {
+    let mut raw = RawSignal::new(PROXY_SOURCE, channel.kind, clock.tick(), Bytes::new());
+    for (key, value) in attributes {
+        raw = raw.with_attribute(key, value);
+    }
+    raw
 }
 
 /// Builds a request signal: offloaded (empty body + `payload_ref`) when the blob
@@ -1569,7 +1793,30 @@ impl HttpHandler for CaptureHandler {
         _ctx: &HttpContext,
         request: Request<Body>,
     ) -> RequestOrResponse {
-        self.on_request(request).await
+        let selected_connect = request.method() == Method::CONNECT
+            && canonical_authority(&request).is_some_and(|destination| {
+                self.bound_https_relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.route_connect(&destination) == RelayRoute::Bound)
+            });
+        if !selected_connect {
+            return self.on_request(request).await;
+        }
+
+        match self.on_request(request).await {
+            RequestOrResponse::Response(response) => response.into(),
+            RequestOrResponse::Request(mut connect) => {
+                let Some(authority) = connect.uri().authority().cloned() else {
+                    return forbidden().into();
+                };
+                let Some(transport) = self.bound_connect.clone() else {
+                    return bad_gateway().into();
+                };
+                let upgrade = hudsucker::hyper::upgrade::on(&mut connect);
+                transport.spawn(upgrade, authority, self.clone());
+                Response::new(Body::empty()).into()
+            }
+        }
     }
 
     async fn handle_response(
@@ -1653,8 +1900,8 @@ fn metadata_only_telemetry_target(uri: &hudsucker::hyper::Uri) -> String {
 }
 
 /// Canonicalize a request's destination authority — the CONNECT authority for a
-/// CONNECT, otherwise the URI host or `Host` header. `None` when no host is present or
-/// it fails canonicalization.
+/// CONNECT, otherwise the URI authority or `Host` header. `None` when no host is
+/// present or it fails canonicalization.
 fn canonical_authority(request: &Request<Body>) -> Option<Destination> {
     let raw = if request.method() == Method::CONNECT {
         request
@@ -1668,12 +1915,16 @@ fn canonical_authority(request: &Request<Body>) -> Option<Destination> {
     canonicalize_host(&raw).ok()
 }
 
+fn status_class(status: StatusCode) -> String {
+    format!("{}xx", status.as_u16() / 100)
+}
+
 fn request_host(
     uri: &hudsucker::hyper::Uri,
     headers: &hudsucker::hyper::HeaderMap,
 ) -> Option<String> {
-    uri.host()
-        .map(ToOwned::to_owned)
+    uri.authority()
+        .map(|authority| authority.as_str().to_owned())
         .or_else(|| header_str(headers, &HOST))
 }
 
@@ -1926,7 +2177,11 @@ impl Normalizer for ProxyNormalizer {
         if raw.source == PROXY_SOURCE
             && matches!(
                 raw.kind.as_str(),
-                REQUEST_KIND | RESPONSE_KIND | ABORT_KIND | EGRESS_DENIED_KIND
+                REQUEST_KIND
+                    | RESPONSE_KIND
+                    | ABORT_KIND
+                    | EGRESS_DENIED_KIND
+                    | SECRET_EGRESS_DENIED_KIND
             )
         {
             NormalizerSupport::Exact
@@ -1984,6 +2239,8 @@ mod tests {
     use hiloop_core::event::{AttributeValue, PayloadDigest};
     use hiloop_core::identity::{Hlc, RunContext};
     use hudsucker::hyper::body::Frame;
+
+    mod relay_tests;
 
     #[test]
     fn configured_proxy_is_a_capture_session_source() {
