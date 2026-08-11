@@ -858,6 +858,47 @@ async fn response_blackhole_relay(relay_ca: &ProxyCa) -> (SocketAddr, mpsc::Rece
     (addr, request_rx)
 }
 
+async fn h1_keepalive_relay(relay_ca: &ProxyCa) -> (SocketAddr, mpsc::Receiver<()>) {
+    use hyper_util::rt::TokioIo;
+
+    let leaf = relay_ca
+        .authority
+        .gen_cert(&Authority::from_static("secret-egress.test"));
+    let mut server_cfg =
+        ServerConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("server versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf], relay_ca.authority.private_key.clone_key())
+            .expect("server cert");
+    server_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind relay");
+    let addr = listener.local_addr().expect("relay address");
+    let (accept_tx, accept_rx) = mpsc::channel(2);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let _ = accept_tx.send(()).await;
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(|_request| async {
+                    Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .keep_alive(true)
+                    .serve_connection(TokioIo::new(tls), service)
+                    .await;
+            });
+        }
+    });
+    (addr, accept_rx)
+}
+
 #[derive(Clone, Copy)]
 enum EarlyResponse {
     Pending { read_first_data: bool },
@@ -1229,6 +1270,49 @@ async fn relay_response_header_blackhole_has_a_fixed_deadline() {
             .status(),
         StatusCode::BAD_GATEWAY
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_h1_relay_connections_are_evicted_on_a_fixed_deadline() {
+    let relay_ca = ProxyCa::generate().expect("relay CA");
+    let (relay_addr, mut accepts) = h1_keepalive_relay(&relay_ca).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_file = dir.path().join("proof");
+    tokio::fs::write(&proof_file, b"proof")
+        .await
+        .expect("proof");
+    let relay = FixedTlsRelayConfig::new(
+        relay_addr,
+        "secret-egress.test",
+        vec![ca_trust_anchor(&relay_ca)],
+        proof_file,
+        [BoundHttpsSelector::new("api.example.com").expect("selector")],
+    )
+    .expect("relay config");
+    let (proxy_addr, proxy_ca, _signals, _store) = spawn_bound_proxy(relay).await;
+
+    for path in ["first", "after-idle"] {
+        let response = h1_request_through_proxy(
+            proxy_addr,
+            &proxy_ca,
+            "api.example.com:443",
+            &format!("/{path}"),
+            "api.example.com:443",
+        )
+        .await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        tokio::time::timeout(Duration::from_secs(1), accepts.recv())
+            .await
+            .expect("fresh relay connection deadline")
+            .expect("relay connection");
+        if path == "first" {
+            tokio::time::advance(
+                crate::bound_connect::RELAY_POOL_IDLE_TIMEOUT + Duration::from_millis(1),
+            )
+            .await;
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]

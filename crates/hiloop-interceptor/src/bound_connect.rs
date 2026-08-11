@@ -11,7 +11,7 @@ use hudsucker::{
     hyper::{Request, Response, StatusCode, Uri, http::uri::Authority, service::service_fn},
     hyper_util::{
         client::legacy::Client,
-        rt::{TokioExecutor, TokioIo},
+        rt::{TokioExecutor, TokioIo, TokioTimer},
         server::conn::auto::Builder as ServerBuilder,
     },
 };
@@ -26,7 +26,9 @@ use crate::{
 pub(crate) const TLS_CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const RELAY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const RELAY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const RELAY_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_BODY_PROGRESS_CHUNK_BYTES: usize = 16 * 1024;
+const RELAY_POOL_MAX_IDLE_PER_HOST: usize = 1;
 
 #[derive(Clone, Copy)]
 enum RequestBodyState {
@@ -46,7 +48,10 @@ impl BoundConnectTransport {
         let mut client_builder = Client::builder(TokioExecutor::new());
         client_builder
             .http1_title_case_headers(true)
-            .http1_preserve_header_case(true);
+            .http1_preserve_header_case(true)
+            .pool_timer(TokioTimer::new())
+            .pool_idle_timeout(RELAY_POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(RELAY_POOL_MAX_IDLE_PER_HOST);
         let mut server = ServerBuilder::new(TokioExecutor::new());
         server
             .http1()
@@ -152,16 +157,22 @@ async fn forward_bound_request(
     let (parts, body) = request.into_parts();
     let (body, mut body_state, request_abort) = request_body_with_progress(body);
     let mut response = Box::pin(client.request(Request::from_parts(parts, body)));
+    let deadline = tokio::time::sleep(RELAY_REQUEST_BODY_IDLE_TIMEOUT);
+    tokio::pin!(deadline);
     let outcome = loop {
         let state = *body_state.borrow_and_update();
-        let deadline = match state {
-            RequestBodyState::Progress(at) => at + RELAY_REQUEST_BODY_IDLE_TIMEOUT,
+        match state {
+            RequestBodyState::Progress(at) => {
+                deadline
+                    .as_mut()
+                    .reset(at + RELAY_REQUEST_BODY_IDLE_TIMEOUT);
+            }
             RequestBodyState::Complete => {
                 break tokio::time::timeout(RELAY_RESPONSE_HEADER_TIMEOUT, &mut response)
                     .await
                     .ok();
             }
-        };
+        }
         tokio::select! {
             biased;
             result = &mut response => break Some(result),
@@ -172,7 +183,7 @@ async fn forward_bound_request(
                         .ok();
                 }
             }
-            () = tokio::time::sleep_until(deadline) => break None,
+            () = &mut deadline => break None,
         }
     };
     match outcome {
@@ -286,6 +297,8 @@ fn supervise_response_body(
     tokio::spawn(async move {
         let mut frames = BodyStream::new(body);
         let mut pending = None;
+        let deadline = tokio::time::sleep(RELAY_REQUEST_BODY_IDLE_TIMEOUT);
+        tokio::pin!(deadline);
         loop {
             let state = *body_state.borrow_and_update();
             if matches!(state, RequestBodyState::Complete) {
@@ -300,7 +313,9 @@ fn supervise_response_body(
             let RequestBodyState::Progress(at) = state else {
                 unreachable!("complete request bodies are handled above")
             };
-            let deadline = at + RELAY_REQUEST_BODY_IDLE_TIMEOUT;
+            deadline
+                .as_mut()
+                .reset(at + RELAY_REQUEST_BODY_IDLE_TIMEOUT);
             tokio::select! {
                 biased;
                 () = frame_tx.closed() => {
@@ -334,7 +349,7 @@ fn supervise_response_body(
                         }
                     }
                 }
-                () = tokio::time::sleep_until(deadline) => {
+                () = &mut deadline => {
                     eprintln!("hiloop-interceptor: bound secret relay upload timed out");
                     request_abort.abort();
                     timeout_tx.send_replace(true);
