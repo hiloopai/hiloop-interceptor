@@ -2,7 +2,6 @@
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
-use bytes::Bytes;
 use futures_util::StreamExt as _;
 use http_body_util::{BodyStream, StreamBody};
 use hudsucker::{
@@ -150,7 +149,7 @@ async fn forward_bound_request(
         RequestOrResponse::Response(response) => return Ok(response),
     };
     let (parts, body) = request.into_parts();
-    let (body, mut body_state) = request_body_with_progress(body);
+    let (body, mut body_state, request_abort) = request_body_with_progress(body);
     let mut response = Box::pin(client.request(Request::from_parts(parts, body)));
     let outcome = loop {
         let state = *body_state.borrow_and_update();
@@ -178,11 +177,15 @@ async fn forward_bound_request(
     match outcome {
         Some(Ok(response)) => {
             let (parts, body) = response.map(Body::from).into_parts();
-            let body = supervise_response_body(body, body_state);
+            let body = supervise_response_body(body, body_state, request_abort);
             Ok(handler.on_response(Response::from_parts(parts, body)))
         }
-        Some(Err(error)) => Ok(handler.on_upstream_client_error(error).await),
+        Some(Err(error)) => {
+            request_abort.abort();
+            Ok(handler.on_upstream_client_error(error).await)
+        }
         None => {
+            request_abort.abort();
             eprintln!("hiloop-interceptor: bound secret relay request timed out");
             handler
                 .on_upstream_error("upstream_error", "relay request timed out".to_owned())
@@ -194,57 +197,88 @@ async fn forward_bound_request(
 
 fn request_body_with_progress(
     body: Body,
-) -> (Body, tokio::sync::watch::Receiver<RequestBodyState>) {
+) -> (
+    Body,
+    tokio::sync::watch::Receiver<RequestBodyState>,
+    tokio::task::AbortHandle,
+) {
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(1);
+    let pump = tokio::spawn(async move {
+        let mut frames = BodyStream::new(body);
+        while let Some(frame) = frames.next().await {
+            match frame {
+                Ok(frame) => match frame.into_data() {
+                    Ok(data) if data.is_empty() => {
+                        if frame_tx
+                            .send(Ok(hudsucker::hyper::body::Frame::data(data)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(mut data) => {
+                        while !data.is_empty() {
+                            let chunk =
+                                data.split_to(data.len().min(RELAY_BODY_PROGRESS_CHUNK_BYTES));
+                            if frame_tx
+                                .send(Ok(hudsucker::hyper::body::Frame::data(chunk)))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    Err(frame) => {
+                        let _ = frame_tx.send(Ok(frame)).await;
+                        return;
+                    }
+                },
+                Err(error) => {
+                    let _ = frame_tx.send(Err(error)).await;
+                    return;
+                }
+            }
+        }
+    });
+    let request_abort = pump.abort_handle();
     let (state_tx, state_rx) =
         tokio::sync::watch::channel(RequestBodyState::Progress(tokio::time::Instant::now()));
     let frames = futures_util::stream::unfold(
-        (BodyStream::new(body), None::<Bytes>, state_tx),
-        |(mut frames, mut pending, state_tx)| async move {
-            loop {
-                if let Some(mut data) = pending.take() {
-                    let chunk = data.split_to(data.len().min(RELAY_BODY_PROGRESS_CHUNK_BYTES));
-                    if !data.is_empty() {
-                        pending = Some(data);
-                    }
-                    state_tx.send_replace(RequestBodyState::Progress(tokio::time::Instant::now()));
-                    return Some((
-                        Ok(hudsucker::hyper::body::Frame::data(chunk)),
-                        (frames, pending, state_tx),
-                    ));
-                }
-                let Some(frame) = frames.next().await else {
-                    state_tx.send_replace(RequestBodyState::Complete);
-                    return None;
-                };
-                match frame {
-                    Ok(frame) => match frame.into_data() {
-                        Ok(data) if data.is_empty() => {
-                            return Some((
-                                Ok(hudsucker::hyper::body::Frame::data(data)),
-                                (frames, pending, state_tx),
-                            ));
-                        }
-                        Ok(data) => pending = Some(data),
-                        Err(frame) => {
-                            state_tx.send_replace(RequestBodyState::Complete);
-                            return Some((Ok(frame), (frames, pending, state_tx)));
-                        }
-                    },
-                    Err(error) => {
+        (
+            tokio_stream::wrappers::ReceiverStream::new(frame_rx),
+            state_tx,
+        ),
+        |(mut frames, state_tx)| async move {
+            match frames.next().await {
+                Some(Ok(frame)) => {
+                    if frame.data_ref().is_some_and(|data| !data.is_empty()) {
                         state_tx
                             .send_replace(RequestBodyState::Progress(tokio::time::Instant::now()));
-                        return Some((Err(error), (frames, pending, state_tx)));
+                    } else if frame.trailers_ref().is_some() {
+                        state_tx.send_replace(RequestBodyState::Complete);
                     }
+                    Some((Ok(frame), (frames, state_tx)))
+                }
+                Some(Err(error)) => {
+                    state_tx.send_replace(RequestBodyState::Complete);
+                    Some((Err(error), (frames, state_tx)))
+                }
+                None => {
+                    state_tx.send_replace(RequestBodyState::Complete);
+                    None
                 }
             }
         },
     );
-    (Body::from(StreamBody::new(frames)), state_rx)
+    (Body::from(StreamBody::new(frames)), state_rx, request_abort)
 }
 
 fn supervise_response_body(
     body: Body,
     mut body_state: tokio::sync::watch::Receiver<RequestBodyState>,
+    request_abort: tokio::task::AbortHandle,
 ) -> Body {
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(1);
     let (timeout_tx, timeout_rx) = tokio::sync::watch::channel(false);
@@ -274,6 +308,7 @@ fn supervise_response_body(
                 biased;
                 changed = body_state.changed() => {
                     if changed.is_err() {
+                        request_abort.abort();
                         while let Some(frame) = frames.next().await {
                             if frame_tx.send(frame).await.is_err() {
                                 return;
@@ -289,15 +324,22 @@ fn supervise_response_body(
                     permit.send(pending.take().expect("guarded response frame"));
                 }
                 frame = frames.next(), if pending.is_none() => {
-                    let Some(frame) = frame else {
-                        eprintln!("hiloop-interceptor: bound secret relay ended its response before upload completion");
-                        timeout_tx.send_replace(true);
-                        return;
-                    };
-                    pending = Some(frame);
+                    match frame {
+                        Some(Ok(frame)) => pending = Some(Ok(frame)),
+                        Some(Err(error)) => {
+                            request_abort.abort();
+                            let _ = frame_tx.send(Err(error)).await;
+                            return;
+                        }
+                        None => {
+                            request_abort.abort();
+                            return;
+                        }
+                    }
                 }
                 () = tokio::time::sleep_until(deadline) => {
                     eprintln!("hiloop-interceptor: bound secret relay upload timed out");
+                    request_abort.abort();
                     timeout_tx.send_replace(true);
                     return;
                 }

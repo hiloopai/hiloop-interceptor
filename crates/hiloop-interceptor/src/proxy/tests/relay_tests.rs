@@ -858,10 +858,22 @@ async fn response_blackhole_relay(relay_ca: &ProxyCa) -> (SocketAddr, mpsc::Rece
     (addr, request_rx)
 }
 
+#[derive(Clone, Copy)]
+enum EarlyResponse {
+    Pending { read_first_data: bool },
+    Empty,
+    Finite,
+    Reset,
+}
+
 async fn early_response_relay(
     relay_ca: &ProxyCa,
-    read_first_data: bool,
-) -> (SocketAddr, mpsc::Receiver<()>) {
+    response: EarlyResponse,
+) -> (
+    SocketAddr,
+    mpsc::Receiver<()>,
+    tokio::sync::watch::Sender<bool>,
+) {
     use hudsucker::hyper::body::Frame;
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
@@ -882,10 +894,12 @@ async fn early_response_relay(
         .expect("bind relay");
     let addr = listener.local_addr().expect("relay address");
     let (data_tx, data_rx) = mpsc::channel(1);
+    let (reset_tx, reset_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             let data_tx = data_tx.clone();
+            let reset_rx = reset_rx.clone();
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
@@ -893,24 +907,63 @@ async fn early_response_relay(
                 let service =
                     hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
                         let data_tx = data_tx.clone();
+                        let mut reset_rx = reset_rx.clone();
                         async move {
                             let mut request = BodyStream::new(request.into_body());
-                            tokio::spawn(async move {
-                                if read_first_data {
-                                    while let Some(frame) = request.next().await {
-                                        let frame = frame.expect("request frame");
-                                        if frame.data_ref().is_some_and(|data| !data.is_empty()) {
-                                            let _ = data_tx.send(()).await;
-                                            break;
+                            if let EarlyResponse::Pending { read_first_data } = response {
+                                tokio::spawn(async move {
+                                    if read_first_data {
+                                        while let Some(frame) = request.next().await {
+                                            let frame = frame.expect("request frame");
+                                            if frame.data_ref().is_some_and(|data| !data.is_empty())
+                                            {
+                                                let _ = data_tx.send(()).await;
+                                                break;
+                                            }
                                         }
                                     }
+                                    std::future::pending::<()>().await;
+                                });
+                                let body =
+                                    Body::from(StreamBody::new(futures_util::stream::pending::<
+                                        Result<Frame<Bytes>, hudsucker::Error>,
+                                    >(
+                                    )));
+                                return Ok::<_, std::convert::Infallible>(Response::new(body));
+                            }
+                            while let Some(frame) = request.next().await {
+                                let frame = frame.expect("request frame");
+                                if frame.data_ref().is_some_and(|data| !data.is_empty()) {
+                                    let _ = data_tx.send(()).await;
+                                    break;
                                 }
+                            }
+                            tokio::spawn(async move {
+                                let _request = request;
                                 std::future::pending::<()>().await;
                             });
                             let body =
-                                Body::from(StreamBody::new(futures_util::stream::pending::<
-                                    Result<Frame<Bytes>, hudsucker::Error>,
-                                >()));
+                                match response {
+                                    EarlyResponse::Empty => Body::empty(),
+                                    EarlyResponse::Finite => {
+                                        Body::from(Bytes::from_static(b"relay response"))
+                                    }
+                                    EarlyResponse::Reset => {
+                                        let frames = futures_util::stream::once(async {
+                                            Ok::<_, hudsucker::Error>(Frame::data(
+                                                Bytes::from_static(b"before reset"),
+                                            ))
+                                        })
+                                        .chain(futures_util::stream::once(async move {
+                                            reset_rx.changed().await.expect("reset trigger");
+                                            Err(hudsucker::Error::Io(std::io::Error::other(
+                                                "relay reset",
+                                            )))
+                                        }));
+                                        Body::from(StreamBody::new(frames))
+                                    }
+                                    EarlyResponse::Pending { .. } => unreachable!("handled above"),
+                                };
                             Ok::<_, std::convert::Infallible>(Response::new(body))
                         }
                     });
@@ -920,7 +973,7 @@ async fn early_response_relay(
             });
         }
     });
-    (addr, data_rx)
+    (addr, data_rx, reset_tx)
 }
 
 async fn trailer_observing_relay(
@@ -1242,7 +1295,13 @@ async fn early_response_keeps_supervising_a_later_stalled_upload() {
     use hudsucker::hyper::body::Frame;
 
     let relay_ca = ProxyCa::generate().expect("relay CA");
-    let (relay_addr, mut first_data) = early_response_relay(&relay_ca, true).await;
+    let (relay_addr, mut first_data, _reset) = early_response_relay(
+        &relay_ca,
+        EarlyResponse::Pending {
+            read_first_data: true,
+        },
+    )
+    .await;
     let dir = tempfile::tempdir().expect("tempdir");
     let proof_file = dir.path().join("proof");
     tokio::fs::write(&proof_file, b"proof")
@@ -1321,11 +1380,147 @@ async fn early_response_keeps_supervising_a_later_stalled_upload() {
 }
 
 #[tokio::test]
+async fn clean_early_response_preserves_body_and_cancels_the_upload() {
+    use hudsucker::hyper::body::Frame;
+
+    for (response_kind, expected) in [
+        (EarlyResponse::Empty, b"".as_slice()),
+        (EarlyResponse::Finite, b"relay response".as_slice()),
+    ] {
+        let relay_ca = ProxyCa::generate().expect("relay CA");
+        let (relay_addr, mut first_data, _reset) =
+            early_response_relay(&relay_ca, response_kind).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proof_file = dir.path().join("proof");
+        tokio::fs::write(&proof_file, b"proof")
+            .await
+            .expect("proof");
+        let relay = FixedTlsRelayConfig::new(
+            relay_addr,
+            "secret-egress.test",
+            vec![ca_trust_anchor(&relay_ca)],
+            proof_file,
+            [BoundHttpsSelector::new("api.example.com").expect("selector")],
+        )
+        .expect("relay config");
+        let (proxy_addr, proxy_ca, _signals, _store) = spawn_bound_proxy(relay).await;
+        let mut sender =
+            h2_client_through_proxy(proxy_addr, &proxy_ca, "api.example.com:443").await;
+        let (frames_tx, frames_rx) = mpsc::channel(2);
+        let body = Body::from(StreamBody::new(
+            tokio_stream::wrappers::ReceiverStream::new(frames_rx),
+        ));
+        let response = tokio::spawn(async move {
+            sender
+                .send_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("https://api.example.com/early-completion")
+                        .body(body)
+                        .expect("request"),
+                )
+                .await
+        });
+        frames_tx
+            .send(Ok::<_, hudsucker::Error>(Frame::data(Bytes::from_static(
+                b"first request chunk",
+            ))))
+            .await
+            .expect("first upload chunk");
+        first_data.recv().await.expect("relay reads first chunk");
+        let response = response
+            .await
+            .expect("request task")
+            .expect("early response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            drain_body(response.into_body().into()).await.concat(),
+            expected
+        );
+        tokio::time::timeout(Duration::from_secs(1), frames_tx.closed())
+            .await
+            .expect("completed response cancels unfinished request");
+    }
+}
+
+#[tokio::test]
+async fn early_response_reset_is_forwarded_and_cancels_the_upload() {
+    use hudsucker::hyper::body::Frame;
+
+    let relay_ca = ProxyCa::generate().expect("relay CA");
+    let (relay_addr, mut first_data, reset) =
+        early_response_relay(&relay_ca, EarlyResponse::Reset).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_file = dir.path().join("proof");
+    tokio::fs::write(&proof_file, b"proof")
+        .await
+        .expect("proof");
+    let relay = FixedTlsRelayConfig::new(
+        relay_addr,
+        "secret-egress.test",
+        vec![ca_trust_anchor(&relay_ca)],
+        proof_file,
+        [BoundHttpsSelector::new("api.example.com").expect("selector")],
+    )
+    .expect("relay config");
+    let (proxy_addr, proxy_ca, _signals, _store) = spawn_bound_proxy(relay).await;
+    let mut sender = h2_client_through_proxy(proxy_addr, &proxy_ca, "api.example.com:443").await;
+    let (frames_tx, frames_rx) = mpsc::channel(2);
+    let body = Body::from(StreamBody::new(
+        tokio_stream::wrappers::ReceiverStream::new(frames_rx),
+    ));
+    let response = tokio::spawn(async move {
+        sender
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://api.example.com/early-reset")
+                    .body(body)
+                    .expect("request"),
+            )
+            .await
+    });
+    frames_tx
+        .send(Ok::<_, hudsucker::Error>(Frame::data(Bytes::from_static(
+            b"first request chunk",
+        ))))
+        .await
+        .expect("first upload chunk");
+    first_data.recv().await.expect("relay reads first chunk");
+    let response = response
+        .await
+        .expect("request task")
+        .expect("early response headers");
+    assert_eq!(response.status(), StatusCode::OK);
+    reset.send_replace(true);
+    let mut body = BodyStream::new(response.into_body());
+    assert_eq!(
+        body.next()
+            .await
+            .expect("response data frame")
+            .expect("response data")
+            .into_data()
+            .expect("data frame"),
+        b"before reset".as_slice()
+    );
+    assert!(body.next().await.expect("reset frame").is_err());
+    tokio::time::timeout(Duration::from_secs(1), frames_tx.closed())
+        .await
+        .expect("reset response cancels unfinished request");
+}
+
+#[tokio::test]
 async fn empty_data_frames_do_not_refresh_the_upload_idle_deadline() {
     use hudsucker::hyper::body::Frame;
 
     let relay_ca = ProxyCa::generate().expect("relay CA");
-    let (relay_addr, _first_data) = early_response_relay(&relay_ca, false).await;
+    let (relay_addr, _first_data, _reset) = early_response_relay(
+        &relay_ca,
+        EarlyResponse::Pending {
+            read_first_data: false,
+        },
+    )
+    .await;
     let dir = tempfile::tempdir().expect("tempdir");
     let proof_file = dir.path().join("proof");
     tokio::fs::write(&proof_file, b"proof")
