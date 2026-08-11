@@ -2,6 +2,7 @@
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
+use bytes::Bytes;
 use futures_util::StreamExt as _;
 use http_body_util::{BodyStream, StreamBody};
 use hudsucker::{
@@ -293,11 +294,7 @@ fn supervise_response_body(
                 {
                     return;
                 }
-                while let Some(frame) = frames.next().await {
-                    if frame_tx.send(frame).await.is_err() {
-                        return;
-                    }
-                }
+                forward_response_until_end(&mut frames, &frame_tx, &request_abort).await;
                 return;
             }
             let RequestBodyState::Progress(at) = state else {
@@ -306,14 +303,14 @@ fn supervise_response_body(
             let deadline = at + RELAY_REQUEST_BODY_IDLE_TIMEOUT;
             tokio::select! {
                 biased;
+                () = frame_tx.closed() => {
+                    request_abort.abort();
+                    return;
+                }
                 changed = body_state.changed() => {
                     if changed.is_err() {
                         request_abort.abort();
-                        while let Some(frame) = frames.next().await {
-                            if frame_tx.send(frame).await.is_err() {
-                                return;
-                            }
-                        }
+                        forward_response_until_end(&mut frames, &frame_tx, &request_abort).await;
                         return;
                     }
                 }
@@ -388,6 +385,33 @@ fn supervise_response_body(
     Body::from(StreamBody::new(frames))
 }
 
+async fn forward_response_until_end(
+    frames: &mut BodyStream<Body>,
+    frame_tx: &tokio::sync::mpsc::Sender<
+        Result<hudsucker::hyper::body::Frame<Bytes>, hudsucker::Error>,
+    >,
+    request_abort: &tokio::task::AbortHandle,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = frame_tx.closed() => {
+                request_abort.abort();
+                return;
+            }
+            frame = frames.next() => {
+                let Some(frame) = frame else {
+                    return;
+                };
+                if frame_tx.send(frame).await.is_err() {
+                    request_abort.abort();
+                    return;
+                }
+            }
+        }
+    }
+}
+
 fn forbidden() -> Response<Body> {
     Response::builder()
         .status(StatusCode::FORBIDDEN)
@@ -400,4 +424,88 @@ fn bad_gateway() -> Response<Body> {
         .status(StatusCode::BAD_GATEWAY)
         .body(Body::empty())
         .expect("static response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hudsucker::hyper::body::Frame;
+
+    struct PendingRelayBody {
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl futures_util::Stream for PendingRelayBody {
+        type Item = Result<Frame<Bytes>, hudsucker::Error>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingRelayBody {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    fn pending_relay_body() -> (Body, tokio::sync::oneshot::Receiver<()>) {
+        let (dropped, observed) = tokio::sync::oneshot::channel();
+        let body = Body::from(StreamBody::new(PendingRelayBody {
+            dropped: Some(dropped),
+        }));
+        (body, observed)
+    }
+
+    #[tokio::test]
+    async fn downstream_drop_aborts_an_active_upload_and_pending_relay_response() {
+        let (request_tx, request_rx) = tokio::sync::mpsc::channel(1);
+        let request = Body::from(StreamBody::new(
+            tokio_stream::wrappers::ReceiverStream::new(request_rx),
+        ));
+        let (request, state, abort) = request_body_with_progress(request);
+        let mut relay_request = BodyStream::new(request);
+        request_tx
+            .send(Ok::<_, hudsucker::Error>(Frame::data(Bytes::from_static(
+                b"upload",
+            ))))
+            .await
+            .expect("request data");
+        relay_request
+            .next()
+            .await
+            .expect("request frame")
+            .expect("request data");
+        let (response, response_dropped) = pending_relay_body();
+
+        drop(supervise_response_body(response, state, abort));
+
+        tokio::time::timeout(Duration::from_secs(1), request_tx.closed())
+            .await
+            .expect("request producer cancellation");
+        tokio::time::timeout(Duration::from_secs(1), response_dropped)
+            .await
+            .expect("relay response cancellation")
+            .expect("relay response drop observation");
+    }
+
+    #[tokio::test]
+    async fn downstream_drop_stops_a_pending_relay_response_after_upload_completion() {
+        let (request, state, abort) = request_body_with_progress(Body::empty());
+        let mut relay_request = BodyStream::new(request);
+        assert!(relay_request.next().await.is_none(), "request body EOF");
+        let (response, response_dropped) = pending_relay_body();
+
+        drop(supervise_response_body(response, state, abort));
+
+        tokio::time::timeout(Duration::from_secs(1), response_dropped)
+            .await
+            .expect("relay response cancellation")
+            .expect("relay response drop observation");
+    }
 }
