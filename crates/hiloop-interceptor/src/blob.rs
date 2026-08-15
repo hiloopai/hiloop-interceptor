@@ -162,6 +162,22 @@ impl DirBlobStore {
         })?;
         Ok(Self { dir })
     }
+
+    fn finalized_path(&self, digest: &PayloadDigest) -> Result<PathBuf, BlobStoreError> {
+        let Some(hex) = digest.as_str().strip_prefix(BLAKE3_DIGEST_PREFIX) else {
+            return Err(BlobStoreError::other(
+                STORE_NAME,
+                format!("unsupported payload digest `{digest}`"),
+            ));
+        };
+        if !is_blake3_hex(hex) {
+            return Err(BlobStoreError::other(
+                STORE_NAME,
+                format!("invalid blake3 payload digest `{digest}`"),
+            ));
+        }
+        Ok(self.dir.join(format!("{BLAKE3_FILE_PREFIX}{hex}")))
+    }
 }
 
 // Temp-file uniqueness within one process: pid plus a monotonic counter.
@@ -347,20 +363,7 @@ impl DirBlobStore {
         &self,
         digest: &PayloadDigest,
     ) -> Result<Option<FinalizedBlob>, BlobStoreError> {
-        let Some(hex) = digest.as_str().strip_prefix(BLAKE3_DIGEST_PREFIX) else {
-            return Err(BlobStoreError::other(
-                STORE_NAME,
-                format!("unsupported payload digest `{digest}`"),
-            ));
-        };
-        if !is_blake3_hex(hex) {
-            return Err(BlobStoreError::other(
-                STORE_NAME,
-                format!("invalid blake3 payload digest `{digest}`"),
-            ));
-        }
-
-        let path = self.dir.join(format!("{BLAKE3_FILE_PREFIX}{hex}"));
+        let path = self.finalized_path(digest)?;
         let metadata = match fs::metadata(&path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -421,6 +424,22 @@ impl DirBlobStore {
         }
         blobs.sort_by(|a, b| a.digest.cmp(&b.digest));
         Ok(blobs)
+    }
+
+    /// Remove one finalized blob after a caller has made it durable elsewhere.
+    ///
+    /// A missing blob is success so replaying a durable acknowledgement is idempotent.
+    pub async fn remove_finalized(&self, digest: &PayloadDigest) -> Result<(), BlobStoreError> {
+        let path = self.finalized_path(digest)?;
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(BlobStoreError::with_source(
+                STORE_NAME,
+                "failed to remove finalized blob",
+                error,
+            )),
+        }
     }
 }
 
@@ -721,6 +740,40 @@ mod tests {
                 .await
                 .expect("lookup")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_finalized_is_idempotent_and_leaves_other_blobs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = DirBlobStore::create(temp.path())
+            .await
+            .expect("create store");
+        let removed = store_blob(&store, b"remove me").await;
+        let retained = store_blob(&store, b"keep me").await;
+
+        store
+            .remove_finalized(&removed)
+            .await
+            .expect("remove finalized blob");
+        store
+            .remove_finalized(&removed)
+            .await
+            .expect("an acknowledged retry is idempotent");
+
+        assert!(
+            store
+                .finalized_blob(&removed)
+                .await
+                .expect("lookup removed")
+                .is_none()
+        );
+        assert!(
+            store
+                .finalized_blob(&retained)
+                .await
+                .expect("lookup retained")
+                .is_some()
         );
     }
 
