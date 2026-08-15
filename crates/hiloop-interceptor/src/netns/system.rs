@@ -15,7 +15,7 @@ pub struct SystemNetworkProvisioner {
     helper_path: PathBuf,
     startup_timeout: Duration,
     resolver_timeout: Duration,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     forced_host_ip_families: Option<(bool, bool)>,
 }
 
@@ -27,7 +27,7 @@ impl SystemNetworkProvisioner {
             helper_path: std::env::current_exe()?,
             startup_timeout: Duration::from_secs(10),
             resolver_timeout: Duration::from_secs(2),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             forced_host_ip_families: None,
         })
     }
@@ -57,13 +57,13 @@ impl SystemNetworkProvisioner {
         &self.helper_path
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn force_ipv4_only(mut self) -> Self {
         self.forced_host_ip_families = Some((true, false));
         self
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn force_dual_stack(mut self) -> Self {
         self.forced_host_ip_families = Some((true, true));
         self
@@ -325,9 +325,9 @@ mod linux {
         }
     }
 
-    fn host_connectivity(provisioner: &SystemNetworkProvisioner) -> HostConnectivity {
-        #[cfg(feature = "test-support")]
-        if let Some((ipv4, ipv6)) = provisioner.forced_host_ip_families {
+    fn host_connectivity(_provisioner: &SystemNetworkProvisioner) -> HostConnectivity {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some((ipv4, ipv6)) = _provisioner.forced_host_ip_families {
             return HostConnectivity { ipv4, ipv6 };
         }
         HostConnectivity::probe()
