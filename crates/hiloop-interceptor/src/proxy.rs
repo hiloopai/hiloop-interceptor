@@ -1308,12 +1308,12 @@ impl CaptureHandler {
                 }
                 Some(Err(error)) => {
                     state.upstream = None;
-                    state.emit(true).await;
+                    state.spawn_emit(true);
                     Some((Err(error), state))
                 }
                 None => {
                     state.upstream = None;
-                    state.emit(false).await;
+                    state.spawn_emit(false);
                     None
                 }
             }
@@ -1464,26 +1464,42 @@ impl TeeState {
     }
 
     /// Idempotent so the end-of-stream emit and the Drop fallback can't double-send.
-    async fn emit(&mut self, truncated: bool) {
+    fn spawn_emit(&mut self, truncated: bool) {
         if self.emitted {
             return;
         }
         self.emitted = true;
-        let raw = finalize_tee(FinalizeTee {
-            clock: &self.clock,
-            channel: self.channel,
-            attributes: std::mem::take(&mut self.attributes),
-            blob_store: self.blob_store.as_ref(),
-            captured: std::mem::take(&mut self.captured),
-            redaction: self.redaction,
-            disposition: self.disposition,
-            media_type: self.media_type.take(),
-            truncated: truncated || self.truncated || self.capped,
-            inspection: self.inspection.take(),
-            wire_bytes: self.wire_bytes,
-        })
-        .await;
-        let _ = self.sink.send(raw).await;
+        let clock = Arc::clone(&self.clock);
+        let channel = self.channel;
+        let wire_bytes = self.wire_bytes;
+        let attributes = std::mem::take(&mut self.attributes);
+        let blob_store = Arc::clone(&self.blob_store);
+        let captured = std::mem::take(&mut self.captured);
+        let capture_permit = self.capture_permit.take();
+        let redaction = self.redaction;
+        let disposition = self.disposition;
+        let media_type = self.media_type.take();
+        let inspection = self.inspection.take();
+        let sink = self.sink.clone();
+        let truncated = truncated || self.truncated || self.capped;
+        tokio::spawn(async move {
+            let _capture_permit = capture_permit;
+            let raw = finalize_tee(FinalizeTee {
+                clock: &clock,
+                channel,
+                attributes,
+                blob_store: blob_store.as_ref(),
+                captured,
+                redaction,
+                disposition,
+                media_type,
+                truncated,
+                inspection,
+                wire_bytes,
+            })
+            .await;
+            let _ = sink.send(raw).await;
+        });
     }
 }
 
@@ -1497,43 +1513,7 @@ fn merge_capture_permit(held: &mut Option<OwnedSemaphorePermit>, permit: OwnedSe
 
 impl Drop for TeeState {
     fn drop(&mut self) {
-        if self.emitted {
-            return;
-        }
-        self.emitted = true;
-        // Drop can't await, so finalize the partial blob on a detached task.
-        // TeeState is always dropped inside the proxy's tokio runtime, so spawn is
-        // safe here.
-        let clock = Arc::clone(&self.clock);
-        let channel = self.channel;
-        let wire_bytes = self.wire_bytes;
-        let attributes = std::mem::take(&mut self.attributes);
-        let blob_store = Arc::clone(&self.blob_store);
-        let captured = std::mem::take(&mut self.captured);
-        let capture_permit = self.capture_permit.take();
-        let redaction = self.redaction;
-        let disposition = self.disposition;
-        let media_type = self.media_type.take();
-        let inspection = self.inspection.take();
-        let sink = self.sink.clone();
-        tokio::spawn(async move {
-            let _capture_permit = capture_permit;
-            let raw = finalize_tee(FinalizeTee {
-                clock: &clock,
-                channel,
-                attributes,
-                blob_store: blob_store.as_ref(),
-                captured,
-                redaction,
-                disposition,
-                media_type,
-                truncated: true,
-                inspection,
-                wire_bytes,
-            })
-            .await;
-            let _ = sink.send(raw).await;
-        });
+        self.spawn_emit(true);
     }
 }
 
@@ -2833,6 +2813,61 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn response_eof_does_not_wait_for_capture_sink_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Ok(RawSignal::new(
+            "test",
+            "queue.filler",
+            HlcClock::new().tick(),
+            Bytes::new(),
+        )))
+        .await
+        .expect("fill capture queue");
+        let store = Arc::new(MemoryBlobStore::default());
+        let handler = CaptureHandler::new(
+            RawSignalSink::new(tx),
+            Arc::new(HlcClock::new()),
+            store,
+            None,
+            RedactionPolicy::default(),
+            Arc::new(EgressPolicy::default()),
+            Arc::new(AnomalyConfig::default()),
+        );
+        let teed = handler.tee_body(
+            RESPONSE_TEE,
+            vec![("http.status_code", "200".to_owned())],
+            None,
+            None,
+            streaming_body(&[b"complete response"]),
+        );
+        let mut downstream = BodyStream::new(teed);
+
+        let frame = downstream
+            .next()
+            .await
+            .expect("response frame")
+            .expect("valid frame")
+            .into_data()
+            .expect("data frame");
+        assert_eq!(frame, Bytes::from_static(b"complete response"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), downstream.next())
+                .await
+                .expect("capture backpressure must not withhold response EOF")
+                .is_none()
+        );
+
+        let filler = rx.recv().await.expect("filler").expect("raw filler");
+        assert_eq!(filler.kind, "queue.filler");
+        let captured = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("capture resumes after sink capacity returns")
+            .expect("capture signal")
+            .expect("raw capture");
+        assert_eq!(captured.kind, RESPONSE_KIND);
+    }
+
     #[tokio::test]
     async fn concurrent_proxy_capture_truncates_at_the_aggregate_buffer_budget() {
         let (mut handler, mut rx, _store) = handler();
@@ -3280,14 +3315,16 @@ mod tests {
         drain_body(teed.into_body()).await;
         drop(handler);
 
-        let kinds: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
-            .map(|signal| signal.expect("raw").kind)
-            .collect();
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            kinds.push(rx.recv().await.expect("signal").expect("raw").kind);
+        }
         assert_eq!(
             kinds,
             [REQUEST_KIND, RESPONSE_KIND],
             "a request → response exchange must not grow a terminal abort"
         );
+        assert!(rx.recv().await.is_none(), "no abort follows the response");
     }
 
     #[tokio::test]
